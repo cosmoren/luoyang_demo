@@ -80,40 +80,58 @@ def create_infer_offline_gui(
     
     root = tk.Tk()
     root.title("Inference Offline (Simulator)")
-    root.geometry("900x600")
+
+    # Scale UI for different screens (DPI / resolution)
+    try:
+        dpi_scale = root.tk.call("tk", "scaling")
+    except Exception:
+        dpi_scale = 1.0
+    scale = max(0.8, min(2.0, float(dpi_scale)))
+    try:
+        w, h = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.geometry(f"{min(900, int(w * 0.7))}x{min(650, int(h * 0.7))}")
+        root.minsize(500, 400)
+    except Exception:
+        root.geometry("900x650")
+
+    font_time = ("", max(10, int(14 * scale)))
+    font_btn = ("", max(16, int(20 * scale)))
+    pad_main = max(8, int(12 * scale))
+    pad_btn = max(10, int(16 * scale))
 
     # Simulated time from historical_data; count indexes the current timestep
     count = 24*4
     n_rows = len(historical_data)
 
     # Top bar: simulated time display (read-only) - UTC, local, count
-    top_frame = tk.Frame(root, padx=10, pady=5)
+    top_frame = tk.Frame(root, padx=pad_main, pady=pad_main // 2)
     top_frame.pack(fill=tk.X)
     def get_sim_time():
         idx = min(count, n_rows - 1)
         return pd.Timestamp(historical_data["time"].iloc[idx]).to_pydatetime()
 
     sim_time = get_sim_time()
-    tk.Label(top_frame, text="Simulated time (UTC):", font=("", 20)).pack(side=tk.LEFT)
+    tk.Label(top_frame, text="Simulated time (UTC):", font=font_time).pack(side=tk.LEFT)
     utc_var = tk.StringVar(value=sim_time.strftime("%Y-%m-%d %H:%M:%S"))
-    tk.Entry(top_frame, width=32, font=("", 20), state="readonly", textvariable=utc_var).pack(
-        side=tk.LEFT, padx=(5, 15)
+    tk.Entry(top_frame, width=28, font=font_time, state="readonly", textvariable=utc_var).pack(
+        side=tk.LEFT, padx=(5, pad_main)
     )
-    tk.Label(top_frame, text="Simulated time (UTC+8):", font=("", 20)).pack(side=tk.LEFT, padx=(0, 5))
+    tk.Label(top_frame, text="Simulated time (UTC+8):", font=font_time).pack(side=tk.LEFT, padx=(0, 5))
     local_var = tk.StringVar(value=(sim_time + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S"))
-    tk.Entry(top_frame, width=32, font=("", 20), state="readonly", textvariable=local_var).pack(
-        side=tk.LEFT, padx=(0, 15)
+    tk.Entry(top_frame, width=28, font=font_time, state="readonly", textvariable=local_var).pack(
+        side=tk.LEFT, padx=(0, pad_main)
     )
 
-    # Plots
-    fig = Figure(figsize=(8, 6), dpi=100)
+    # Plots (figure scales with display)
+    fig_dpi = max(80, min(150, int(100 * scale)))
+    fig = Figure(figsize=(8, 6), dpi=fig_dpi)
     ax_top = fig.add_subplot(2, 1, 1)
     ax_bot = fig.add_subplot(2, 1, 2)
     fig.tight_layout()
     fig.autofmt_xdate()
 
     canvas = FigureCanvasTkAgg(fig, master=root)
-    canvas.get_tk_widget().pack(expand=True, fill=tk.BOTH, padx=(800, 10), pady=10)
+    canvas.get_tk_widget().pack(expand=True, fill=tk.BOTH, padx=(pad_main * 2, pad_main), pady=pad_main)
 
     # Start/Stop button at bottom
     running = [False]
@@ -131,21 +149,21 @@ def create_infer_offline_gui(
             start_btn.config(text="Stop", bg="#E53935")
             root.after(0, lambda: tick(historical_data))
 
-    btn_frame = tk.Frame(root, pady=15)
+    btn_frame = tk.Frame(root, pady=pad_btn)
     btn_frame.pack(fill=tk.X)
     start_btn = tk.Button(
         btn_frame,
         text="Start",
-        font=("", 24),
-        width=12,
-        height=2,
+        font=font_btn,
+        padx=pad_btn * 2,
+        pady=pad_btn,
         command=toggle_start_stop,
         bg="#4CAF50",
         fg="white",
         relief=tk.RAISED,
         cursor="hand2",
     )
-    start_btn.pack(pady=5)
+    start_btn.pack(pady=pad_btn // 2)
 
     # Trajectory of pred_4h: list of (t0+4h, pred_4h) as time advances (points move left)
     pred_4h_trajectory: list[tuple[datetime, float]] = []
