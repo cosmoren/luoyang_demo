@@ -1,0 +1,15 @@
+# Paths and overall settings
+
+paths:
+  config_dir: config
+  nwp_config: config/NWP.yaml
+  data_dir: "/home/cosmo/workspace/data"
+  nwp_download: "/home/cosmo/workspace/data/nwp_download"
+  nwp_newest: "/home/cosmo/workspace/data/nwp_newest"
+
+nwp:
+  solar_subdir: solar
+  wind_subdir: wind
+
+download:
+  user_agent: "Mozilla/5.0 (compatible; NWP downloader)"

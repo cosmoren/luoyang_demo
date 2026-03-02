@@ -1,0 +1,24 @@
+# NWP (Numerical Weather Prediction) data file paths
+# Base URL: https://testbed.obs.cn-north-9.myhuaweicloud.com/poc/luoyang/
+
+solar:
+  - https://testbed.obs.cn-north-9.myhuaweicloud.com/poc/luoyang/solar/nearest/112.250_34.650_UTC0_model_solar_v5.csv
+  - https://testbed.obs.cn-north-9.myhuaweicloud.com/poc/luoyang/solar/nearest/112.250_34.700_UTC0_model_solar_v5.csv
+  - https://testbed.obs.cn-north-9.myhuaweicloud.com/poc/luoyang/solar/nearest/112.250_34.750_UTC0_model_solar_v5.csv
+  - https://testbed.obs.cn-north-9.myhuaweicloud.com/poc/luoyang/solar/nearest/112.300_34.650_UTC0_model_solar_v5.csv
+  - https://testbed.obs.cn-north-9.myhuaweicloud.com/poc/luoyang/solar/nearest/112.300_34.700_UTC0_model_solar_v5.csv
+  - https://testbed.obs.cn-north-9.myhuaweicloud.com/poc/luoyang/solar/nearest/112.300_34.750_UTC0_model_solar_v5.csv
+  - https://testbed.obs.cn-north-9.myhuaweicloud.com/poc/luoyang/solar/nearest/112.350_34.650_UTC0_model_solar_v5.csv
+  - https://testbed.obs.cn-north-9.myhuaweicloud.com/poc/luoyang/solar/nearest/112.350_34.700_UTC0_model_solar_v5.csv
+  - https://testbed.obs.cn-north-9.myhuaweicloud.com/poc/luoyang/solar/nearest/112.350_34.750_UTC0_model_solar_v5.csv
+
+wind:
+  - https://testbed.obs.cn-north-9.myhuaweicloud.com/poc/luoyang/wind/nearest/112.250_34.650_UTC0_model_wind_v5.csv
+  - https://testbed.obs.cn-north-9.myhuaweicloud.com/poc/luoyang/wind/nearest/112.250_34.700_UTC0_model_wind_v5.csv
+  - https://testbed.obs.cn-north-9.myhuaweicloud.com/poc/luoyang/wind/nearest/112.250_34.750_UTC0_model_wind_v5.csv
+  - https://testbed.obs.cn-north-9.myhuaweicloud.com/poc/luoyang/wind/nearest/112.300_34.650_UTC0_model_wind_v5.csv
+  - https://testbed.obs.cn-north-9.myhuaweicloud.com/poc/luoyang/wind/nearest/112.300_34.700_UTC0_model_wind_v5.csv
+  - https://testbed.obs.cn-north-9.myhuaweicloud.com/poc/luoyang/wind/nearest/112.300_34.750_UTC0_model_wind_v5.csv
+  - https://testbed.obs.cn-north-9.myhuaweicloud.com/poc/luoyang/wind/nearest/112.350_34.650_UTC0_model_wind_v5.csv
+  - https://testbed.obs.cn-north-9.myhuaweicloud.com/poc/luoyang/wind/nearest/112.350_34.700_UTC0_model_wind_v5.csv
+  - https://testbed.obs.cn-north-9.myhuaweicloud.com/poc/luoyang/wind/nearest/112.350_34.750_UTC0_model_wind_v5.csv
