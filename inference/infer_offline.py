@@ -24,232 +24,11 @@ from pathlib import Path
 import xgboost as xgb
 from xgboost import XGBRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-
+from demo_luoyang import LuoyangDataLoader
 # Simulator: advance simulated time by this amount each 5-sec GUI tick
 SIM_TIME_STEP = timedelta(minutes=5)
 GUI_UPDATE_MS = 100 # 1000
 LOCAL_TZ = timezone(timedelta(hours=8))  # UTC+8 for x-axis display
-
-class LuoyangDataLoader:
-
-    def __init__(
-        self,
-        df,
-        feature_cols=["total_active_kw", "mean_inner_temp"],
-        target_col="total_active_kw",
-        time_col="time",
-        freq_minutes=15,
-        add_time_encoding=True
-    ):
-        """
-        feature_cols:
-            原始数值特征列，例如:
-            ["total_active_kw", "mean_inner_temp"]
-
-        如果 add_time_encoding=True，
-        会自动追加:
-            time_sin, time_cos
-        """
-
-        #self.csv_path = csv_path
-        self.feature_cols = list(feature_cols)
-        self.target_col = target_col
-        self.time_col = time_col
-        self.freq_minutes = freq_minutes
-        self.add_time_encoding = add_time_encoding
-
-        self.df = df #pd.read_csv(csv_path, parse_dates=[time_col])
-        self.df = self.df.sort_values(time_col).reset_index(drop=True)
-
-        self.step_per_hour = int(60 // freq_minutes)
-
-        self._build_features()
-
-    # -------------------------------------------------
-    # 时间 sin / cos 编码
-    # -------------------------------------------------
-    def _add_time_encoding(self, df):
-        """
-        使用一天内时刻做周期编码
-        """
-        col = self.time_col  # 'time'
-        df[col] = pd.to_datetime(df[col].astype(str).str.strip(), errors="raise")
-        minutes = (
-            df[self.time_col].dt.hour * 60
-            + df[self.time_col].dt.minute
-        ).astype(np.float32)
-
-        period = 24 * 60
-
-        df["time_sin"] = np.sin(2 * np.pi * minutes / period)
-        df["time_cos"] = np.cos(2 * np.pi * minutes / period)
-
-        return df
-
-    # -------------------------------------------------
-    # 构建最终特征矩阵
-    # -------------------------------------------------
-    def _build_features(self):
-
-        df = self.df.copy()
-
-        if self.add_time_encoding:
-            df = self._add_time_encoding(df)
-            self.used_feature_cols = (
-                self.feature_cols + ["time_sin", "time_cos"]
-            )
-        else:
-            self.used_feature_cols = list(self.feature_cols)
-
-        self.X_all = df[self.used_feature_cols].values.astype(np.float32)
-        self.y_all = df[self.target_col].values.astype(np.float32)
-        self.time_all = df[self.time_col].values
-
-        self.df = df
-
-    # -------------------------------------------------
-    # 通用单点预测数据构造
-    # -------------------------------------------------
-    def make_single_horizon_dataset(
-        self,
-        history_len,
-        horizon_steps
-    ):
-
-        X = []
-        y = []
-        t = []
-
-        max_i = len(self.df) - horizon_steps
-
-        for i in range(history_len - 1, max_i):
-
-            x_hist = self.X_all[i - history_len + 1: i + 1]
-            y_tar = self.y_all[i + horizon_steps]
-
-            X.append(x_hist)
-            y.append(y_tar)
-            t.append(self.time_all[i])
-
-        return (
-            np.asarray(X, dtype=np.float32),
-            np.asarray(y, dtype=np.float32),
-            np.asarray(t)
-        )
-
-    # -------------------------------------------------
-    # ultra short
-    # -------------------------------------------------
-    def make_ultra_short_dataset(self, history_len):
-        return self.make_single_horizon_dataset(
-            history_len=history_len,
-            horizon_steps=1
-        )
-
-    # -------------------------------------------------
-    # short
-    # -------------------------------------------------
-    def make_short_dataset(
-        self,
-        history_len,
-        horizon_hours=4
-    ):
-
-        horizon_steps = horizon_hours * self.step_per_hour
-
-        return self.make_single_horizon_dataset(
-            history_len=history_len,
-            horizon_steps=horizon_steps
-        )
-
-    # -------------------------------------------------
-    # long
-    # -------------------------------------------------
-    def make_long_dataset(
-        self,
-        history_len,
-        anchor_hour=9
-    ):
-        """
-        每天 anchor_hour 作为当前时刻
-        预测:
-            t + 15 小时开始
-            连续 96 个 15 分钟点
-        """
-
-        X = []
-        Y = []
-        T = []
-
-        start_offset_steps = 15 * self.step_per_hour
-        pred_len = 96
-
-        df = self.df
-
-        for i in range(history_len - 1, len(df)):
-
-            current_time = df.iloc[i][self.time_col]
-
-            if not (
-                current_time.hour == anchor_hour
-                and current_time.minute == 0
-            ):
-                continue
-
-            start_y = i + start_offset_steps
-            end_y = start_y + pred_len
-
-            if end_y > len(df):
-                break
-
-            x_hist = self.X_all[i - history_len + 1: i + 1]
-            y_seq = self.y_all[start_y:end_y]
-
-            X.append(x_hist)
-            Y.append(y_seq)
-            T.append(current_time)
-
-        return (
-            np.asarray(X, dtype=np.float32),
-            np.asarray(Y, dtype=np.float32),
-            np.asarray(T)
-        )
-
-    # -------------------------------------------------
-    # windowed-long
-    # -------------------------------------------------
-    def make_sequence_dataset(
-        self,
-        history_len,
-        horizon_steps
-    ):
-        """
-        通用序列预测
-        Input:
-            history_len: 历史长度
-            horizon_steps: 预测步数（192 = 48h）
-        Output:
-            X shape = (N, history_len, F)
-            Y shape = (N, horizon_steps)
-        """
-        X = []
-        Y = []
-        T = []
-
-        max_i = len(self.df) - horizon_steps
-
-        for i in range(history_len - 1, max_i):
-            x_hist = self.X_all[i - history_len + 1 : i + 1]
-            y_seq = self.y_all[i + 1 : i + 1 + horizon_steps]
-            X.append(x_hist)
-            Y.append(y_seq)
-            T.append(self.time_all[i])
-
-        return (
-            np.asarray(X, dtype=np.float32),
-            np.asarray(Y, dtype=np.float32),
-            np.asarray(T)
-        )
 
 def setup_axis_time_range(
     ax, t_start, t_end, t0, tick_interval_minutes: int | None = None, tick_interval_hours: int | None = None
@@ -303,35 +82,52 @@ def create_infer_offline_gui(
     
     ### added by weize
     loader = LuoyangDataLoader(
-        df=historical_data,
+        
         feature_cols=[
             "total_active_kw",
             "mean_inner_temp",
             "status_ok"
         ],
-        add_time_encoding=True
+        add_time_encoding=True,
+        df=historical_data,
+        solar_forecast_path="/data/luoyang_demo/datasets/112.285_34.700_UTC0_model_solar_v5.csv",
+        wind_forecast_path="/data/luoyang_demo/datasets/112.285_34.700_UTC0_model_wind_v5.csv",
+        forecast_feature_config={
+            "solar": [
+                "ssrd"
+            ],
+            "wind": [
+                "t2m",
+                #"msl",
+                #"u10",
+                #"v10",
+                #"u100",
+                #"v100",
+                #"wind_speed_10m"
+            ]
+        },
     )
 
     # X, y, t = loader.make_ultra_short_dataset(history_len=32) # ultra short
-    X_4h, y_4h, t_4h = loader.make_short_dataset(history_len=64, horizon_hours=4) # short
+    X_4h, y_4h, curr_gt_4h, t_4h = loader.make_short_dataset(history_len=64, horizon_hours=4) # short
     # X, y, t = loader.make_long_dataset(history_len=96, anchor_hour=9) # long
-    X_48h, y_48h, t_48h = loader.make_sequence_dataset(history_len=96, horizon_steps=192) # windowed-long
+    X_48h, y_48h, curr_gt_48h, t_48h = loader.make_sequence_dataset(history_len=96, horizon_steps=192) # windowed-long
     model_4h_path = (
-        "../models/luoyang_agg_short_xgb.json"
+        "../datasets/luoyang_agg_short_xgb.json"
         #"D:\workspace\luoyang_demo_v2\models\luoyang_agg_short_xgb.json"
     )
     model_48h_path = (
-        "../models/luoyang_agg_windowed-long_xgb.json"
+        "../datasets/luoyang_agg_windowed-long_xgb.json"
     )
 
     # ---------------------------------------------------------
     # 展平 X
     # ---------------------------------------------------------
 
-    N_4h, T_4h, F_4h = X_4h.shape
-    X_4h_flat = X_4h.reshape(N_4h, T_4h * F_4h)
-    N_48h, T_48h, F_48h = X_48h.shape
-    X_48h_flat = X_48h.reshape(N_48h, T_48h * F_48h)
+    N_4h = X_4h.shape[0]
+    X_4h_flat = X_4h.reshape(N_4h, -1)
+    N_48h = X_48h.shape[0]
+    X_48h_flat = X_48h.reshape(N_48h, -1)
 
     # ---------------------------------------------------------
     # 构造监督样本
@@ -371,8 +167,8 @@ def create_infer_offline_gui(
     y_48h_flat = np.asarray(y_list, dtype=np.float32)
     t_48h_flat = pd.to_datetime(t_list)
 
-    power_4h_gt = X_4h[:, -1, 0] # [N]
-    power_48h_gt = y_48h_flat # [N, 192] # TODO
+    power_4h_gt = curr_gt_4h # [N]
+    power_48h_gt = curr_gt_48h # [N]
 
     model_4h = xgb.XGBRegressor()   # 分类任务 XGBClassifier
     model_4h.load_model(model_4h_path)

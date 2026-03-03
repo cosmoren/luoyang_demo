@@ -147,7 +147,6 @@ class LuoyangDataLoader:
 
     def __init__(
         self,
-        csv_path,
         feature_cols=["total_active_kw", "mean_inner_temp"],
         target_col="total_active_kw",
         time_col="time",
@@ -156,6 +155,8 @@ class LuoyangDataLoader:
         solar_forecast_path=None,
         wind_forecast_path=None,
         forecast_feature_config=None,
+        df=None,
+        csv_path=None,
     ):
         """
         feature_cols:
@@ -191,7 +192,12 @@ class LuoyangDataLoader:
             }
 
         self.forecast_feature_config = forecast_feature_config
-        self.df = pd.read_csv(csv_path, parse_dates=[time_col])
+        if df is None:
+            self.df = pd.read_csv(csv_path, parse_dates=[time_col])
+            self.df[self.time_col] = pd.to_datetime(self.df[self.time_col])
+        else:
+            self.df = df.copy()
+            self.df[self.time_col] = pd.to_datetime(self.df[self.time_col])
         self.df = self.df.sort_values(time_col).reset_index(drop=True)
 
         self.step_per_hour = int(60 // freq_minutes)
@@ -351,6 +357,7 @@ class LuoyangDataLoader:
 
         X = []
         y = []
+        curr_gt = []
         t = []
 
         max_i = len(self.df) - horizon_steps
@@ -374,11 +381,13 @@ class LuoyangDataLoader:
 
             X.append(x_hist)
             y.append(y_tar)
+            curr_gt.append(self.y_all[i])
             t.append(t0)
 
         return (
             np.asarray(X, dtype=np.float32),
             np.asarray(y, dtype=np.float32),
+            np.asarray(curr_gt, dtype=np.float32),
             np.asarray(t)
         )
 
@@ -424,6 +433,7 @@ class LuoyangDataLoader:
 
         X = []
         Y = []
+        CURR_GT = []
         T = []
 
         start_offset_steps = 15 * self.step_per_hour
@@ -465,11 +475,13 @@ class LuoyangDataLoader:
 
             X.append(x)
             Y.append(y_seq)
+            CURR_GT.append(self.y_all[i])
             T.append(current_time)
 
         return (
             np.asarray(X, dtype=np.float32),
             np.asarray(Y, dtype=np.float32),
+            np.asarray(CURR_GT, dtype=np.float32),
             np.asarray(T)
         )
 
@@ -489,6 +501,7 @@ class LuoyangDataLoader:
         """
         X = []
         Y = []
+        CURR_GT = []
         T = []
 
         max_i = len(self.df) - horizon_steps
@@ -513,12 +526,14 @@ class LuoyangDataLoader:
             
             y_seq = self.y_all[i + 1 : i + 1 + horizon_steps]
             X.append(x_hist)
+            CURR_GT.append(self.y_all[i])
             Y.append(y_seq)
             T.append(t0)
 
         return (
             np.asarray(X, dtype=np.float32),
             np.asarray(Y, dtype=np.float32),
+            np.asarray(CURR_GT, dtype=np.float32),
             np.asarray(T)
         )
 
@@ -585,8 +600,8 @@ if __name__ == "__main__":
             "status_ok"
         ],
         add_time_encoding=True,
-        solar_forecast_path="/home/kyber/Desktop/pv_forcast/pv_forcast/datasets/112.285_34.700_UTC0_model_solar_v5.csv",
-        wind_forecast_path="/home/kyber/Desktop/pv_forcast/pv_forcast/datasets/112.285_34.700_UTC0_model_wind_v5.csv",
+        solar_forecast_path="/data/luoyang_demo/datasets/112.285_34.700_UTC0_model_solar_v5.csv",
+        wind_forecast_path="/data/luoyang_demo/datasets/112.285_34.700_UTC0_model_wind_v5.csv",
         forecast_feature_config={
             "solar": [
                 "ssrd"
@@ -611,15 +626,15 @@ if __name__ == "__main__":
     # 构造数据
     # -------------------------------------------------------
 
-    mode = "ultra-short" # "ultra-short", "short", "long", "windowed-long"
+    mode = "windowed-long" #ultra-short", "short", "long", "windowed-long"
     if mode == "ultra-short":
-        X, y, t = loader.make_ultra_short_dataset(history_len=32)
+        X, y, _, t = loader.make_ultra_short_dataset(history_len=32)
     elif mode == "short":
-        X, y, t = loader.make_short_dataset(history_len=64, horizon_hours=4)
+        X, y, _, t = loader.make_short_dataset(history_len=64, horizon_hours=4)
     elif mode == "long":
-        X, y, t = loader.make_long_dataset(history_len=96, anchor_hour=9)
+        X, y, _, t = loader.make_long_dataset(history_len=96, anchor_hour=9)
     elif mode == "windowed-long":
-        X, y, t = loader.make_sequence_dataset(history_len=96, horizon_steps=192)
+        X, y, _, t = loader.make_sequence_dataset(history_len=96, horizon_steps=192)
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
