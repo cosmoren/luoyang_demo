@@ -22,129 +22,6 @@ from matplotlib.figure import Figure
 import tkinter as tk
 from pathlib import Path
 import xgboost as xgb
-
-# Optional: load images for sky panels (PNG/JPG)
-try:
-    from PIL import Image, ImageTk
-    _PIL_AVAILABLE = True
-except ImportError:
-    _PIL_AVAILABLE = False
-
-# Dummy directory for sky images (contains many images named by timestamp)
-# Example filenames: 2024-01-15_14-30.png, 20240115143000.png
-SKY_IMAGE_DIR = Path("../sky_images")
-
-# Filename patterns to parse timestamp (without extension); try in order
-_SKY_IMAGE_TIME_FMTS = [
-    "%Y-%m-%d_%H-%M",      # 2024-01-15_14-30
-    "%Y-%m-%d_%H-%M-%S",  # 2024-01-15_14-30-00
-    "%Y%m%d_%H%M%S",      # 20240115143000
-    "%Y%m%d_%H%M",        # 202401151430
-]
-
-
-def _find_sky_image_for_time(dir_path: Path, t: datetime) -> Path | None:
-    """Find the sky image file that best matches the given timestamp.
-    Looks for exact or nearest match in dir_path. Returns None if dir missing or no match."""
-    if not dir_path.is_dir():
-        return None
-    best_path: Path | None = None
-    best_delta: float | None = None
-    t_ts = t.timestamp()
-    for f in dir_path.iterdir():
-        if not f.is_file() or f.suffix.lower() not in (".png", ".jpg", ".jpeg"):
-            continue
-        stem = f.stem
-        for fmt in _SKY_IMAGE_TIME_FMTS:
-            try:
-                parsed = datetime.strptime(stem, fmt)
-                delta = abs(parsed.timestamp() - t_ts)
-                if best_delta is None or delta < best_delta:
-                    best_delta = delta
-                    best_path = f
-                break
-            except ValueError:
-                continue
-    return best_path
-
-
-def _load_sky_image(path: Path, max_size: tuple[int, int] = (200, 150)):
-    """Load image from path for display; return PhotoImage or None if not found/invalid."""
-    if not path.exists() or not _PIL_AVAILABLE:
-        return None
-    try:
-        img = Image.open(path).convert("RGB")
-        try:
-            resample = Image.Resampling.LANCZOS
-        except AttributeError:
-            resample = Image.LANCZOS
-        img.thumbnail(max_size, resample)
-        return ImageTk.PhotoImage(img)
-    except Exception:
-        return None
-
-
-def _preload_sky_images(dir_path: Path, max_size: tuple[int, int] = (64, 64)):
-    """
-    Load all valid sky images from dir_path into memory once.
-    Returns (times, images) where times is a sorted list of datetimes
-    and images is a list of PhotoImage objects aligned with times.
-    """
-    if not dir_path.is_dir() or not _PIL_AVAILABLE:
-        return [], []
-
-    items = []
-    for f in sorted(dir_path.iterdir()):
-        if not f.is_file() or f.suffix.lower() not in (".png", ".jpg", ".jpeg"):
-            continue
-        stem = f.stem
-        parsed_time = None
-        for fmt in _SKY_IMAGE_TIME_FMTS:
-            try:
-                parsed_time = datetime.strptime(stem, fmt)
-                break
-            except ValueError:
-                continue
-        if parsed_time is None:
-            continue
-        ph = _load_sky_image(f, max_size=max_size)
-        if ph is None:
-            continue
-        items.append((parsed_time, ph))
-
-    items.sort(key=lambda x: x[0])
-    times = [t for t, _ in items]
-    images = [img for _, img in items]
-    return times, images
-
-
-def _get_sky_image_for_time(times, images, t: datetime):
-    """
-    Given a sorted list of times and aligned images, find the image
-    with timestamp closest to t. Returns None if no images loaded.
-    """
-    if not times:
-        return None
-
-    # Binary search for insertion point
-    lo, hi = 0, len(times)
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if times[mid] < t:
-            lo = mid + 1
-        else:
-            hi = mid
-
-    if lo == 0:
-        return images[0]
-    if lo == len(times):
-        return images[-1]
-
-    before_t = times[lo - 1]
-    after_t = times[lo]
-    if (t - before_t) <= (after_t - t):
-        return images[lo - 1]
-    return images[lo]
 from xgboost import XGBRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from demo_luoyang import LuoyangDataLoader
@@ -343,135 +220,16 @@ def create_infer_offline_gui(
         side=tk.LEFT, padx=(0, pad_main)
     )
 
-    # Plots: upper row = sky images (left) + 4h plot (right); lower row = 48h plot
+    # Plots (figure scales with display)
     fig_dpi = max(80, min(150, int(100 * scale)))
-    fig_top = Figure(figsize=(6, 2.5), dpi=fig_dpi)
-    ax_top = fig_top.add_subplot(1, 1, 1)
-    fig_top.tight_layout()
-    fig_top.autofmt_xdate()
-    fig_bot = Figure(figsize=(8, 3), dpi=fig_dpi)
-    ax_bot = fig_bot.add_subplot(1, 1, 1)
-    fig_bot.tight_layout()
-    fig_bot.autofmt_xdate()
+    fig = Figure(figsize=(8, 6), dpi=fig_dpi)
+    ax_top = fig.add_subplot(2, 1, 1)
+    ax_bot = fig.add_subplot(2, 1, 2)
+    fig.tight_layout()
+    fig.autofmt_xdate()
 
-    # Left panel: two sky image slots (upper row); updated by simulated time
-    img_size = (200, 150)
-    sky_photo_refs: list = []  # keep refs so images are not garbage-collected
-    sky_times, sky_images = _preload_sky_images(SKY_IMAGE_DIR, max_size=img_size)
-
-    def make_sky_slot(parent: tk.Frame, label_text: str, rows: int = 1, cols: int = 1):
-        """Create a slot with a grid of rows x cols image labels (row-major order)."""
-        frame = tk.Frame(parent, relief=tk.GROOVE, borderwidth=1, padx=4, pady=4)
-        tk.Label(frame, text=label_text, font=font_time).pack()
-        grid_frame = tk.Frame(frame)
-        grid_frame.pack(pady=4)
-        content_labels = []
-        for r in range(rows):
-            row_f = tk.Frame(grid_frame)
-            row_f.pack()
-            for c in range(cols):
-                lbl = tk.Label(row_f, text="", font=font_time, fg="gray")
-                lbl.pack(side=tk.LEFT, padx=2)
-                content_labels.append(lbl)
-        frame.content_labels = content_labels
-        return frame
-
-    def update_sky_images(t0: datetime):
-        """Set current (8 images, 2x4) and predicted (8 images, 2x4) sky images using preloaded data."""
-        nonlocal sky_photo_refs
-        sky_photo_refs.clear()
-        interval_min = 15
-
-        # Current sky: most recent 8 images, 2 rows x 4 cols (rightmost = current time t0)
-        # Times: t0-7*15min .. t0-15min, t0 (row-major: row0 then row1)
-        current_times = [
-            t0 - timedelta(minutes=k * interval_min) for k in range(7, -1, -1)
-        ]
-        current_photos = []
-        for t in current_times:
-            ph = _get_sky_image_for_time(sky_times, sky_images, t)
-            if ph is not None:
-                sky_photo_refs.append(ph)
-                current_photos.append(ph)
-        for i, lbl in enumerate(slot_current.content_labels):
-            if i < len(current_photos):
-                lbl.config(image=current_photos[i], text="")
-            else:
-                lbl.config(image="", text="")
-
-        # Predicted sky: next 8 images starting after current (t0+15min .. t0+8*15min), 2 rows x 4 cols
-        pred_times = [
-            t0 + timedelta(minutes=k * interval_min) for k in range(1, 9)
-        ]
-        pred_photos = []
-        for t in pred_times:
-            ph = _get_sky_image_for_time(sky_times, sky_images, t)
-            if ph is not None:
-                sky_photo_refs.append(ph)
-                pred_photos.append(ph)
-        for i, lbl in enumerate(slot_predicted.content_labels):
-            if i < len(pred_photos):
-                lbl.config(image=pred_photos[i], text="")
-            else:
-                lbl.config(image="", text="")
-
-        # Lower row panels: same images as upper row
-        for i, lbl in enumerate(slot_current_bot.content_labels):
-            if i < len(current_photos):
-                lbl.config(image=current_photos[i], text="")
-            else:
-                lbl.config(image="", text="")
-        for i, lbl in enumerate(slot_predicted_bot.content_labels):
-            if i < len(pred_photos):
-                lbl.config(image=pred_photos[i], text="")
-            else:
-                lbl.config(image="", text="")
-
-    content = tk.Frame(root, padx=pad_main, pady=pad_main)
-    content.pack(expand=True, fill=tk.BOTH)
-    content.grid_columnconfigure(0, weight=0, minsize=1)   # left: image panels
-    content.grid_columnconfigure(1, weight=1)             # right: plots
-    content.grid_rowconfigure(0, weight=1)                # upper row (4h)
-    content.grid_rowconfigure(1, weight=0, minsize=4)    # separator bar
-    content.grid_rowconfigure(2, weight=1)                # lower row (48h)
-
-    # Upper row: sky image panels (left) + 4h plot (right), aligned height
-    top_row = tk.Frame(content)
-    top_row.grid(row=0, column=0, columnspan=2, sticky="nsew")
-    top_row.grid_columnconfigure(0, weight=0, minsize=1)
-    top_row.grid_columnconfigure(1, weight=1)
-    top_row.grid_rowconfigure(0, weight=1)
-    left_panel = tk.Frame(top_row)
-    left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, pad_main))
-    left_panel.grid_rowconfigure(0, weight=0)
-    left_panel.grid_rowconfigure(1, weight=0)
-    slot_current = make_sky_slot(left_panel, "Current sky images", rows=2, cols=4)
-    slot_current.grid(row=0, column=0, pady=(0, pad_main // 2), sticky="nw")
-    slot_predicted = make_sky_slot(left_panel, "Predicted sky images", rows=2, cols=4)
-    slot_predicted.grid(row=1, column=0, sticky="nw")
-    canvas_top = FigureCanvasTkAgg(fig_top, master=top_row)
-    canvas_top.get_tk_widget().grid(row=0, column=1, sticky="nsew")
-
-    # Separator bar between upper and lower visualization
-    sep = tk.Frame(content, height=4, bg="gray75", relief=tk.FLAT)
-    sep.grid(row=1, column=0, columnspan=2, sticky="ew", pady=pad_main // 2)
-
-    # Lower row: sky image panels (left) + 48h plot (right), aligned height
-    bottom_row = tk.Frame(content)
-    bottom_row.grid(row=2, column=0, columnspan=2, sticky="nsew")
-    bottom_row.grid_columnconfigure(0, weight=0, minsize=1)
-    bottom_row.grid_columnconfigure(1, weight=1)
-    bottom_row.grid_rowconfigure(0, weight=1)
-    left_panel_bot = tk.Frame(bottom_row)
-    left_panel_bot.grid(row=0, column=0, sticky="nsew", padx=(0, pad_main))
-    left_panel_bot.grid_rowconfigure(0, weight=0)
-    left_panel_bot.grid_rowconfigure(1, weight=0)
-    slot_current_bot = make_sky_slot(left_panel_bot, "Current sky images", rows=2, cols=4)
-    slot_current_bot.grid(row=0, column=0, pady=(0, pad_main // 2), sticky="nw")
-    slot_predicted_bot = make_sky_slot(left_panel_bot, "Predicted sky images", rows=2, cols=4)
-    slot_predicted_bot.grid(row=1, column=0, sticky="nw")
-    canvas_bot = FigureCanvasTkAgg(fig_bot, master=bottom_row)
-    canvas_bot.get_tk_widget().grid(row=0, column=1, sticky="nsew")
+    canvas = FigureCanvasTkAgg(fig, master=root)
+    canvas.get_tk_widget().pack(expand=True, fill=tk.BOTH, padx=(pad_main * 2, pad_main), pady=pad_main)
 
     # Start/Stop button at bottom
     running = [False]
@@ -519,8 +277,6 @@ def create_infer_offline_gui(
         nonlocal count
         idx = min(count, len(data) - 1)
         t0 = pd.Timestamp(data["time"].iloc[idx]).to_pydatetime()
-
-        update_sky_images(t0)
 
         # Ground truth at t0 (x = t0)
         gt_4h = power_4h_gt[count:count+1]/1e3 #input_window_4h[0, 3]
@@ -590,8 +346,7 @@ def create_infer_offline_gui(
             ax_bot.plot(t_vals, y_vals, color="C0", marker="s", ms=4, lw=1.5, label="gt_48h")
         ax_bot.legend(loc="upper right")
 
-        canvas_top.draw()
-        canvas_bot.draw()
+        canvas.draw()
         count += 1
         if running[0]:
             after_id[0] = root.after(GUI_UPDATE_MS, lambda: tick(historical_data, X_4h_flat, y_4h_flat, power_4h_gt, \
@@ -599,7 +354,6 @@ def create_infer_offline_gui(
 
     # Initial draw
     t0 = get_sim_time()
-    update_sky_images(t0)
     t_top_start = t0 - timedelta(hours=2)
     t_top_end = t0 + timedelta(hours=4.5)
     t_bot_start = t0 - timedelta(hours=24)
@@ -616,8 +370,7 @@ def create_infer_offline_gui(
     ax_bot.set_ylabel("Output (MW)")
     # ax_bot.set_title("Day-ahead (t0 − 24 h to t0 + 50 h)")
     ax_bot.legend(loc="upper right")
-    canvas_top.draw()
-    canvas_bot.draw()
+    canvas.draw()
 
     root.mainloop()
 
