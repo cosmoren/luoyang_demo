@@ -963,8 +963,8 @@ if __name__ == "__main__":
             "status_ok"
         ],
         add_time_encoding=True,
-        solar_forecast_path="/data/luoyang_demo/datasets/112.285_34.700_UTC0_model_solar_v5.csv",
-        wind_forecast_path="/data/luoyang_demo/datasets/112.285_34.700_UTC0_model_wind_v5.csv",
+        solar_forecast_path="/home/weize/ai4energy/luoyang_demo/datasets/112.285_34.700_UTC0_model_solar_v5.csv",
+        wind_forecast_path="/home/weize/ai4energy/luoyang_demo/datasets/112.285_34.700_UTC0_model_wind_v5.csv",
         forecast_feature_config={
             "solar": [
                 "ssrd"
@@ -1065,7 +1065,7 @@ if __name__ == "__main__":
         t_list = []
         X_list = []
 
-        for i in range(N):
+        for i in range(X_flat.shape[0]):
             # t[i] 是 anchor time（9点）
             base_time = pd.to_datetime(t[i])
 
