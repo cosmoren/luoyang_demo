@@ -2,6 +2,7 @@ import zipfile
 from pathlib import Path
 import pandas as pd
 import numpy as np
+import xarray as xr
 import shutil
 import tempfile
 
@@ -155,6 +156,13 @@ class LuoyangDataLoader:
         solar_forecast_path=None,
         wind_forecast_path=None,
         forecast_feature_config=None,
+        satellite_root=None, # 卫星nc根目录，例如 /home/weize/ai4energy_crop
+        satellite_cache=None, # 卫星cache目录
+        satellite_vars=("CLTT", "CLTH", "CLOT", "CLTYPE"),
+        use_satellite=False,
+        satellite_history_len=9, # 过去多少帧卫星图像
+        satellite_interval_minutes=10, # 卫星原始时间分辨率
+        satellite_expected_hw=(90, 109), # 缺失帧时默认shape
         df=None,
         csv_path=None,
     ):
@@ -163,9 +171,24 @@ class LuoyangDataLoader:
             原始数值特征列，例如:
             ["total_active_kw", "mean_inner_temp"]
 
-        如果 add_time_encoding=True，
+        如果 add_time_encoding=True,
         会自动追加:
             time_sin, time_cos
+
+        satellite_root:
+            已经 crop 好的 Himawari nc 根目录
+
+        satellite_vars:
+            从 nc 中读取哪些变量作为图像通道
+
+        use_satellite:
+            是否启用卫星图像
+
+        satellite_history_len:
+            每个样本使用过去多少帧卫星图像
+
+        satellite_expected_hw:
+            缺失帧时构造零张量的默认空间尺寸
         """
 
         self.csv_path = csv_path
@@ -176,6 +199,13 @@ class LuoyangDataLoader:
         self.add_time_encoding = add_time_encoding
         self.solar_forecast_path = solar_forecast_path
         self.wind_forecast_path = wind_forecast_path
+        self.use_satellite = use_satellite
+        self.satellite_root = Path(satellite_root) if satellite_root is not None else None
+        self.satellite_cache = Path(satellite_cache) if satellite_cache is not None else None
+        self.satellite_vars = list(satellite_vars)
+        self.satellite_history_len = satellite_history_len
+        self.satellite_interval_minutes = satellite_interval_minutes
+        self.satellite_expected_hw = satellite_expected_hw
         # forcast feature config
         if forecast_feature_config is None:
             forecast_feature_config = {
@@ -203,6 +233,194 @@ class LuoyangDataLoader:
         self.step_per_hour = int(60 // freq_minutes)
         self._load_forecast_data()
         self._build_features()
+        if self.use_satellite:
+            self._build_satellite_index()
+
+    # -------------------------------------------------
+    # 建立卫星文件时间索引
+    # -------------------------------------------------
+    def _build_satellite_index(self):
+        """
+        扫描 satellite_root 下所有 nc 文件，
+        从文件名中解析时间，建立:
+            timestamp -> filepath
+        """
+
+        self.sat_time_to_file = {}
+
+        if self.satellite_root is None:
+            raise ValueError("use_satellite=True but satellite_root is None")
+
+        for nc_path in self.satellite_root.rglob("*.nc"):
+            name = nc_path.name
+
+            # 文件名示例:
+            # NC_H09_20250101_0000_L2CLP010_FLDK.02401_02401.nc
+            parts = name.split("_")
+            if len(parts) < 4:
+                continue
+
+            date_str = parts[2]
+            hm_str = parts[3]
+
+            try:
+                t = pd.to_datetime(date_str + hm_str, format="%Y%m%d%H%M")
+                self.sat_time_to_file[t] = nc_path
+            except Exception:
+                continue
+
+        self.sat_times = np.array(sorted(self.sat_time_to_file.keys()))
+
+        print(f"[Satellite] indexed {len(self.sat_time_to_file)} nc files.")
+
+    # -------------------------------------------------
+    # 给定目标时间 t，选择 <= t 的最近一张卫星图
+    # -------------------------------------------------
+    def _get_latest_satellite_time(self, t0):
+        """
+        卫星是10分钟分辨率,PV是15分钟。
+        这里采用:
+            latest satellite time <= t0
+        例如:
+            10:15 -> 10:10
+            10:30 -> 10:30
+        """
+
+        if len(self.sat_times) == 0:
+            return None
+
+        idx = np.searchsorted(self.sat_times, t0, side="right") - 1
+        if idx < 0:
+            return None
+
+        return self.sat_times[idx]
+
+    # -------------------------------------------------
+    # 清洗单帧卫星数据
+    # -------------------------------------------------
+    def _clean_satellite_frame(self, ds):
+
+        qa = ds["QA"].astype(np.uint16)
+        algo_flag = qa & 0b111
+
+        good = (algo_flag == 4) | (algo_flag == 5)
+
+        channels = []
+
+        for v in self.satellite_vars:
+            data = ds[v].isel(time=0).values.squeeze().astype(np.float32)
+
+            valid_min = ds[v].attrs.get("valid_min", None)
+            valid_max = ds[v].attrs.get("valid_max", None)
+
+            mask = good
+
+            if valid_min is not None:
+                mask = mask & (data >= valid_min)
+
+            if valid_max is not None:
+                mask = mask & (data <= valid_max)
+
+            data = np.where(mask, data, np.nan)
+
+            channels.append(data)
+
+        img = np.stack(channels, axis=0)
+
+        valid_mask = np.all(np.isfinite(img), axis=0).astype(np.float32)
+
+        img = np.nan_to_num(img, nan=0.0)
+
+        img = np.concatenate([img, valid_mask[None]], axis=0)
+
+        return img
+
+    # -------------------------------------------------
+    # 读取一帧卫星图像
+    # -------------------------------------------------
+    def _load_satellite_frame(self, sat_time):
+        """
+        输入:
+            sat_time: pandas.Timestamp
+
+        输出:
+            img: shape = (C+1, H, W)
+                 最后一个通道是 valid_mask
+            found: 1/0，表示是否真实找到该帧
+        """
+        if sat_time is None:
+            h, w = self.satellite_expected_hw
+            c = len(self.satellite_vars) + 1
+            return np.zeros((c, h, w), dtype=np.float32), 0
+
+        if False: # back up old code if cache is not there. Run build_satellite_cache.py to build cache first.
+            file_path = self.sat_time_to_file.get(sat_time, None)
+
+            if file_path is None:
+                h, w = self.satellite_expected_hw
+                c = len(self.satellite_vars) + 1
+                return np.zeros((c, h, w), dtype=np.float32), 0
+
+            try:
+                ds = xr.open_dataset(file_path)
+                img = self._clean_satellite_frame(ds)
+                ds.close()
+                return img, 1
+            except Exception:
+                h, w = self.satellite_expected_hw
+                c = len(self.satellite_vars) + 1
+                return np.zeros((c, h, w), dtype=np.float32), 0
+        
+        cache_file = self.satellite_cache / f"{sat_time:%Y%m%d_%H%M}.npy"
+        if not cache_file.exists():
+            print("cache not exist. Run build_satellite_cache.py to build cache first")
+            h,w = self.satellite_expected_hw
+            c = len(self.satellite_vars)+1
+            return np.zeros((c,h,w),dtype=np.float32),0
+        img = np.load(cache_file)
+        img = np.squeeze(img)
+        return img,1
+
+    # -------------------------------------------------
+    # 构造过去若干帧卫星序列
+    # -------------------------------------------------
+    def _build_satellite_sequence(self, t0):
+        """
+        对于一个 anchor time t0，构造过去 satellite_history_len 帧的卫星序列。
+
+        注意：
+        - PV 是 15min
+        - 卫星原始是 10min
+        - 这里仍然按 “PV 的时间步” 回看
+        - 每个时刻取 <= 当前时刻的最近一张卫星图
+
+        输出:
+            sat_seq: (T_sat, C+1, H, W)
+            sat_frame_mask: (T_sat,)
+                1 表示该帧真实存在
+                0 表示该帧缺失，使用零图填充
+        """
+
+        sat_imgs = []
+        sat_frame_mask = []
+
+        # 例如 history_len = 9
+        # 对应 t0-8*15min, ..., t0
+        for k in range(self.satellite_history_len):
+            tk = t0 - pd.Timedelta(minutes=self.freq_minutes * (self.satellite_history_len - 1 - k))
+            sat_time = self._get_latest_satellite_time(tk)
+            img, found = self._load_satellite_frame(sat_time)
+            img = np.squeeze(img)
+            if img.ndim != 3:
+                raise ValueError(f"Unexpected satellite frame shape {img.shape}")
+
+            sat_imgs.append(img)
+            sat_frame_mask.append(found)
+
+        sat_seq = np.stack(sat_imgs, axis=0).astype(np.float32)
+        sat_frame_mask = np.asarray(sat_frame_mask, dtype=np.float32)
+
+        return sat_seq, sat_frame_mask
 
     def _load_forecast_data(self):
         # solar
@@ -354,42 +572,70 @@ class LuoyangDataLoader:
         history_len,
         horizon_steps
     ):
-
-        X = []
+        X_tab = []
+        X_sat = []
+        X_sat_mask = []
+        X_fcst = []
         y = []
         curr_gt = []
         t = []
 
         max_i = len(self.df) - horizon_steps
-
+        count= 0
         for i in range(history_len - 1, max_i):
-            t0 = self.time_all[i]
-            x_hist = self.X_all[i - history_len + 1: i + 1]
+            count+=1
+            if count % 1000 == 0:
+                print("count ", count, " total range ", history_len - 1, " ", max_i)
+            t0 = pd.to_datetime(self.time_all[i])
+            # tabular history
+            x_hist = self.X_all[i - history_len + 1 : i + 1] # (T_tab, F_tab)
+            # forecast sequence
             target_time = self.time_all[i + horizon_steps]
             fcst = self._build_forecast_features(
                 t0,
                 [target_time]
             )
-            if fcst is not None:
-                x_hist = np.concatenate([
-                    x_hist.flatten(),
-                    fcst.flatten()
-                ])
-            else:
-                x_hist = x_hist.flatten()
+            if fcst is None:
+                fcst = np.zeros((1, 0), dtype=np.float32)
+            # satellite
+            if self.use_satellite:
+                sat_seq, sat_mask = self._build_satellite_sequence(t0)
+                X_sat.append(sat_seq)
+                X_sat_mask.append(sat_mask)
+            # target
             y_tar = self.y_all[i + horizon_steps]
-
-            X.append(x_hist)
+            X_tab.append(x_hist)
+            X_fcst.append(fcst)
             y.append(y_tar)
             curr_gt.append(self.y_all[i])
             t.append(t0)
 
-        return (
-            np.asarray(X, dtype=np.float32),
-            np.asarray(y, dtype=np.float32),
-            np.asarray(curr_gt, dtype=np.float32),
-            np.asarray(t)
-        )
+        X_tab = np.asarray(X_tab, dtype=np.float32)
+        X_fcst = np.asarray(X_fcst, dtype=np.float32)
+        y = np.asarray(y, dtype=np.float32)
+        curr_gt = np.asarray(curr_gt, dtype=np.float32)
+        t = np.asarray(t)
+
+        if self.use_satellite:
+            X_sat = np.asarray(X_sat, dtype=np.float32)
+            X_sat_mask = np.asarray(X_sat_mask, dtype=np.float32)
+            return (
+                X_tab,
+                X_sat,
+                X_sat_mask,
+                X_fcst,
+                y,
+                curr_gt,
+                t
+            )
+        else:
+            return (
+                X_tab,
+                X_fcst,
+                y,
+                curr_gt,
+                t
+            )
 
     # -------------------------------------------------
     # ultra short
@@ -424,14 +670,10 @@ class LuoyangDataLoader:
         history_len,
         anchor_hour=9
     ):
-        """
-        每天 anchor_hour 作为当前时刻
-        预测:
-            t + 15 小时开始
-            连续 96 个 15 分钟点
-        """
-
-        X = []
+        X_tab = []
+        X_sat = []
+        X_sat_mask = []
+        X_fcst = []
         Y = []
         CURR_GT = []
         T = []
@@ -440,11 +682,12 @@ class LuoyangDataLoader:
         pred_len = 96
 
         df = self.df
-
+        count= 0
         for i in range(history_len - 1, len(df)):
-
-            current_time = df.iloc[i][self.time_col]
-
+            count+=1
+            if count % 1000 == 0:
+                print("count ", count, " total range ", history_len - 1, " ", len(df))
+            current_time = pd.to_datetime(df.iloc[i][self.time_col])
             if not (
                 current_time.hour == anchor_hour
                 and current_time.minute == 0
@@ -457,137 +700,257 @@ class LuoyangDataLoader:
             if end_y > len(df):
                 break
 
-            x_hist = self.X_all[i - history_len + 1: i + 1]
-            y_seq = self.y_all[start_y:end_y]
-
+            # tabular history
+            x_hist = self.X_all[i - history_len + 1 : i + 1]
+            # forecast sequence
             target_times = self.time_all[start_y:end_y]
+
             fcst = self._build_forecast_features(
                 t0=current_time,
                 target_times=target_times
             )
-            if fcst is not None:
-                x = np.concatenate([
-                    x_hist.flatten(),
-                    fcst.flatten()
-                ])
-            else:
-                x = x_hist.flatten()
 
-            X.append(x)
+            if fcst is None:
+                fcst = np.zeros((pred_len, 0), dtype=np.float32)
+            # satellite
+            if self.use_satellite:
+                sat_seq, sat_mask = self._build_satellite_sequence(current_time)
+                X_sat.append(sat_seq)
+                X_sat_mask.append(sat_mask)
+            # target
+            y_seq = self.y_all[start_y:end_y]
+            X_tab.append(x_hist)
+            X_fcst.append(fcst)
             Y.append(y_seq)
             CURR_GT.append(self.y_all[i])
             T.append(current_time)
 
-        return (
-            np.asarray(X, dtype=np.float32),
-            np.asarray(Y, dtype=np.float32),
-            np.asarray(CURR_GT, dtype=np.float32),
-            np.asarray(T)
-        )
+        X_tab = np.asarray(X_tab, dtype=np.float32)
+        X_fcst = np.asarray(X_fcst, dtype=np.float32)
+        Y = np.asarray(Y, dtype=np.float32)
+        CURR_GT = np.asarray(CURR_GT, dtype=np.float32)
+        T = np.asarray(T)
+
+        if self.use_satellite:
+            X_sat = np.asarray(X_sat, dtype=np.float32)
+            X_sat_mask = np.asarray(X_sat_mask, dtype=np.float32)
+            return (
+                X_tab,
+                X_sat,
+                X_sat_mask,
+                X_fcst,
+                Y,
+                CURR_GT,
+                T
+            )
+        else:
+            return (
+                X_tab,
+                X_fcst,
+                Y,
+                CURR_GT,
+                T
+            )
 
     def make_sequence_dataset(
         self,
         history_len,
         horizon_steps
     ):
-        """
-        通用序列预测
-        Input:
-            history_len: 历史长度
-            horizon_steps: 预测步数（192 = 48h）
-        Output:
-            X shape = (N, history_len, F)
-            Y shape = (N, horizon_steps)
-        """
-        X = []
+        X_tab = []
+        X_sat = []
+        X_sat_mask = []
+        X_fcst = []
         Y = []
         CURR_GT = []
         T = []
 
         max_i = len(self.df) - horizon_steps
-
+        count = 0
         for i in range(history_len - 1, max_i):
-            t0 = self.time_all[i]
+            count+=1
+            if count % 1000 == 0:
+                print("count ", count, " total range ", history_len - 1, " ", max_i)
+            t0 = pd.to_datetime(self.time_all[i])
+            # tabular history
             x_hist = self.X_all[i - history_len + 1 : i + 1]
+            # forecast sequence
             target_times = self.time_all[
-                i+1 : i+1+horizon_steps
+                i + 1 : i + 1 + horizon_steps
             ]
             fcst = self._build_forecast_features(
                 t0,
                 target_times
             )
-            if fcst is not None:
-                x = np.concatenate([
-                    x_hist.flatten(),
-                    fcst.flatten()
-                ])
-            else:
-                x = x_hist.flatten()
-            
+            if fcst is None:
+                fcst = np.zeros((horizon_steps, 0), dtype=np.float32)
+            # satellite
+            if self.use_satellite:
+                sat_seq, sat_mask = self._build_satellite_sequence(t0)
+                X_sat.append(sat_seq)
+                X_sat_mask.append(sat_mask)
+            # target
             y_seq = self.y_all[i + 1 : i + 1 + horizon_steps]
-            X.append(x_hist)
+            X_tab.append(x_hist)
+            X_fcst.append(fcst)
             CURR_GT.append(self.y_all[i])
             Y.append(y_seq)
             T.append(t0)
 
-        return (
-            np.asarray(X, dtype=np.float32),
-            np.asarray(Y, dtype=np.float32),
-            np.asarray(CURR_GT, dtype=np.float32),
-            np.asarray(T)
-        )
+        X_tab = np.asarray(X_tab, dtype=np.float32)
+        X_fcst = np.asarray(X_fcst, dtype=np.float32)
+        Y = np.asarray(Y, dtype=np.float32)
+        CURR_GT = np.asarray(CURR_GT, dtype=np.float32)
+        T = np.asarray(T)
 
+        if self.use_satellite:
+            X_sat = np.asarray(X_sat, dtype=np.float32)
+            X_sat_mask = np.asarray(X_sat_mask, dtype=np.float32)
+            return (
+                X_tab,
+                X_sat,
+                X_sat_mask,
+                X_fcst,
+                Y,
+                CURR_GT,
+                T
+            )
+        else:
+            return (
+                X_tab,
+                X_fcst,
+                Y,
+                CURR_GT,
+                T
+            )
 
 # ==========================================================
-# unit test（只检查结构与 shape）
+# unit test（检查结构, shape and reasonable values）
 # ==========================================================
-
 def _unit_test():
 
-    print("Running unit test...")
+    print("Running unit tests for LuoyangDataLoader...\n")
 
     loader = LuoyangDataLoader(
         csv_path=agg_path,
         feature_cols=["total_active_kw", "mean_inner_temp"],
-        add_time_encoding=True
+        add_time_encoding=True,
+        use_satellite=False
     )
 
-    # ---------- ultra short ----------
-    X, y, t = loader.make_ultra_short_dataset(history_len=8)
+    # =====================================================
+    # ultra short
+    # =====================================================
+    history_len = 3
+    X_tab, X_fcst, y, curr_gt, t = loader.make_ultra_short_dataset(
+        history_len=history_len
+    )
 
-    assert X.ndim == 3
-    assert y.ndim == 1
-    assert X.shape[1] == 8
-    assert X.shape[2] == 4   # 2原始特征 + sin + cos
+    N = len(y)
 
-    # ---------- short ----------
-    Xs, ys, ts = loader.make_short_dataset(
+    assert X_tab.shape == (N, history_len, 4)
+    assert y.shape == (N,)
+    assert curr_gt.shape == (N,)
+    assert X_fcst.ndim == 3
+    assert len(t) == N
+
+    # 时间应该严格递增
+    assert np.all(np.diff(t).astype("timedelta64[m]") >= np.timedelta64(0, "m"))
+
+    print("✓ ultra short dataset OK")
+
+    # =====================================================
+    # short
+    # =====================================================
+
+    X_tab, X_fcst, y, curr_gt, t = loader.make_short_dataset(
         history_len=16,
         horizon_hours=4
     )
 
-    assert Xs.ndim == 3
-    assert ys.ndim == 1
-    assert Xs.shape[1] == 16
-    assert Xs.shape[2] == 4
+    N = len(y)
 
-    # ---------- long ----------
-    Xl, Yl, tl = loader.make_long_dataset(
+    assert X_tab.shape[1] == 16
+    assert X_tab.shape[2] == 4
+
+    assert y.shape == (N,)
+    assert curr_gt.shape == (N,)
+    assert X_fcst.ndim == 3
+
+    print("✓ short dataset OK")
+
+    # =====================================================
+    # long
+    # =====================================================
+
+    X_tab, X_fcst, Y, curr_gt, t = loader.make_long_dataset(
         history_len=32,
         anchor_hour=9
     )
 
-    if len(Xl) > 0:
-        assert Xl.ndim == 3
-        assert Yl.ndim == 2
-        assert Xl.shape[1] == 32
-        assert Xl.shape[2] == 4
-        assert Yl.shape[1] == 96
+    if len(X_tab) > 0:
 
-    print("Unit test passed.")
-    print("ultra short X shape:", X.shape)
-    print("short       X shape:", Xs.shape)
-    print("long        X shape:", Xl.shape)
+        N = len(X_tab)
+
+        assert X_tab.shape == (N, 32, 4)
+        assert Y.shape == (N, 96)
+
+        assert X_fcst.ndim == 3
+        assert curr_gt.shape == (N,)
+
+        # anchor time 应该是 09:00
+        hours = pd.to_datetime(t).hour
+        assert np.all(hours == 9)
+
+    print("✓ long dataset OK")
+
+    # =====================================================
+    # sequence dataset
+    # =====================================================
+
+    X_tab, X_fcst, Y, curr_gt, t = loader.make_sequence_dataset(
+        history_len=32,
+        horizon_steps=16
+    )
+
+    N = len(X_tab)
+
+    assert X_tab.shape == (N, 32, 4)
+    assert Y.shape == (N, 16)
+
+    assert X_fcst.shape[1] == 16
+
+    print("✓ sequence dataset OK")
+
+    # =====================================================
+    # satellite enabled test
+    # =====================================================
+    loader_sat = LuoyangDataLoader(
+        csv_path=agg_path,
+        feature_cols=["total_active_kw", "mean_inner_temp"],
+        add_time_encoding=True,
+        use_satellite=True,
+        satellite_root="/home/weize/ai4energy_crop",
+        satellite_cache="/home/weize/sat_cache",
+    )
+    print("Dataloader done.")
+    X_tab, X_sat, X_sat_mask, X_fcst, y, curr_gt, t = \
+        loader_sat.make_ultra_short_dataset(history_len=8)
+    print("make_ultra_short_dataset done.")
+    N = len(y)
+
+    assert X_sat.ndim == 5
+    assert X_sat_mask.ndim == 2
+
+    assert X_sat.shape[0] == N
+    assert X_sat_mask.shape[0] == N
+
+    # satellite frame mask 只能是 0 或 1
+    assert np.all((X_sat_mask == 0) | (X_sat_mask == 1))
+
+    print("✓ satellite dataset OK")
+
+    print("\nAll unit tests passed successfully.")
 
 if __name__ == "__main__":
     #_unit_test()
@@ -616,11 +979,34 @@ if __name__ == "__main__":
                 #"wind_speed_10m"
             ]
         },
+        use_satellite=False,
     )
     # train and eval
     from xgboost import XGBRegressor
     from sklearn.metrics import mean_absolute_error, mean_squared_error
     import numpy as np
+
+    # 帮助函数：把 X_tab 和 X_fcst flatten 后拼接成 XGBoost 可用的二维特征
+    def build_xgb_features(X_tab, X_fcst):
+        """
+        X_tab:  (N, T_tab, F_tab)
+        X_fcst: (N, T_fcst, F_fcst)
+
+        返回:
+            X_flat: (N, D)
+        """
+        N = X_tab.shape[0]
+
+        # [NEW] tabular flatten
+        X_tab_flat = X_tab.reshape(N, -1)
+
+        # [NEW] forecast flatten
+        X_fcst_flat = X_fcst.reshape(N, -1)
+
+        # [NEW] 拼接成最终树模型输入
+        X_flat = np.concatenate([X_tab_flat, X_fcst_flat], axis=1)
+
+        return X_flat
 
     # -------------------------------------------------------
     # 构造数据
@@ -628,13 +1014,13 @@ if __name__ == "__main__":
 
     mode = "windowed-long" #ultra-short", "short", "long", "windowed-long"
     if mode == "ultra-short":
-        X, y, _, t = loader.make_ultra_short_dataset(history_len=32)
+        X_tab, X_fcst, y, curr_gt, t = loader.make_ultra_short_dataset(history_len=32)
     elif mode == "short":
-        X, y, _, t = loader.make_short_dataset(history_len=64, horizon_hours=4)
+        X_tab, X_fcst, y, curr_gt, t = loader.make_short_dataset(history_len=64, horizon_hours=4)
     elif mode == "long":
-        X, y, _, t = loader.make_long_dataset(history_len=96, anchor_hour=9)
+        X_tab, X_fcst, y, curr_gt, t = loader.make_long_dataset(history_len=96, anchor_hour=9)
     elif mode == "windowed-long":
-        X, y, _, t = loader.make_sequence_dataset(history_len=96, horizon_steps=192)
+        X_tab, X_fcst, y, curr_gt, t = loader.make_sequence_dataset(history_len=96, horizon_steps=192)
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -652,11 +1038,10 @@ if __name__ == "__main__":
     print("is_sequence  mode:", is_sequence)
 
     # ---------------------------------------------------------
-    # 展平 X
+    # 用新 helper 构造 XGBoost 输入
     # ---------------------------------------------------------
-    #N, T, F = X.shape
-    N = X.shape[0]
-    X_flat = X.reshape(N, -1)
+
+    X_flat = build_xgb_features(X_tab, X_fcst)
 
     # ---------------------------------------------------------
     # 构造监督样本
