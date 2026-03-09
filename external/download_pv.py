@@ -1,17 +1,34 @@
-import argparse
 import json
 import random
 import sys
 import time
+from pathlib import Path
 from typing import List
 
 import requests
 import urllib3
+import yaml
 
 urllib3.disable_warnings()
-from urllib.parse import quote, urlparse
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+CONF_PATH = PROJECT_ROOT / "config" / "conf.yaml"
+PASSWORDS_PATH = PROJECT_ROOT / "config" / "passwords.yaml"
 
 session = requests.session()
+
+
+def load_conf():
+    with open(CONF_PATH) as f:
+        return yaml.safe_load(f)
+
+
+def resolve_path(p: str) -> Path:
+    path = Path(p)
+    return path if path.is_absolute() else (PROJECT_ROOT / p).resolve()
+header = {
+    "application/json": "application/json"
+}
 
 def get_token(endpoint, username, password):
     """
@@ -92,11 +109,11 @@ def get_real_kpi(endpoint, inv_device_dev_ids: List[str], dev_type_id: int):
     }
     resp = session.post(url=req_url, json=req_json, verify=False, headers=header)
     if resp.status_code == 200 and resp.json()["success"] is True:
-        print("get real kep success")
+        print("get real kpi success")
         return resp.json()["data"]
     else:
-        print(f"get real kep failed：{resp.json()}")
-        sys.exit(1)
+        print(f"get real kpi failed：{resp.json()}")
+        # sys.exit(1)
 
 
 def main(endpoint, username, password):
@@ -107,6 +124,8 @@ def main(endpoint, username, password):
     :param password:
     :return:
     """
+    conf = load_conf()
+    out_dir = resolve_path(conf.get("paths", {}).get("pv_download", "data/pv"))
     get_token(endpoint, username, password)
     station_total = get_station_list(endpoint, get_total=True)
     print("总电站数：", station_total)
@@ -129,7 +148,7 @@ def main(endpoint, username, password):
         # 防止限流
         time.sleep(random.randint(3, 10))
 
-    # 获取设备实时数据，单词最多100个设备
+    # 获取设备实时数据，单次最多100个设备
     # 户用逆变器实时数据
     inv_active_power = {}
     print(f"获取户用逆变器实时功率, 逆变器个数：{len(house_inv_dev_ids)}")
@@ -140,7 +159,7 @@ def main(endpoint, username, password):
         time.sleep(random.randint(3, 10))
 
     # PV逆变器实时数据获取
-    print(f"获取PV逆变器实时功率, 逆变器个数：{len(house_inv_dev_ids)}")
+    print(f"获取PV逆变器实时功率, 逆变器个数：{len(pv_inv_dev_ids)}")
     for i in range(0, len(pv_inv_dev_ids), 100):
         pv_kpi = get_real_kpi(endpoint, pv_inv_dev_ids[i: i + 100], 38)
         for each_data in pv_kpi:
@@ -151,14 +170,31 @@ def main(endpoint, username, password):
         print(f"{each_inv}：{each_active_power}")
 
     # 结果写入文件
-    with open("device_active_power.json", "w", encoding="utf-8") as f:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "device_active_power.json"
+    with open(out_path, "w", encoding="utf-8") as f:
         json.dump(inv_active_power, f, indent=4, ensure_ascii=False)
+    print(f"Saved: {out_path}")
 
 
 
-if __name__ == '__main__':
-    endpoint = "cn.fusionsolar.huawei.com"
-    username = ""
-    password = ""
+def load_passwords():
+    """Read endpoint, username, password from config/passwords.yaml (pv section)."""
+    if not PASSWORDS_PATH.exists():
+        print(f"Missing {PASSWORDS_PATH}. Create it with pv.endpoint, pv.username, pv.password.")
+        sys.exit(1)
+    with open(PASSWORDS_PATH) as f:
+        data = yaml.safe_load(f)
+    pv = data.get("pv") or {}
+    endpoint = pv.get("endpoint", "").strip()
+    username = (pv.get("username") or "").strip()
+    password = (pv.get("password") or "").strip()
+    if not endpoint or not username or not password:
+        print("Set pv.endpoint, pv.username, and pv.password in config/passwords.yaml")
+        sys.exit(1)
+    return endpoint, username, password
 
+
+if __name__ == "__main__":
+    endpoint, username, password = load_passwords()
     main(endpoint, username, password)

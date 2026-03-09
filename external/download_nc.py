@@ -2,15 +2,17 @@
 import ftplib
 import os
 import time
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
+import yaml
+
 # ================= CONFIG =================
-FTP_HOST = "ftp.ptree.jaxa.jp"
-FTP_USER = "weize.zhang_h-partners.com"
-FTP_PASS = "SP+wari8"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+CONF_PATH = PROJECT_ROOT / "config" / "conf.yaml"
+PASSWORDS_PATH = PROJECT_ROOT / "config" / "passwords.yaml"
 
 BASE_DIR = "/pub/himawari/L2/CLP/010"
-LOCAL_DIR = "./nc_files"
 
 CHECK_INTERVAL = 600  # 10 minutes
 MAX_FILES = 24
@@ -18,9 +20,34 @@ HOURS_BACK_INIT = 6   # how far back to scan on first run
 # =========================================
 
 
-def connect_ftp():
-    ftp = ftplib.FTP(FTP_HOST)
-    ftp.login(FTP_USER, FTP_PASS)
+def load_conf():
+    with open(CONF_PATH) as f:
+        return yaml.safe_load(f)
+
+
+def resolve_path(p: str) -> Path:
+    path = Path(p)
+    return path if path.is_absolute() else (PROJECT_ROOT / p).resolve()
+
+
+def load_ftp_credentials():
+    """Read FTP host, user, password from config/passwords.yaml (jaxa_ftp section)."""
+    if not PASSWORDS_PATH.exists():
+        raise SystemExit(f"Missing {PASSWORDS_PATH}. Add jaxa_ftp.host, jaxa_ftp.user, jaxa_ftp.password.")
+    with open(PASSWORDS_PATH) as f:
+        data = yaml.safe_load(f) or {}
+    ftp = data.get("jaxa_ftp") or {}
+    host = (ftp.get("host") or "").strip()
+    user = (ftp.get("user") or "").strip()
+    password = (ftp.get("password") or "").strip()
+    if not host or not user or not password:
+        raise SystemExit("Set jaxa_ftp.host, jaxa_ftp.user, jaxa_ftp.password in config/passwords.yaml")
+    return host, user, password
+
+
+def connect_ftp(host, user, password):
+    ftp = ftplib.FTP(host)
+    ftp.login(user, password)
     return ftp
 
 
@@ -74,9 +101,9 @@ def list_remote_files(ftp, hours_back):
     return files
 
 
-def download_file(ftp, remote_dir, filename):
-    os.makedirs(LOCAL_DIR, exist_ok=True)
-    local_path = os.path.join(LOCAL_DIR, filename)
+def download_file(ftp, remote_dir, filename, local_dir):
+    os.makedirs(local_dir, exist_ok=True)
+    local_path = os.path.join(local_dir, filename)
 
     ftp.cwd(remote_dir)
     with open(local_path, "wb") as f:
@@ -85,12 +112,12 @@ def download_file(ftp, remote_dir, filename):
     print(f"Downloaded: {filename}")
 
 
-def local_files():
+def local_files(local_dir):
     files = []
-    if not os.path.exists(LOCAL_DIR):
+    if not os.path.exists(local_dir):
         return files
 
-    for f in os.listdir(LOCAL_DIR):
+    for f in os.listdir(local_dir):
         if f.endswith(".nc") and "FLDK" in f:
             t = parse_time_from_name(f)
             if t:
@@ -98,37 +125,37 @@ def local_files():
     return files
 
 
-def delete_oldest_local():
-    files = local_files()
+def delete_oldest_local(local_dir):
+    files = local_files(local_dir)
     if len(files) <= MAX_FILES:
         return
 
     files.sort()  # oldest first
     while len(files) > MAX_FILES:
         _, fname = files.pop(0)
-        os.remove(os.path.join(LOCAL_DIR, fname))
+        os.remove(os.path.join(local_dir, fname))
         print(f"Deleted oldest: {fname}")
 
 
-def initial_download():
-    ftp = connect_ftp()
+def initial_download(local_dir, ftp_host, ftp_user, ftp_pass):
+    ftp = connect_ftp(ftp_host, ftp_user, ftp_pass)
     files = list_remote_files(ftp, HOURS_BACK_INIT)
 
     files.sort(reverse=True)  # newest first
     for t, name, rdir in files[:MAX_FILES]:
-        download_file(ftp, rdir, name)
+        download_file(ftp, rdir, name, local_dir)
 
     ftp.quit()
 
 
-def check_for_updates():
-    ftp = connect_ftp()
+def check_for_updates(local_dir, ftp_host, ftp_user, ftp_pass):
+    ftp = connect_ftp(ftp_host, ftp_user, ftp_pass)
 
     # Look back far enough to catch multiple new files
     remote_files = list_remote_files(ftp, hours_back=4)
     remote_files.sort()  # oldest → newest
 
-    local = local_files()
+    local = local_files(local_dir)
     local_times = {t for t, _ in local}
 
     new_files = [
@@ -143,27 +170,30 @@ def check_for_updates():
         return
 
     for t, name, rdir in new_files:
-        download_file(ftp, rdir, name)
+        download_file(ftp, rdir, name, local_dir)
 
-    delete_oldest_local()
+    delete_oldest_local(local_dir)
     ftp.quit()
 
 
 def main():
-    os.makedirs(LOCAL_DIR, exist_ok=True)
+    conf = load_conf()
+    local_dir = resolve_path(conf.get("paths", {}).get("sat_download", "nc_files"))
+    ftp_host, ftp_user, ftp_pass = load_ftp_credentials()
+    os.makedirs(local_dir, exist_ok=True)
 
-    if len(local_files()) < MAX_FILES:
+    if len(local_files(local_dir)) < MAX_FILES:
         print("Initial download...")
-        initial_download()
+        initial_download(local_dir, ftp_host, ftp_user, ftp_pass)
 
     while True:
         try:
-            check_for_updates()
+            check_for_updates(local_dir, ftp_host, ftp_user, ftp_pass)
         except Exception as e:
             print(f"Error: {e}")
 
         time.sleep(CHECK_INTERVAL)
-        print (f"Sleeping for {CHECK_INTERVAL} seconds")
+        print(f"Sleeping for {CHECK_INTERVAL} seconds")
 
 
 if __name__ == "__main__":

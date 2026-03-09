@@ -1,11 +1,15 @@
 # Paths and overall settings
 
+
 paths:
   config_dir: config
   nwp_config: config/NWP.yaml
   data_dir: "/home/cosmo/workspace/data"
+  sat_download: "/home/cosmo/workspace/data/himawari"   # local path for satellite downloads (e.g. NC files)
+  pv_download: "/home/cosmo/workspace/data/pv"
   nwp_download: "/home/cosmo/workspace/data/nwp_download"
   nwp_newest: "/home/cosmo/workspace/data/nwp_newest"
+  
 
 nwp:
   solar_subdir: solar
