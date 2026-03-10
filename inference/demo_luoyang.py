@@ -157,7 +157,7 @@ class LuoyangDataLoader:
         wind_forecast_path=None,
         forecast_feature_config=None,
         satellite_root=None, # 卫星nc根目录，例如 /home/weize/ai4energy_crop
-        satellite_cache=None, # 卫星cache目录
+        satellite_cache=None, # 卫星cache目录 i.e. /home/weize/sat_cache
         satellite_vars=("CLTT", "CLTH", "CLOT", "CLTYPE"),
         use_satellite=False,
         satellite_history_len=9, # 过去多少帧卫星图像
@@ -211,13 +211,14 @@ class LuoyangDataLoader:
             forecast_feature_config = {
                 "solar": ["ssrd"],
                 "wind": [
-                    "t2m",
+                    #"t2m",
                     #"msl",
-                    #"u10",
-                    #"v10",
+                    "u10",
+                    "v10",
+                    "wind_speed_10m",
                     #"u100",
                     #"v100",
-                    #"wind_speed_10m",
+                    #"wind_speed_100m",
                 ]
             }
 
@@ -233,8 +234,8 @@ class LuoyangDataLoader:
         self.step_per_hour = int(60 // freq_minutes)
         self._load_forecast_data()
         self._build_features()
-        if self.use_satellite:
-            self._build_satellite_index()
+        #if self.use_satellite:
+        self._build_satellite_index()
 
     # -------------------------------------------------
     # 建立卫星文件时间索引
@@ -510,6 +511,10 @@ class LuoyangDataLoader:
             if "wind_speed_10m" in self.forecast_feature_config["wind"]:
                 wind_df["wind_speed_10m"] = np.sqrt(
                     wind_df["u10"]**2 + wind_df["v10"]**2
+                )
+            if "wind_speed_100m" in self.forecast_feature_config["wind"]:
+                wind_df["wind_speed_100m"] = np.sqrt(
+                    wind_df["u100"]**2 + wind_df["v100"]**2
                 )
 
             wind_block = wind_df.set_index("forecast_time")[
@@ -824,6 +829,69 @@ class LuoyangDataLoader:
                 T
             )
 
+# 帮助函数：把 X_tab 和 X_fcst flatten 后拼接成 XGBoost 可用的二维特征
+def build_xgb_features(X_tab, X_fcst):
+    """
+    X_tab:  (N, T_tab, F_tab)
+    X_fcst: (N, T_fcst, F_fcst)
+
+    返回:
+        X_flat: (N, D)
+    """
+    N = X_tab.shape[0]
+
+    # [NEW] tabular flatten
+    X_tab_flat = X_tab.reshape(N, -1)
+
+    # [NEW] forecast flatten
+    X_fcst_flat = X_fcst.reshape(N, -1)
+
+    # [NEW] 拼接成最终树模型输入
+    X_flat = np.concatenate([X_tab_flat, X_fcst_flat], axis=1)
+
+    return X_flat
+
+# 帮助函数： extract_satellite_features
+def extract_satellite_features(X_sat):
+    """
+    从卫星序列提取简单统计特征
+
+    X_sat shape:
+        (N, T_sat, C, H, W)
+
+    返回:
+        (N, 3)
+    """
+
+    N = X_sat.shape[0]
+
+    feats = []
+
+    for i in range(N):
+
+        sat = X_sat[i]  # (T,C,H,W)
+
+        # flatten temporal
+        sat = sat.reshape(-1, sat.shape[1], sat.shape[2], sat.shape[3])
+        # (T,C,H,W)
+
+        CLTT = sat[:,0,:,:]
+        CLOT = sat[:,2,:,:]
+
+        mean_cltt = np.mean(CLTT)
+
+        mean_clot = np.mean(CLOT)
+
+        cloud_cov = np.mean(CLOT > 0)
+
+        feats.append([
+            mean_cltt,
+            mean_clot,
+            cloud_cov
+        ])
+
+    return np.asarray(feats, dtype=np.float32)
+
 # ==========================================================
 # unit test（检查结构, shape and reasonable values）
 # ==========================================================
@@ -835,7 +903,11 @@ def _unit_test():
         csv_path=agg_path,
         feature_cols=["total_active_kw", "mean_inner_temp"],
         add_time_encoding=True,
-        use_satellite=False
+        #solar_forecast_path="/home/weize/ai4energy/luoyang_demo/datasets/112.285_34.700_UTC0_model_solar_v5.csv",
+        #wind_forecast_path="/home/weize/ai4energy/luoyang_demo/datasets/112.285_34.700_UTC0_model_wind_v5.csv",
+        use_satellite=False,
+        satellite_root="/home/weize/ai4energy_crop",
+        satellite_cache="/home/weize/sat_cache",
     )
 
     # =====================================================
@@ -925,6 +997,7 @@ def _unit_test():
     # =====================================================
     # satellite enabled test
     # =====================================================
+    breakpoint()
     loader_sat = LuoyangDataLoader(
         csv_path=agg_path,
         feature_cols=["total_active_kw", "mean_inner_temp"],
@@ -953,7 +1026,8 @@ def _unit_test():
     print("\nAll unit tests passed successfully.")
 
 if __name__ == "__main__":
-    #_unit_test()
+    _unit_test()
+    breakpoint()
     capacity = 0.5 * 117 * 1e3
     loader = LuoyangDataLoader(
         csv_path=agg_path,
@@ -970,60 +1044,42 @@ if __name__ == "__main__":
                 "ssrd"
             ],
             "wind": [
-                "t2m",
+                #"t2m",
                 #"msl",
-                #"u10",
-                #"v10",
+                "u10",
+                "v10",
+                "wind_speed_10m",
                 #"u100",
                 #"v100",
-                #"wind_speed_10m"
+                #"wind_speed_100m",
             ]
         },
-        use_satellite=False,
+        use_satellite=True,
+        satellite_root="/home/weize/ai4energy_crop",
+        satellite_cache="/home/weize/sat_cache",
     )
     # train and eval
     from xgboost import XGBRegressor
     from sklearn.metrics import mean_absolute_error, mean_squared_error
     import numpy as np
 
-    # 帮助函数：把 X_tab 和 X_fcst flatten 后拼接成 XGBoost 可用的二维特征
-    def build_xgb_features(X_tab, X_fcst):
-        """
-        X_tab:  (N, T_tab, F_tab)
-        X_fcst: (N, T_fcst, F_fcst)
-
-        返回:
-            X_flat: (N, D)
-        """
-        N = X_tab.shape[0]
-
-        # [NEW] tabular flatten
-        X_tab_flat = X_tab.reshape(N, -1)
-
-        # [NEW] forecast flatten
-        X_fcst_flat = X_fcst.reshape(N, -1)
-
-        # [NEW] 拼接成最终树模型输入
-        X_flat = np.concatenate([X_tab_flat, X_fcst_flat], axis=1)
-
-        return X_flat
-
     # -------------------------------------------------------
     # 构造数据
     # -------------------------------------------------------
 
-    mode = "windowed-long" #ultra-short", "short", "long", "windowed-long"
+    mode = "short" #ultra-short", "short", "long", "windowed-long"
     if mode == "ultra-short":
-        X_tab, X_fcst, y, curr_gt, t = loader.make_ultra_short_dataset(history_len=32)
+        X_tab, X_sat, X_sat_mask, X_fcst, y, curr_gt, t = loader.make_ultra_short_dataset(history_len=32)
     elif mode == "short":
-        X_tab, X_fcst, y, curr_gt, t = loader.make_short_dataset(history_len=64, horizon_hours=4)
+        X_tab, X_sat, X_sat_mask, X_fcst, y, curr_gt, t = loader.make_short_dataset(history_len=64, horizon_hours=4)
     elif mode == "long":
-        X_tab, X_fcst, y, curr_gt, t = loader.make_long_dataset(history_len=96, anchor_hour=9)
+        X_tab, X_sat, X_sat_mask, X_fcst, y, curr_gt, t = loader.make_long_dataset(history_len=96, anchor_hour=9)
     elif mode == "windowed-long":
-        X_tab, X_fcst, y, curr_gt, t = loader.make_sequence_dataset(history_len=96, horizon_steps=192)
+        X_tab, X_sat, X_sat_mask, X_fcst, y, curr_gt, t = loader.make_sequence_dataset(history_len=96, horizon_steps=192)
     else:
         raise ValueError(f"Unknown mode: {mode}")
-
+    
+    # XGBoost demo
     model_path = (
         agg_path.parent
         / f"{agg_path.stem}_{mode}_xgb.json"
@@ -1040,9 +1096,20 @@ if __name__ == "__main__":
     # ---------------------------------------------------------
     # 用新 helper 构造 XGBoost 输入
     # ---------------------------------------------------------
+    if loader.use_satellite == False:
+        X_flat = build_xgb_features(X_tab, X_fcst)
+    else:
+        X_tab_flat = X_tab.reshape(X_tab.shape[0], -1)
+        X_fcst_flat = X_fcst.reshape(X_fcst.shape[0], -1)
 
-    X_flat = build_xgb_features(X_tab, X_fcst)
+        # NEW
+        X_sat_feat = extract_satellite_features(X_sat)
 
+        # concatenate
+        X_flat = np.concatenate(
+            [X_tab_flat, X_fcst_flat, X_sat_feat],
+            axis=1
+        )
     # ---------------------------------------------------------
     # 构造监督样本
     # ---------------------------------------------------------
