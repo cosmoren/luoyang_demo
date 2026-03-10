@@ -44,9 +44,10 @@ class PVShortDataset(Dataset):
         X_sat = torch.tensor(sat_seq, dtype=torch.float32)
         X_sat_mask = torch.tensor(sat_mask, dtype=torch.float32)
         X_sat = X_sat * X_sat_mask.view(-1,1,1,1)
-        mean = self.sat_mean.view(1,-1,1,1)
-        std  = self.sat_std.view(1,-1,1,1)
-        X_sat = (X_sat - mean) / std # normalize
+        n_var = len(loader.satellite_vars)
+        mean = self.sat_mean[:n_var].view(1,-1,1,1)
+        std  = self.sat_std[:n_var].view(1,-1,1,1)
+        X_sat[:,:n_var] = (X_sat[:,:n_var] - mean) / std # normalize
         X_sat_mask = torch.tensor(sat_mask, dtype=torch.float32)
 
         return X_tab, X_sat, X_sat_mask, X_fcst, y
@@ -416,7 +417,7 @@ if __name__ == "__main__":
     print("Building dataset...")
 
     X_tab,X_fcst,y,curr_gt,t = loader.make_short_dataset(
-        history_len=4,
+        history_len=16,
         horizon_hours=4
     )
 
