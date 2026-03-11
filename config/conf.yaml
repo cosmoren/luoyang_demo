@@ -6,10 +6,13 @@ paths:
   nwp_config: config/NWP.yaml
   data_dir: "/home/cosmo/workspace/data"
   sat_download: "/home/cosmo/workspace/data/himawari"   # local path for satellite downloads (e.g. NC files)
-  pv_download: "/home/cosmo/workspace/data/pv"
+  # NWP
   nwp_download: "/home/cosmo/workspace/data/nwp_download"
   nwp_newest: "/home/cosmo/workspace/data/nwp_newest"
-  
+  # NorthAPI
+  pv_download: "/home/cosmo/workspace/data/pv"
+  pv_station_meta: "/home/cosmo/workspace/luoyang_demo/data"
+  pv_device_path: "/home/cosmo/workspace/luoyang_demo/datasets/XINSHENG_power_total_devices_type1.xlsx"
 
 nwp:
   solar_subdir: solar
