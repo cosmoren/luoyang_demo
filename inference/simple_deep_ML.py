@@ -14,14 +14,18 @@ from demo_luoyang import LuoyangDataLoader
 # Dataset wrapper
 # =====================================================
 
+OUTPUT_DIM = 192   # change to 192 for sequence forecast
+
 class PVShortDataset(Dataset):
 
-    def __init__(self, loader, X_tab, X_fcst, y, t, tab_mean,
-        tab_std, fcst_mean, fcst_std, sat_mean, sat_std):
+    def __init__(self, loader, capacity, X_tab, X_fcst, y, curr_gt, t, tab_mean,
+        tab_std, fcst_mean, fcst_std, sat_mean, sat_std, y_scale_factor):
         self.loader = loader
+        self.capacity = capacity
         self.X_tab = torch.tensor(X_tab, dtype=torch.float32)
         self.X_fcst = torch.tensor(X_fcst, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.float32)
+        self.curr_gt = torch.tensor(curr_gt, dtype=torch.float32)
         self.times = pd.to_datetime(t)
         self.tab_mean = torch.tensor(tab_mean, dtype=torch.float32)
         self.tab_std  = torch.tensor(tab_std, dtype=torch.float32)
@@ -29,6 +33,7 @@ class PVShortDataset(Dataset):
         self.fcst_std  = torch.tensor(fcst_std, dtype=torch.float32)
         self.sat_mean = torch.tensor(sat_mean, dtype=torch.float32)
         self.sat_std  = torch.tensor(sat_std, dtype=torch.float32)
+        self.y_scale_factor = y_scale_factor
 
     def __len__(self):
         return len(self.y)
@@ -36,7 +41,8 @@ class PVShortDataset(Dataset):
     def __getitem__(self, idx):
         X_tab = (self.X_tab[idx] - self.tab_mean) / self.tab_std # normalize
         X_fcst = (self.X_fcst[idx] - self.fcst_mean) / self.fcst_std # normalize
-        y = self.y[idx]
+        y = (self.y[idx] - self.curr_gt[idx]) / self.y_scale_factor # normalize
+        curr_gt = self.curr_gt[idx]
         t0 = self.times[idx]
 
         # 调用原 dataloader
@@ -44,13 +50,12 @@ class PVShortDataset(Dataset):
         X_sat = torch.tensor(sat_seq, dtype=torch.float32)
         X_sat_mask = torch.tensor(sat_mask, dtype=torch.float32)
         X_sat = X_sat * X_sat_mask.view(-1,1,1,1)
-        n_var = len(loader.satellite_vars)
+        n_var = len(self.loader.satellite_vars)
         mean = self.sat_mean[:n_var].view(1,-1,1,1)
         std  = self.sat_std[:n_var].view(1,-1,1,1)
         X_sat[:,:n_var] = (X_sat[:,:n_var] - mean) / std # normalize
-        X_sat_mask = torch.tensor(sat_mask, dtype=torch.float32)
 
-        return X_tab, X_sat, X_sat_mask, X_fcst, y
+        return X_tab, X_sat, X_sat_mask, X_fcst, y, curr_gt
 
 # ConvLSTMCell
 class ConvLSTMCell(nn.Module):
@@ -199,9 +204,9 @@ class ViTSatelliteEncoder(nn.Module):
         embed_dim=128,
         num_heads=4,
         depth_spatial=2,
-        depth_temporal=2,
+        depth_temporal=1,
         out_dim=64,
-        dropout=0.1
+        dropout=0.3
     ):
         super().__init__()
 
@@ -360,23 +365,24 @@ class PVModel(nn.Module):
             img_h=90,
             img_w=109,
             patch_size=10,
-            embed_dim=128,
+            embed_dim=64,
             num_heads=4,
             depth_spatial=2,
-            depth_temporal=2,
+            depth_temporal=1,
             out_dim=64,
-            dropout=0.1
+            dropout=0.3
         )
-
+        
         #self.fcst_encoder = ForecastEncoder(F_fcst) # test only
 
         self.fusion = nn.Sequential(
             #nn.Linear(64+64+64,128), # test only
             nn.Linear(64+64,128),
             nn.ReLU(),
-
-            nn.Linear(128,1)
+            nn.Dropout(0.3),
+            nn.Linear(128,OUTPUT_DIM)
         )
+        self.log_scale = nn.Parameter(torch.tensor(0.0))
 
     def forward(self,X_tab,X_sat,X_fcst):
 
@@ -389,20 +395,24 @@ class PVModel(nn.Module):
         #z = torch.cat([z_tab,z_sat,z_fcst],dim=1) # test only
         z = torch.cat([z_tab,z_sat],dim=1)
 
-        y = self.fusion(z)
+        y = torch.exp(self.log_scale) * self.fusion(z)
 
-        return y.squeeze(-1)
+        if OUTPUT_DIM == 1:
+            return y.squeeze(-1)
+        else:
+            return y
 
 # =====================================================
 # Train function
 # =====================================================
 
-def train_model(model,train_loader,test_loader,capacity,epochs=20):
+def train_model(model,train_loader,test_loader,capacity,y_scale_factor,epochs=20):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model.to(device)
-    optimizer = optim.Adam(model.parameters(),lr=1e-4)
+    #optimizer = optim.Adam(model.parameters(),lr=1e-4)
+    optimizer = optim.AdamW(model.parameters(),lr=1e-4, weight_decay=1e-4)
 
     loss_fn = nn.MSELoss()
 
@@ -414,7 +424,7 @@ def train_model(model,train_loader,test_loader,capacity,epochs=20):
 
         train_losses = []
 
-        for X_tab,X_sat,X_sat_mask,X_fcst,y in train_loader:
+        for X_tab,X_sat,X_sat_mask,X_fcst,y,curr_gt in train_loader:
             # test only
             #print("tab mean:", X_tab.mean().item())
             #print("tab std:", X_tab.std().item())
@@ -462,13 +472,16 @@ def train_model(model,train_loader,test_loader,capacity,epochs=20):
 
         with torch.no_grad():
 
-            for X_tab,X_sat,X_sat_mask,X_fcst,y in test_loader:
+            for X_tab,X_sat,X_sat_mask,X_fcst,y,curr_gt in test_loader:
                 X_tab = X_tab.to(device)
                 X_sat = X_sat.to(device)
                 X_fcst = X_fcst.to(device)
-
-                pred = model(X_tab,X_sat,X_fcst)
-
+                if OUTPUT_DIM == 1:
+                    pred = model(X_tab,X_sat,X_fcst) * y_scale_factor + curr_gt.to(device)
+                    y_abs = (y * y_scale_factor + curr_gt)
+                else:
+                    pred = model(X_tab,X_sat,X_fcst) * y_scale_factor + curr_gt.unsqueeze(1).to(device)
+                    y_abs = (y * y_scale_factor + curr_gt.unsqueeze(1))
                 '''
                 print("Detecting NaN in eval")
                 if torch.isnan(X_tab).any():
@@ -487,7 +500,7 @@ def train_model(model,train_loader,test_loader,capacity,epochs=20):
                     print("pred good")
                 '''
                     
-                y_true.append(y.cpu().numpy())
+                y_true.append(y_abs.cpu().numpy())
                 y_pred.append(pred.cpu().numpy())
 
         y_true = np.concatenate(y_true)
@@ -549,9 +562,15 @@ if __name__ == "__main__":
 
     print("Building dataset...")
 
-    X_tab,X_fcst,y,curr_gt,t = loader.make_short_dataset(
-        history_len=16,
-        horizon_hours=4
+    # X_tab,X_fcst,y,curr_gt,t = loader.make_short_dataset(
+    #     history_stride=16, # 4 hour
+    #     history_len=2,
+    #     horizon_hours=4
+    # )
+    X_tab,X_fcst,y,curr_gt,t = loader.make_sequence_dataset(
+        history_stride=4, # 4->1 hour
+        history_len=12,
+        horizon_steps=192
     )
 
     print("Dataset shapes")
@@ -567,6 +586,8 @@ if __name__ == "__main__":
     X_tab = X_tab[order]
     X_fcst = X_fcst[order]
     y = y[order]
+    curr_gt = curr_gt[order]
+    t = t[order]
 
     # ======================================
     # split
@@ -574,13 +595,30 @@ if __name__ == "__main__":
 
     split = int(len(y)*0.7)
 
+    # clean the data
+    np.random.seed(42)
+    X_tab_train = X_tab[:split]
+    status = X_tab_train[:, -1, 2]
+    good_mask = status == 1
+    bad_indices = np.where(status == 0)[0]
+    keep_bad = np.random.choice(
+        bad_indices,
+        size=int(len(bad_indices) * 0.1),
+        replace=False
+    )
+    train_mask = good_mask.copy()
+    train_mask[keep_bad] = True
+    #pv = curr_gt[:split]
+    #day_mask = pv > 0.0001 * capacity # keep day time
+    #train_mask = train_mask & day_mask
+
     # compute normalization stats
     # tabular
-    tab_mean = X_tab[:split].mean(axis=(0,1))
-    tab_std  = X_tab[:split].std(axis=(0,1)) + 1e-6
+    tab_mean = X_tab[:split][train_mask].mean(axis=(0,1))
+    tab_std  = X_tab[:split][train_mask].std(axis=(0,1)) + 1e-6
     # forecast
-    fcst_mean = X_fcst[:split].mean(axis=(0,1))
-    fcst_std  = X_fcst[:split].std(axis=(0,1)) + 1e-6
+    fcst_mean = X_fcst[:split][train_mask].mean(axis=(0,1))
+    fcst_std  = X_fcst[:split][train_mask].std(axis=(0,1)) + 1e-6
     print("tab_mean", tab_mean)
     print("tab_std", tab_std)
     print("fcst_mean", fcst_mean)
@@ -588,10 +626,18 @@ if __name__ == "__main__":
     # satellite stats (sample)
     sat_mean = np.zeros(len(loader.satellite_vars)+1)
     sat_std  = np.zeros(len(loader.satellite_vars)+1)
+    # y scale
+    if OUTPUT_DIM == 1:
+        y_scale_factor = np.abs(y[:split][train_mask] - curr_gt[:split][train_mask]).max()
+    else:
+        y_scale_factor = np.abs(y[:split][train_mask] - curr_gt[:split][train_mask][:, None]).max()
+
     count = 0
-    sample_n = min(2000, split)
+    train_indices = np.where(train_mask)[0]
+    sample_n = min(2000, len(train_indices))
     for i in range(sample_n):
-        sat_seq, sat_mask = loader._build_satellite_sequence(pd.to_datetime(t[i]))
+        idx = train_indices[i]
+        sat_seq, sat_mask = loader._build_satellite_sequence(pd.to_datetime(t[idx]))
         valid = sat_mask.astype(bool)
         if valid.sum() == 0:
             continue
@@ -608,30 +654,36 @@ if __name__ == "__main__":
 
     train_dataset = PVShortDataset(
         loader,
-        X_tab[:split],
-        X_fcst[:split],
-        y[:split],
-        t[:split],
+        capacity,
+        X_tab[:split][train_mask],
+        X_fcst[:split][train_mask],
+        y[:split][train_mask],
+        curr_gt[:split][train_mask],
+        t[:split][train_mask],
         tab_mean,
         tab_std,
         fcst_mean,
         fcst_std,
         sat_mean,
-        sat_std
+        sat_std,
+        y_scale_factor
     )
 
     test_dataset = PVShortDataset(
         loader,
+        capacity,
         X_tab[split:],
         X_fcst[split:],
         y[split:],
+        curr_gt[split:],
         t[split:],
         tab_mean,
         tab_std,
         fcst_mean,
         fcst_std,
         sat_mean,
-        sat_std
+        sat_std,
+        y_scale_factor
     )
 
     train_loader = DataLoader(
@@ -662,5 +714,6 @@ if __name__ == "__main__":
         train_loader,
         test_loader,
         capacity,
+        y_scale_factor,
         epochs=500
     )

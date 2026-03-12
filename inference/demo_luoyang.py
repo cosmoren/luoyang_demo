@@ -585,6 +585,7 @@ class LuoyangDataLoader:
     # -------------------------------------------------
     def make_single_horizon_dataset(
         self,
+        history_stride,
         history_len,
         horizon_steps
     ):
@@ -598,13 +599,16 @@ class LuoyangDataLoader:
 
         max_i = len(self.df) - horizon_steps
         count= 0
-        for i in range(history_len - 1, max_i):
+        max_history_offset = (history_len - 1) * history_stride
+        for i in range(max_history_offset, max_i):
             count+=1
             if count % 1000 == 0:
-                print("count ", count, " total range ", history_len - 1, " ", max_i)
+                print("count ", count, " total range ", max_history_offset, " ", max_i)
             t0 = pd.to_datetime(self.time_all[i])
             # tabular history
-            x_hist = self.X_all[i - history_len + 1 : i + 1] # (T_tab, F_tab)
+            indices = i - np.arange(history_len)[::-1] * history_stride
+            x_hist = self.X_all[indices] # (T_tab, F_tab)
+            #x_hist = self.X_all[i - history_len + 1 : i + 1] # (T_tab, F_tab)
             # forecast sequence
             target_time = self.time_all[i + horizon_steps]
             fcst = self._build_forecast_features(
@@ -656,8 +660,9 @@ class LuoyangDataLoader:
     # -------------------------------------------------
     # ultra short
     # -------------------------------------------------
-    def make_ultra_short_dataset(self, history_len):
+    def make_ultra_short_dataset(self, history_stride, history_len):
         return self.make_single_horizon_dataset(
+            history_stride=history_stride,
             history_len=history_len,
             horizon_steps=1
         )
@@ -667,6 +672,7 @@ class LuoyangDataLoader:
     # -------------------------------------------------
     def make_short_dataset(
         self,
+        history_stride,
         history_len,
         horizon_hours=4
     ):
@@ -674,6 +680,7 @@ class LuoyangDataLoader:
         horizon_steps = horizon_hours * self.step_per_hour
 
         return self.make_single_horizon_dataset(
+            history_stride=history_stride,
             history_len=history_len,
             horizon_steps=horizon_steps
         )
@@ -683,6 +690,7 @@ class LuoyangDataLoader:
     # -------------------------------------------------
     def make_long_dataset(
         self,
+        history_stride,
         history_len,
         anchor_hour=9
     ):
@@ -699,7 +707,8 @@ class LuoyangDataLoader:
 
         df = self.df
         count= 0
-        for i in range(history_len - 1, len(df)):
+        max_history_offset = (history_len - 1) * history_stride
+        for i in range(max_history_offset, len(df)):
             count+=1
             if count % 1000 == 0:
                 print("count ", count, " total range ", history_len - 1, " ", len(df))
@@ -717,7 +726,8 @@ class LuoyangDataLoader:
                 break
 
             # tabular history
-            x_hist = self.X_all[i - history_len + 1 : i + 1]
+            indices = i - np.arange(history_len)[::-1] * history_stride
+            x_hist = self.X_all[indices]
             # forecast sequence
             target_times = self.time_all[start_y:end_y]
 
@@ -770,6 +780,7 @@ class LuoyangDataLoader:
 
     def make_sequence_dataset(
         self,
+        history_stride,
         history_len,
         horizon_steps
     ):
@@ -783,13 +794,15 @@ class LuoyangDataLoader:
 
         max_i = len(self.df) - horizon_steps
         count = 0
-        for i in range(history_len - 1, max_i):
+        max_history_offset = (history_len - 1) * history_stride
+        for i in range(max_history_offset, max_i):
             count+=1
             if count % 1000 == 0:
-                print("count ", count, " total range ", history_len - 1, " ", max_i)
+                print("count ", count, " total range ", max_history_offset, " ", max_i)
             t0 = pd.to_datetime(self.time_all[i])
             # tabular history
-            x_hist = self.X_all[i - history_len + 1 : i + 1]
+            indices = i - np.arange(history_len)[::-1] * history_stride
+            x_hist = self.X_all[indices]
             # forecast sequence
             target_times = self.time_all[
                 i + 1 : i + 1 + horizon_steps
@@ -922,8 +935,10 @@ def _unit_test():
     # =====================================================
     # ultra short
     # =====================================================
+    history_stride=1
     history_len = 3
     X_tab, X_fcst, y, curr_gt, t = loader.make_ultra_short_dataset(
+        history_stride=history_stride,
         history_len=history_len
     )
 
@@ -953,6 +968,7 @@ def _unit_test():
     # short
     # =====================================================
     X_tab, X_fcst, y, curr_gt, t = loader.make_short_dataset(
+        history_stride=1,
         history_len=16,
         horizon_hours=4
     )
@@ -980,6 +996,7 @@ def _unit_test():
     # long
     # =====================================================
     X_tab, X_fcst, Y, curr_gt, t = loader.make_long_dataset(
+        history_stride=1,
         history_len=32,
         anchor_hour=9
     )
@@ -1013,6 +1030,7 @@ def _unit_test():
     # sequence dataset
     # =====================================================
     X_tab, X_fcst, Y, curr_gt, t = loader.make_sequence_dataset(
+        history_stride=1,
         history_len=32,
         horizon_steps=16
     )
@@ -1049,7 +1067,7 @@ def _unit_test():
     print("Dataloader done.")
 
     X_tab, X_sat, X_sat_mask, X_fcst, y, curr_gt, t = \
-        loader_sat.make_ultra_short_dataset(history_len=8)
+        loader_sat.make_ultra_short_dataset(history_stride=1,history_len=8)
 
     print("make_ultra_short_dataset done.")
 
@@ -1120,13 +1138,13 @@ if __name__ == "__main__":
 
     mode = "short" #ultra-short", "short", "long", "windowed-long"
     if mode == "ultra-short":
-        X_tab, X_sat, X_sat_mask, X_fcst, y, curr_gt, t = loader.make_ultra_short_dataset(history_len=32)
+        X_tab, X_sat, X_sat_mask, X_fcst, y, curr_gt, t = loader.make_ultra_short_dataset(history_stride=1, history_len=32)
     elif mode == "short":
-        X_tab, X_sat, X_sat_mask, X_fcst, y, curr_gt, t = loader.make_short_dataset(history_len=64, horizon_hours=4)
+        X_tab, X_sat, X_sat_mask, X_fcst, y, curr_gt, t = loader.make_short_dataset(history_stride=1, history_len=64, horizon_hours=4)
     elif mode == "long":
-        X_tab, X_sat, X_sat_mask, X_fcst, y, curr_gt, t = loader.make_long_dataset(history_len=96, anchor_hour=9)
+        X_tab, X_sat, X_sat_mask, X_fcst, y, curr_gt, t = loader.make_long_dataset(history_stride=1, history_len=96, anchor_hour=9)
     elif mode == "windowed-long":
-        X_tab, X_sat, X_sat_mask, X_fcst, y, curr_gt, t = loader.make_sequence_dataset(history_len=96, horizon_steps=192)
+        X_tab, X_sat, X_sat_mask, X_fcst, y, curr_gt, t = loader.make_sequence_dataset(history_stride=1, history_len=96, horizon_steps=192)
     else:
         raise ValueError(f"Unknown mode: {mode}")
     
