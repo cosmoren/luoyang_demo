@@ -387,8 +387,11 @@ if __name__ == "__main__":
         print(next_run, now_utc)
         if wait_sec > 0:
             time.sleep(wait_sec)
-
-        capture = datetime.now(timezone.utc)
-        filename = capture.strftime("%Y%m%d_%H%M") + ".csv"
-        save_path = save_dir / filename
-        north_fetcher.fetch_real(save_dir=save_path, collect_time=capture)
+        try:
+            capture = datetime.now(timezone.utc)
+            filename = capture.strftime("%Y%m%d_%H%M") + ".csv"
+            save_path = save_dir / filename
+            north_fetcher.fetch_real(save_dir=save_path, collect_time=capture)
+        except Exception as e:
+            print(f"Error fetching PV data: {e}")
+            time.sleep(10)

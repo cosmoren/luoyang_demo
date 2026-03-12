@@ -46,8 +46,10 @@ def create_infer_online_gui():
     tk.Label(top_frame, text="Current time (Local):", font=("", 10)).pack(side=tk.LEFT, padx=(0, 5))
     local_var = tk.StringVar(value=datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"))
     tk.Entry(top_frame, width=28, font=("", 11), state="readonly", textvariable=local_var).pack(
-        side=tk.LEFT, padx=(0, 0)
+        side=tk.LEFT, padx=(0, 15)
     )
+    site_label = f"Site: {site.get('name', '—')}  lat={latitude}  lon={longitude}"
+    tk.Label(top_frame, text=site_label, font=("", 9)).pack(side=tk.LEFT)
 
     def update_time():
         utc_var.set(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))

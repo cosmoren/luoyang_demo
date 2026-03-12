@@ -1,5 +1,9 @@
 # Paths and overall settings
 
+site:
+  name: Luoyang
+  latitude: 34.65
+  longitude: 112.43
 
 paths:
   config_dir: config
