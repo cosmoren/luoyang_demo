@@ -171,6 +171,127 @@ class SatelliteEncoder(nn.Module):
 
         return pooled.view(B,-1)
 
+class PatchEmbed(nn.Module):
+    def __init__(self, in_chans, embed_dim=128, patch_size=10):
+        super().__init__()
+        self.patch_size = patch_size
+        self.proj = nn.Conv2d(
+            in_chans,
+            embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size
+        )
+
+    def forward(self, x):
+        # x: (B*T, C, H, W)
+        x = self.proj(x)                  # (B*T, D, Hp, Wp)
+        B, D, Hp, Wp = x.shape
+        x = x.flatten(2).transpose(1, 2) # (B*T, N, D)
+        return x, Hp, Wp
+    
+class ViTSatelliteEncoder(nn.Module):
+    def __init__(
+        self,
+        in_chans,
+        img_h=90,
+        img_w=109,
+        patch_size=10,
+        embed_dim=128,
+        num_heads=4,
+        depth_spatial=2,
+        depth_temporal=2,
+        out_dim=64,
+        dropout=0.1
+    ):
+        super().__init__()
+
+        self.patch_embed = PatchEmbed(
+            in_chans=in_chans,
+            embed_dim=embed_dim,
+            patch_size=patch_size
+        )
+
+        # patch 数，按 floor 计算
+        self.num_patches = (img_h // patch_size) * (img_w // patch_size)
+
+        # spatial CLS token
+        self.spatial_cls = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.spatial_pos = nn.Parameter(
+            torch.zeros(1, 1 + self.num_patches, embed_dim)
+        )
+
+        spatial_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 4,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True
+        )
+        self.spatial_encoder = nn.TransformerEncoder(
+            spatial_layer,
+            num_layers=depth_spatial
+        )
+
+        # temporal CLS token
+        self.temporal_cls = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.temporal_pos = nn.Parameter(
+            torch.zeros(1, 1 + 64, embed_dim)  # 先给大一点，forward里切片
+        )
+
+        temporal_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 4,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True
+        )
+        self.temporal_encoder = nn.TransformerEncoder(
+            temporal_layer,
+            num_layers=depth_temporal
+        )
+
+        self.head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, out_dim)
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x: (B, T, C, H, W)
+        B, T, C, H, W = x.shape
+
+        # -------- spatial ViT --------
+        x = x.reshape(B * T, C, H, W)
+        x, Hp, Wp = self.patch_embed(x)  # (B*T, N, D)
+
+        cls_tok = self.spatial_cls.expand(B * T, -1, -1)  # (B*T, 1, D)
+        x = torch.cat([cls_tok, x], dim=1)                # (B*T, 1+N, D)
+
+        pos = self.spatial_pos[:, :x.size(1), :]
+        x = self.dropout(x + pos)
+
+        x = self.spatial_encoder(x)                       # (B*T, 1+N, D)
+
+        frame_feat = x[:, 0, :]                           # (B*T, D)
+        frame_feat = frame_feat.view(B, T, -1)            # (B, T, D)
+
+        # -------- temporal Transformer --------
+        t_cls = self.temporal_cls.expand(B, -1, -1)       # (B, 1, D)
+        x_t = torch.cat([t_cls, frame_feat], dim=1)       # (B, 1+T, D)
+
+        t_pos = self.temporal_pos[:, :x_t.size(1), :]
+        x_t = self.dropout(x_t + t_pos)
+
+        x_t = self.temporal_encoder(x_t)                  # (B, 1+T, D)
+
+        sat_feat = x_t[:, 0, :]                           # (B, D)
+
+        return self.head(sat_feat)                        # (B, out_dim)
+
+
 # =====================================================
 # PV GRU encoder
 # =====================================================
@@ -233,9 +354,21 @@ class PVModel(nn.Module):
 
         self.tab_encoder = TabularEncoder(F_tab)
 
-        self.sat_encoder = SatelliteEncoder(C_sat)
+        #self.sat_encoder = SatelliteEncoder(C_sat)
+        self.sat_encoder = ViTSatelliteEncoder(
+            in_chans=C_sat,
+            img_h=90,
+            img_w=109,
+            patch_size=10,
+            embed_dim=128,
+            num_heads=4,
+            depth_spatial=2,
+            depth_temporal=2,
+            out_dim=64,
+            dropout=0.1
+        )
 
-        # self.fcst_encoder = ForecastEncoder(F_fcst) # test only
+        #self.fcst_encoder = ForecastEncoder(F_fcst) # test only
 
         self.fusion = nn.Sequential(
             #nn.Linear(64+64+64,128), # test only
@@ -251,10 +384,10 @@ class PVModel(nn.Module):
 
         z_sat = self.sat_encoder(X_sat)
 
-        # z_fcst = self.fcst_encoder(X_fcst) # test only
+        #z_fcst = self.fcst_encoder(X_fcst) # test only
 
-        # z = torch.cat([z_tab,z_sat,z_fcst],dim=1) # test only
-        z = torch.cat([z_tab,z_sat],dim=1) # test only
+        #z = torch.cat([z_tab,z_sat,z_fcst],dim=1) # test only
+        z = torch.cat([z_tab,z_sat],dim=1)
 
         y = self.fusion(z)
 
@@ -392,23 +525,23 @@ if __name__ == "__main__":
             "status_ok"
         ],
         add_time_encoding=True,
-        #solar_forecast_path="/home/weize/ai4energy/luoyang_demo/datasets/112.285_34.700_UTC0_model_solar_v5.csv",
-        #wind_forecast_path="/home/weize/ai4energy/luoyang_demo/datasets/112.285_34.700_UTC0_model_wind_v5.csv",
-        #forecast_feature_config={
-        #    "solar": [
-        #        "ssrd"
-        #    ],
-        #    "wind": [
-        #        #"t2m",
-        #        #"msl",
-        #        "u10",
-        #        "v10",
-        #        "wind_speed_10m",
-        #        #"u100",
-        #        #"v100",
-        #        #"wind_speed_100m",
-        #    ]
-        #},
+        # solar_forecast_path="/home/weize/ai4energy/luoyang_demo/datasets/112.285_34.700_UTC0_model_solar_v5.csv",
+        # wind_forecast_path="/home/weize/ai4energy/luoyang_demo/datasets/112.285_34.700_UTC0_model_wind_v5.csv",
+        # forecast_feature_config={
+        #     "solar": [
+        #         "ssrd"
+        #     ],
+        #     "wind": [
+        #         #"t2m",
+        #         #"msl",
+        #         "u10",
+        #         "v10",
+        #         "wind_speed_10m",
+        #         #"u100",
+        #         #"v100",
+        #         #"wind_speed_100m",
+        #     ]
+        # },
         use_satellite=False, # save time
         satellite_root="/home/weize/ai4energy_crop",
         satellite_cache="/home/weize/sat_cache"
@@ -529,5 +662,5 @@ if __name__ == "__main__":
         train_loader,
         test_loader,
         capacity,
-        epochs=20
+        epochs=500
     )

@@ -489,9 +489,14 @@ class LuoyangDataLoader:
                 t0
             )
 
-            solar_block = solar_issue.set_index("forecast_time")[
+            solar_df = solar_issue.set_index("forecast_time")[
                 self.forecast_feature_config["solar"]
-            ].reindex(target_times).values
+            ].sort_index()
+            full_index = solar_df.index.union(pd.to_datetime(target_times))
+            solar_df = solar_df.reindex(full_index).sort_index()
+            solar_df = solar_df.ffill().bfill()
+            solar_block_df = solar_df.loc[pd.to_datetime(target_times)]
+            solar_block = solar_block_df.values
 
             feature_blocks.append(solar_block)
 
@@ -517,9 +522,15 @@ class LuoyangDataLoader:
                     wind_df["u100"]**2 + wind_df["v100"]**2
                 )
 
-            wind_block = wind_df.set_index("forecast_time")[
+            wind_df = wind_df.set_index("forecast_time")[
                 self.forecast_feature_config["wind"]
-            ].reindex(target_times).values
+            ].sort_index()
+            target_times = pd.to_datetime(target_times)
+            full_index = wind_df.index.union(target_times)
+            wind_df = wind_df.reindex(full_index).sort_index()
+            wind_df = wind_df.ffill().bfill()
+            wind_block_df = wind_df.loc[target_times]
+            wind_block = wind_block_df.values
 
             feature_blocks.append(wind_block)
 
@@ -903,8 +914,6 @@ def _unit_test():
         csv_path=agg_path,
         feature_cols=["total_active_kw", "mean_inner_temp"],
         add_time_encoding=True,
-        #solar_forecast_path="/home/weize/ai4energy/luoyang_demo/datasets/112.285_34.700_UTC0_model_solar_v5.csv",
-        #wind_forecast_path="/home/weize/ai4energy/luoyang_demo/datasets/112.285_34.700_UTC0_model_wind_v5.csv",
         use_satellite=False,
         satellite_root="/home/weize/ai4energy_crop",
         satellite_cache="/home/weize/sat_cache",
@@ -926,7 +935,16 @@ def _unit_test():
     assert X_fcst.ndim == 3
     assert len(t) == N
 
-    # 时间应该严格递增
+    # [新增] NaN 检查
+    assert not np.isnan(X_tab).any(), "NaN detected in X_tab"
+    assert not np.isnan(X_fcst).any(), "NaN detected in X_fcst"
+    assert not np.isnan(y).any(), "NaN detected in y"
+
+    # [新增] Inf 检查
+    assert not np.isinf(X_tab).any(), "Inf detected in X_tab"
+    assert not np.isinf(X_fcst).any(), "Inf detected in X_fcst"
+
+    # 时间递增检查
     assert np.all(np.diff(t).astype("timedelta64[m]") >= np.timedelta64(0, "m"))
 
     print("✓ ultra short dataset OK")
@@ -934,7 +952,6 @@ def _unit_test():
     # =====================================================
     # short
     # =====================================================
-
     X_tab, X_fcst, y, curr_gt, t = loader.make_short_dataset(
         history_len=16,
         horizon_hours=4
@@ -944,17 +961,24 @@ def _unit_test():
 
     assert X_tab.shape[1] == 16
     assert X_tab.shape[2] == 4
-
     assert y.shape == (N,)
     assert curr_gt.shape == (N,)
     assert X_fcst.ndim == 3
+
+    # [新增] NaN 检查
+    assert not np.isnan(X_tab).any(), "NaN detected in X_tab"
+    assert not np.isnan(X_fcst).any(), "NaN detected in X_fcst"
+    assert not np.isnan(y).any(), "NaN detected in y"
+
+    # [新增] Inf 检查
+    assert not np.isinf(X_tab).any(), "Inf detected in X_tab"
+    assert not np.isinf(X_fcst).any(), "Inf detected in X_fcst"
 
     print("✓ short dataset OK")
 
     # =====================================================
     # long
     # =====================================================
-
     X_tab, X_fcst, Y, curr_gt, t = loader.make_long_dataset(
         history_len=32,
         anchor_hour=9
@@ -970,7 +994,16 @@ def _unit_test():
         assert X_fcst.ndim == 3
         assert curr_gt.shape == (N,)
 
-        # anchor time 应该是 09:00
+        # [新增] NaN 检查
+        assert not np.isnan(X_tab).any(), "NaN detected in X_tab"
+        assert not np.isnan(X_fcst).any(), "NaN detected in X_fcst"
+        assert not np.isnan(Y).any(), "NaN detected in Y"
+
+        # [新增] Inf 检查
+        assert not np.isinf(X_tab).any(), "Inf detected in X_tab"
+        assert not np.isinf(X_fcst).any(), "Inf detected in X_fcst"
+
+        # anchor time 必须是 09:00
         hours = pd.to_datetime(t).hour
         assert np.all(hours == 9)
 
@@ -979,7 +1012,6 @@ def _unit_test():
     # =====================================================
     # sequence dataset
     # =====================================================
-
     X_tab, X_fcst, Y, curr_gt, t = loader.make_sequence_dataset(
         history_len=32,
         horizon_steps=16
@@ -989,15 +1021,22 @@ def _unit_test():
 
     assert X_tab.shape == (N, 32, 4)
     assert Y.shape == (N, 16)
-
     assert X_fcst.shape[1] == 16
+
+    # [新增] NaN 检查
+    assert not np.isnan(X_tab).any(), "NaN detected in X_tab"
+    assert not np.isnan(X_fcst).any(), "NaN detected in X_fcst"
+    assert not np.isnan(Y).any(), "NaN detected in Y"
+
+    # [新增] Inf 检查
+    assert not np.isinf(X_tab).any(), "Inf detected in X_tab"
+    assert not np.isinf(X_fcst).any(), "Inf detected in X_fcst"
 
     print("✓ sequence dataset OK")
 
     # =====================================================
     # satellite enabled test
     # =====================================================
-    breakpoint()
     loader_sat = LuoyangDataLoader(
         csv_path=agg_path,
         feature_cols=["total_active_kw", "mean_inner_temp"],
@@ -1006,10 +1045,14 @@ def _unit_test():
         satellite_root="/home/weize/ai4energy_crop",
         satellite_cache="/home/weize/sat_cache",
     )
+
     print("Dataloader done.")
+
     X_tab, X_sat, X_sat_mask, X_fcst, y, curr_gt, t = \
         loader_sat.make_ultra_short_dataset(history_len=8)
+
     print("make_ultra_short_dataset done.")
+
     N = len(y)
 
     assert X_sat.ndim == 5
@@ -1018,8 +1061,16 @@ def _unit_test():
     assert X_sat.shape[0] == N
     assert X_sat_mask.shape[0] == N
 
-    # satellite frame mask 只能是 0 或 1
+    # mask 只能是 0 或 1
     assert np.all((X_sat_mask == 0) | (X_sat_mask == 1))
+
+    # [新增] NaN 检查
+    assert not np.isnan(X_sat).any(), "NaN detected in X_sat"
+    assert not np.isnan(X_fcst).any(), "NaN detected in X_fcst"
+    assert not np.isnan(y).any(), "NaN detected in y"
+
+    # [新增] Inf 检查
+    assert not np.isinf(X_sat).any(), "Inf detected in X_sat"
 
     print("✓ satellite dataset OK")
 
