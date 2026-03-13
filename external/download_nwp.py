@@ -9,17 +9,16 @@ from pathlib import Path
 from urllib.request import urlopen, Request
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+import sys
+sys.path.insert(0, str(PROJECT_ROOT))
+from config_utils import get_resolved_paths
+
 CONF_PATH = PROJECT_ROOT / "config" / "conf.yaml"
 
 
 def load_conf():
     with open(CONF_PATH) as f:
         return yaml.safe_load(f)
-
-
-def resolve_path(p: str) -> Path:
-    path = Path(p)
-    return path if path.is_absolute() else (PROJECT_ROOT / p).resolve()
 
 
 def download_file(url: str, out_path: Path, user_agent: str) -> None:
@@ -101,13 +100,13 @@ def copy_download_to_newest(
 
 def main():
     conf = load_conf()
-    paths = conf["paths"]
+    paths = get_resolved_paths(conf, PROJECT_ROOT)
     nwp_conf = conf["nwp"]
     download_conf = conf.get("download", {})
 
-    download_dir = resolve_path(paths["nwp_download"])
-    newest_dir = resolve_path(paths["nwp_newest"])
-    nwp_config_path = resolve_path(paths["nwp_config"])
+    download_dir = paths["nwp_download"]
+    newest_dir = paths["nwp_newest"]
+    nwp_config_path = paths["nwp_config"]
     user_agent = download_conf.get("user_agent", "Mozilla/5.0")
 
     solar_subdir = nwp_conf.get("solar_subdir", "solar")

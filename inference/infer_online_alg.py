@@ -9,17 +9,13 @@ from pvlib import solarposition
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
+from config_utils import get_resolved_paths
 from preprocessing.himawari_infer import create_himawari_tensor
 from preprocessing.pv_infer import create_pv_dataframe
 from models.models import pv_forecasting_model
 import torch
 
 CONF_PATH = _PROJECT_ROOT / "config" / "conf.yaml"
-
-
-def _resolve_path(p: str) -> Path:
-    path = Path(p)
-    return path if path.is_absolute() else (_PROJECT_ROOT / p).resolve()
 
 
 def utc_to_local_solar_time_pvlib(utc_times: pd.DatetimeIndex, longitude: float) -> pd.DatetimeIndex:
@@ -71,7 +67,7 @@ def compute_solar_features(
 
     return [
         {
-            "local_solar_time": local_solar[i].to_pydatetime(),
+            "local_solar_time": local_solar[i].floor("us").to_pydatetime(),
             "azimuth": float(azimuth[i]),
             "zenith": float(zenith[i]),
             "day_of_year": int(day_of_year[i]),
@@ -80,14 +76,14 @@ def compute_solar_features(
         for i in range(len(times_utc))
     ]
 
-class infer_online_alg:
-    def __init__(self):
+class infer_online_alg:    # ckpt = torch.load(checkpoint_path, map_location=self.device)
+    def __init__(self, checkpoint_path: str):
         with open(CONF_PATH) as f:
             conf = yaml.safe_load(f)
-            self.pv_path = _resolve_path(conf.get("paths", {}).get("pv_download", "data/pv"))
-            self.sat_path = _resolve_path(conf.get("paths", {}).get("sat_download", "data/himawari"))
-            pv_device_path = _resolve_path(conf.get("paths", {}).get("pv_device_path", "data/pv_device.xlsx"))
-
+        paths = get_resolved_paths(conf, _PROJECT_ROOT)
+        self.pv_path = paths["pv_download"]
+        self.sat_path = paths["sat_download"]
+        pv_device_path = paths["pv_device_path"]
         site = conf.get("site", {})
         self.latitude = site.get("latitude")
         self.longitude = site.get("longitude")
@@ -97,6 +93,8 @@ class infer_online_alg:
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = pv_forecasting_model(out_dim=64, dev_dn_list=self.devDn_list).to(self.device)
+        ckpt = torch.load(checkpoint_path, map_location=self.device)
+        self.model.load_state_dict(ckpt["model_state_dict"], strict=True)
         self.model.eval()
     
     def inference(self):
@@ -165,5 +163,5 @@ class infer_online_alg:
 
 
 if __name__ == "__main__":
-    inference_online = infer_online_alg()
+    inference_online = infer_online_alg(checkpoint_path='path/to/checkpoint.pt')
     inference_online.inference()

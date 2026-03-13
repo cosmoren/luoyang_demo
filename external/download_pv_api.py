@@ -18,6 +18,9 @@ urllib3.disable_warnings()
 from urllib.parse import quote, urlparse
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+from config_utils import get_resolved_paths
+
 CONF_PATH = PROJECT_ROOT / "config" / "conf.yaml"
 PASSWORDS_PATH = PROJECT_ROOT / "config" / "passwords.yaml"
 
@@ -42,11 +45,6 @@ def load_passwords():
         print("Set pv.endpoint, pv.username, and pv.password in config/passwords.yaml")
         sys.exit(1)
     return endpoint, username, password
-
-
-def resolve_path(p: str) -> Path:
-    path = Path(p)
-    return path if path.is_absolute() else (PROJECT_ROOT / p).resolve()
 
 
 DEVICE_METAINFOS = [
@@ -361,13 +359,10 @@ def next_five_minute() -> datetime:
 if __name__ == "__main__":
     endpoint, username, password = load_passwords()
     conf = load_conf()
-    paths = conf.get("paths", {})
-    pv_download = paths.get("pv_download", "data/pv")
-    save_dir = resolve_path(pv_download)
-    device_path_raw = paths.get("pv_device_path")
-    station_meta_raw = paths.get("pv_station_meta")
-    device_path = str(resolve_path(device_path_raw)) if device_path_raw else None
-    station_meta_save_dir = str(resolve_path(station_meta_raw)) if station_meta_raw else None
+    paths = get_resolved_paths(conf, PROJECT_ROOT)
+    save_dir = paths["pv_download"]
+    device_path = str(paths["pv_device_path"]) if paths.get("pv_device_path") else None
+    station_meta_save_dir = str(paths["pv_station_meta"]) if paths.get("pv_station_meta") else None
 
     dev_type = 1
     north_fetcher = NorthFetcher(

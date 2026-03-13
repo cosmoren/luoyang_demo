@@ -19,6 +19,7 @@ from pvlib import solarposition
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
+from config_utils import get_resolved_paths
 from models.models import pv_forecasting_model
 from training.luoyang_data_loader import build_train_test_splits
 from datetime import datetime, timedelta, timezone
@@ -30,22 +31,10 @@ SOLAR_FEATURE_DIM = 8
 PV_ZTIME_DIM = 6
 
 
-def _resolve_path(p) -> Path:
-    if p is None:
-        return None
-    path = Path(p)
-    return path if path.is_absolute() else (_PROJECT_ROOT / p).resolve()
-
-
 def load_config():
     with open(CONF_PATH) as f:
         conf = yaml.safe_load(f)
     return conf
-
-
-def _resolve_path(p: str) -> Path:
-    path = Path(p)
-    return path if path.is_absolute() else (_PROJECT_ROOT / p).resolve()
 
 
 def utc_to_local_solar_time_pvlib(utc_times: pd.DatetimeIndex, longitude: float) -> pd.DatetimeIndex:
@@ -117,12 +106,12 @@ class PVDataset(Dataset):
     def __init__(self, data_dir: str):
 
         CONF_PATH = _PROJECT_ROOT / "config" / "conf.yaml"
-        
         with open(CONF_PATH) as f:
             conf = yaml.safe_load(f)
-            self.pv_path = _resolve_path(conf.get("paths", {}).get("pv_download", "data/pv"))
-            self.sat_path = _resolve_path(conf.get("paths", {}).get("sat_download", "data/himawari"))
-            pv_device_path = _resolve_path(conf.get("paths", {}).get("pv_device_path", "data/pv_device.xlsx"))
+        paths = get_resolved_paths(conf, _PROJECT_ROOT)
+        self.pv_path = paths["pv_download"]
+        self.sat_path = paths["sat_download"]
+        pv_device_path = paths["pv_device_path"]
 
         site = conf.get("site", {})
         self.latitude = site.get("latitude")
@@ -256,8 +245,8 @@ def main():
     args = parser.parse_args()
 
     conf = load_config()
-    paths = conf.get("paths", {})
-    pv_device_path = _resolve_path(paths.get("pv_device_path"))
+    paths = get_resolved_paths(conf, _PROJECT_ROOT)
+    pv_device_path = paths["pv_device_path"]
     if pv_device_path is None or not pv_device_path.is_file():
         raise FileNotFoundError(f"pv_device_path not found: {pv_device_path}")
     pv_device_df = pd.read_excel(pv_device_path)

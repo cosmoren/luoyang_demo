@@ -1,6 +1,7 @@
 #! /usr/bin/env python
 import ftplib
 import os
+import sys
 import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -9,6 +10,9 @@ import yaml
 
 # ================= CONFIG =================
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+from config_utils import get_resolved_paths
+
 CONF_PATH = PROJECT_ROOT / "config" / "conf.yaml"
 PASSWORDS_PATH = PROJECT_ROOT / "config" / "passwords.yaml"
 
@@ -23,11 +27,6 @@ HOURS_BACK_INIT = 6   # how far back to scan on first run
 def load_conf():
     with open(CONF_PATH) as f:
         return yaml.safe_load(f)
-
-
-def resolve_path(p: str) -> Path:
-    path = Path(p)
-    return path if path.is_absolute() else (PROJECT_ROOT / p).resolve()
 
 
 def load_ftp_credentials():
@@ -178,7 +177,8 @@ def check_for_updates(local_dir, ftp_host, ftp_user, ftp_pass):
 
 def main():
     conf = load_conf()
-    local_dir = resolve_path(conf.get("paths", {}).get("sat_download", "nc_files"))
+    paths = get_resolved_paths(conf, PROJECT_ROOT)
+    local_dir = paths["sat_download"]
     ftp_host, ftp_user, ftp_pass = load_ftp_credentials()
     os.makedirs(local_dir, exist_ok=True)
 

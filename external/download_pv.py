@@ -12,6 +12,9 @@ import yaml
 urllib3.disable_warnings()
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+from config_utils import get_resolved_paths
+
 CONF_PATH = PROJECT_ROOT / "config" / "conf.yaml"
 PASSWORDS_PATH = PROJECT_ROOT / "config" / "passwords.yaml"
 
@@ -23,9 +26,6 @@ def load_conf():
         return yaml.safe_load(f)
 
 
-def resolve_path(p: str) -> Path:
-    path = Path(p)
-    return path if path.is_absolute() else (PROJECT_ROOT / p).resolve()
 header = {
     "application/json": "application/json"
 }
@@ -125,7 +125,8 @@ def main(endpoint, username, password):
     :return:
     """
     conf = load_conf()
-    out_dir = resolve_path(conf.get("paths", {}).get("pv_download", "data/pv"))
+    paths = get_resolved_paths(conf, PROJECT_ROOT)
+    out_dir = paths["pv_download"]
     get_token(endpoint, username, password)
     station_total = get_station_list(endpoint, get_total=True)
     print("总电站数：", station_total)
