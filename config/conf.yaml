@@ -6,7 +6,7 @@ site:
   longitude: 112.43
 
 paths:
-  data_dir: "/home/cosmo/workspace/data"
+  data_dir: "/mnt/nfs/yuan/luoyang_infer_data"
   config_dir: config
   nwp_config: config/NWP.yaml
   sat_download: himawari

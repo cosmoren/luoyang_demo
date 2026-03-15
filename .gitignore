@@ -103,3 +103,6 @@ venv.bak/
 # mypy
 .mypy_cache/
 
+# Checkpoints (model weights, not for repo)
+checkpoints/
+

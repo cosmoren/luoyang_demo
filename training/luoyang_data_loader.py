@@ -35,7 +35,7 @@ DEFAULT_COLUMNS = [
 ]
 
 # Input: 12 rows, 5-min spacing
-INPUT_LEN = 12
+INPUT_LEN = 576
 INPUT_INTERVAL_MIN = 5
 
 # Output: 192 rows, 15-min spacing (48 hours)
@@ -57,7 +57,7 @@ def _is_valid_sample(
     if not valid.iloc[start_input : end_input + 1].any():
         return False
     output_indices = [end_input + 1 + k * OUTPUT_STRIDE for k in range(OUTPUT_LEN)]
-    if not any(valid.iloc[i] for i in output_indices):
+    if not valid.iloc[output_indices].any():
         return False
     return True
 
@@ -76,25 +76,27 @@ def _find_valid_sample_ranges(
     output = df.iloc[end_input+1 : end_input+1 + OUTPUT_LEN*OUTPUT_STRIDE : OUTPUT_STRIDE].
     """
     n = len(df)
-    min_end = INPUT_LEN - 1  # 11
-    max_end = n - 1 - (OUTPUT_LEN - 1) * OUTPUT_STRIDE  # n - 575
+    min_end = INPUT_LEN - 1
+    # Last output index = end_input + 1 + (OUTPUT_LEN-1)*OUTPUT_STRIDE must be <= n-1
+    max_end = n - 2 - (OUTPUT_LEN - 1) * OUTPUT_STRIDE
     if max_end < min_end:
         return []
 
     inv = pd.to_numeric(df[inverter_col], errors="coerce").fillna(0).astype(int)
     valid_state = inv == VALID_STATE
+    valid_arr = valid_state.values
+
+    end_inputs = np.arange(min_end, max_end + 1, dtype=np.intp)
+    output_indices_2d = end_inputs[:, None] + 1 + np.arange(OUTPUT_LEN, dtype=np.intp) * OUTPUT_STRIDE
+    valid_output = valid_arr[output_indices_2d].any(axis=1)
 
     result = []
-    for end_input in range(min_end, max_end + 1):
+    for i, end_input in enumerate(end_inputs):
+        if not valid_output[i]:
+            continue
         start_input = end_input - INPUT_LEN + 1
         input_slice = slice(start_input, end_input + 1)
         if not valid_state.iloc[input_slice].any():
-            continue
-        output_indices = [
-            end_input + 1 + k * OUTPUT_STRIDE
-            for k in range(OUTPUT_LEN)
-        ]
-        if not any(valid_state.iloc[i] for i in output_indices):
             continue
         result.append((start_input, end_input))
     return result
@@ -300,8 +302,8 @@ def build_train_test_splits(
     data_dir: Path | str | None = None,
     test_start: str = "2025-01-01 00:00:00",
     test_end: str = "2025-03-31 23:59:59.999999",
-    max_train_per_file: int = 2500,
-    max_test_per_file: int = 3200,
+    max_train_per_file: int = 200,
+    max_test_per_file: int = 200,
     split: str = "train",
     verbose: bool = True,
 ) -> list[dict]:
@@ -342,7 +344,8 @@ def build_train_test_splits(
             continue
         n = len(df)
         min_end = INPUT_LEN - 1
-        max_end = n - 1 - (OUTPUT_LEN - 1) * OUTPUT_STRIDE
+        # Last output index = end_input + 1 + (OUTPUT_LEN-1)*OUTPUT_STRIDE must be <= n-1
+        max_end = n - 2 - (OUTPUT_LEN - 1) * OUTPUT_STRIDE
         if max_end < min_end:
             if verbose:
                 print("skip (too short)")

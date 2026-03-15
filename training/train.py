@@ -103,8 +103,9 @@ class PVDataset(Dataset):
     Replace with a real dataset that loads from pv_download + targets when available.
     """
 
-    def __init__(self, data_dir: str):
-
+    def __init__(self, data_dir: str, split: str = "train"):
+        assert split in ("train", "test"), "split must be 'train' or 'test'"
+        self.split = split
         CONF_PATH = _PROJECT_ROOT / "config" / "conf.yaml"
         with open(CONF_PATH) as f:
             conf = yaml.safe_load(f)
@@ -119,26 +120,26 @@ class PVDataset(Dataset):
 
         pv_device_df = pd.read_excel(pv_device_path)
         self.devDn_list = pv_device_df["devDn"].dropna().unique().tolist()
-        
-        self.train_list = build_train_test_splits(
+
+        self.samples = build_train_test_splits(
             data_dir=data_dir,
-            max_train_per_file = 2500,
-            max_test_per_file = 3200,
-            split="train",
+            max_train_per_file=1000,
+            max_test_per_file=1000,
+            split=split,
         )
 
     def __len__(self):
-        return len(self.train_list)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        sample = self.train_list[idx]
+        sample = self.samples[idx]
         devDn = sample['station_id']    # get the devDn
-        dev_idx = self.devDn_list.index(devDn)
+        dev_idx = torch.tensor(self.devDn_list.index(devDn), dtype=torch.long)
         timestamps = sample['X'][:,0]
         tz_beijing = ZoneInfo("Asia/Shanghai")  # Beijing/Shanghai time (UTC+8)
         timestamps = [pd.Timestamp(t).to_pydatetime().replace(tzinfo=tz_beijing) if pd.Timestamp(t).tz is None else pd.Timestamp(t).astimezone(tz_beijing).to_pydatetime() for t in timestamps]
-        pv_mask = (sample['X'][:,1]==512).astype(np.float32)
-        pv = (sample['X'][:,2]/50).astype(np.float32)
+        pv_mask = torch.from_numpy( (sample['X'][:,1]==512).astype(np.float32) ).unsqueeze(0)
+        pv = torch.from_numpy( (sample['X'][:,2]/50).astype(np.float32) ).unsqueeze(0)
         pv_solar_features = compute_solar_features(timestamps, self.latitude, self.longitude)
 
         pv_solar_features_array = []
@@ -153,7 +154,7 @@ class PVDataset(Dataset):
             sin_hod = np.sin(2*np.pi*pv_solar_feature['hour_of_day']/24)
             pv_solar_features_array.append(np.array([sin_azimuth, cos_azimuth, sin_zenith, cos_zenith, sin_hod, cos_hod]))
         pv_solar_features_array = np.asarray(pv_solar_features_array).astype(np.float32)
-        pv_solar_features_tensor = torch.from_numpy(pv_solar_features_array)
+        history_solar_features = torch.from_numpy(pv_solar_features_array)
 
         # the timestamp of the latest PV data (ensure UTC timezone)
         time0 = timestamps[-1]
@@ -179,21 +180,18 @@ class PVDataset(Dataset):
     
         solar_features_array  = np.asarray(solar_features_array).astype(np.float32)  # [192, 8]
         batch = solar_features_array.shape[0]
-        solar_features_tensor = torch.from_numpy(solar_features_array)
-
-        # Expand once: (12, 6) -> (B, 6, 12) for all devices
-        pv_ztime = pv_solar_features_tensor.unsqueeze(0).repeat(batch, 1, 1).permute(0, 2, 1)[:,:,-1]  # [B, 6, 12]
+        forecast_solar_features = torch.from_numpy(solar_features_array)
 
         # target
-        target_pv = (sample['Y'][:,2]/50).astype(np.float32)
-        target_mask = (sample['Y'][:,1]==512).astype(np.float32)
+        target_pv = torch.from_numpy( (sample['Y'][:,2]/50).astype(np.float32) )
+        target_mask = torch.from_numpy( (sample['Y'][:,1]==512).astype(np.float32) )
 
         return {
             "dev_idx": dev_idx,
             "pv": pv,
             "pv_mask": pv_mask,
-            "pv_ztime": pv_ztime,
-            "solar_features": solar_features_tensor,
+            "history_solar_features": history_solar_features,
+            "forecast_solar_features": forecast_solar_features,
             "target_pv": target_pv,
             "target_mask": target_mask,
         }
@@ -204,42 +202,75 @@ def collate_single(batch):
     return batch
 
 
+def collate_batched(batch):
+    """Stack list of samples into one dict of tensors with batch dim B in front."""
+    return {
+        "dev_idx": torch.stack([s["dev_idx"] for s in batch]),
+        "pv": torch.stack([s["pv"] for s in batch]),
+        "pv_mask": torch.stack([s["pv_mask"] for s in batch]),
+        "history_solar_features": torch.stack([s["history_solar_features"] for s in batch]),
+        "forecast_solar_features": torch.stack([s["forecast_solar_features"] for s in batch]),
+        "target_pv": torch.stack([s["target_pv"] for s in batch]),
+        "target_mask": torch.stack([s["target_mask"] for s in batch]),
+    }
+
+
 def train_one_epoch(model, device, loader, criterion, optimizer):
     model.train()
     total_loss = 0.0
     n = 0
-    for batch_list in loader:
+    num_batches = len(loader)
+    print('number of batches: ', num_batches)
+    for batch_idx, batch in enumerate(loader):
+        if batch_idx > 3000:
+            break
+        B = batch["dev_idx"].size(0)
+        device_id = batch["dev_idx"].to(device)            # [B]
+        pv = batch["pv"].to(device)                        # [B, C, T_in]
+        mask = batch["pv_mask"].to(device)                 # [B, C, T_in]
+        history_solar_features = batch["history_solar_features"].to(device)
+        forecast_solar_features = batch["forecast_solar_features"].to(device)
+        target_pv = batch["target_pv"].to(device)
+        target_mask = batch["target_mask"].to(device)
+
         optimizer.zero_grad()
-        batch_loss = 0.0
-        for sample in batch_list:
-            device_id = torch.tensor([sample["dev_idx"]], dtype=torch.long, device=device)
-            # Model expects x (B, 1, 12) with B=192 (same history repeated for each forecast step)
-            pv = torch.from_numpy(sample["pv"]).to(device)
-            pv = pv.unsqueeze(0).repeat(FORECAST_STEPS, 1, 1 )  # (192, 1, 12)
-            mask = torch.from_numpy(sample["pv_mask"]).to(device)
-            mask = mask.unsqueeze(0).repeat(FORECAST_STEPS, 1)  # (192, 12)
-            pv_ztime = sample["pv_ztime"].to(device)
-            solar = sample["solar_features"].to(device)
-            target_pv = torch.from_numpy(sample["target_pv"]).to(device)
-            target_mask = torch.from_numpy(sample["target_mask"]).to(device)
-
-            pv_pred = model(device_id, pv, mask, pv_ztime, solar)
-            pv_pred = pv_pred.squeeze()
-
-            loss = criterion(pv_pred*target_mask, target_pv*target_mask)
-            batch_loss += loss.item()
-            n += 1
-            loss.backward()
-        total_loss += batch_loss
+        pv_pred = model(device_id, pv, mask, history_solar_features, forecast_solar_features)
+        loss = criterion(pv_pred * target_mask, target_pv * target_mask)
+        loss.backward()
         optimizer.step()
+        total_loss += loss.item()
+        n += B
+    print()
+    return total_loss / max(n, 1)
+
+
+def evaluate(model, device, loader, criterion):
+    """Compute mean loss on a dataset (e.g. test set). No gradient."""
+    model.eval()
+    total_loss = 0.0
+    n = 0
+    with torch.no_grad():
+        for batch in loader:
+            B = batch["dev_idx"].size(0)
+            device_id = batch["dev_idx"].to(device)
+            pv = batch["pv"].to(device)
+            mask = batch["pv_mask"].to(device)
+            history_solar_features = batch["history_solar_features"].to(device)
+            forecast_solar_features = batch["forecast_solar_features"].to(device)
+            target_pv = batch["target_pv"].to(device)
+            target_mask = batch["target_mask"].to(device)
+            pv_pred = model(device_id, pv, mask, history_solar_features, forecast_solar_features)
+            loss = criterion(pv_pred * target_mask, target_pv * target_mask)
+            total_loss += loss.item()
+            n += B
     return total_loss / max(n, 1)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train PV forecasting model")
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--checkpoint_dir", type=str, default=None)
     parser.add_argument("--save_every", type=int, default=5)
     args = parser.parse_args()
@@ -258,21 +289,35 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
 
-    dataset = PVDataset(data_dir = "/home/cosmo/workspace/luoyang_data_626")
-    loader = DataLoader(
-        dataset,
+    data_dir = "/mnt/nfs/Ai4Energy/Datasets/luoyang_data_626/"
+    train_dataset = PVDataset(data_dir=data_dir, split="train")
+    test_dataset = PVDataset(data_dir=data_dir, split="test")
+
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=collate_single,
-        num_workers=0,
+        collate_fn=collate_batched,
+        num_workers=24,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_batched,
+        num_workers=24,
     )
 
     checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else _PROJECT_ROOT / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    initial_test_loss = evaluate(model, device, test_loader, criterion)
+    print(f"Initial test loss: {initial_test_loss:.6f}")
+
     for epoch in range(1, args.epochs + 1):
-        avg_loss = train_one_epoch(model, device, loader, criterion, optimizer)
-        print(f"Epoch {epoch}/{args.epochs}  loss={avg_loss:.6f}")
+        avg_loss = train_one_epoch(model, device, train_loader, criterion, optimizer)
+        test_loss = evaluate(model, device, test_loader, criterion)
+        print(f"Epoch {epoch}/{args.epochs}  train_loss={avg_loss:.6f}  test_loss={test_loss:.6f}")
 
         if args.save_every and epoch % args.save_every == 0:
             path = checkpoint_dir / f"pv_forecast_epoch_{epoch}.pt"
