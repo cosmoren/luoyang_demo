@@ -151,6 +151,7 @@ class infer_online_alg:    # ckpt = torch.load(checkpoint_path, map_location=sel
 
         pv_pred_dict = {}
         for key, value in pv_dict.items():
+            pv_pred_dict[key] = {}
             dev_idx = torch.tensor(self.devDn_list.index(key), dtype=torch.long, device=self.device)
             dev_idx = dev_idx.unsqueeze(0)
             
@@ -165,9 +166,18 @@ class infer_online_alg:    # ckpt = torch.load(checkpoint_path, map_location=sel
             zenith_mask = (forecast_solar_features[:,:,3]>0.02)
             pv_pred = out*50*zenith_mask
 
+            pv_pred_dict[key]['pv_pred'] = pv_pred.detach().cpu().numpy()
+            pv_pred_dict[key]['forecast_timestamps_utc'] = forecast_timestamps_utc
+            pv_pred_dict[key]['timestamps'] = timestamps
+            pv_pred_dict[key]['pv'] = pv.detach().cpu().numpy().squeeze(axis=1)
+
         return pv_pred_dict
 
 
 if __name__ == "__main__":
     inference_online = infer_online_alg(checkpoint_path='./checkpoints/pv_forecast_epoch_10.pt')
     pv_pred_dict = inference_online.inference()
+    print (pv_pred_dict['NE=333858485']['pv_pred'].shape)
+    print (len(pv_pred_dict['NE=333858485']['timestamps']))
+    print (len(pv_pred_dict['NE=333858485']['forecast_timestamps_utc']))
+    print (pv_pred_dict['NE=333858485']['pv'].shape)

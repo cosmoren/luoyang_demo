@@ -6,7 +6,7 @@ site:
   longitude: 112.43
 
 paths:
-  data_dir: "/mnt/nfs/yuan/luoyang_infer_data"
+  data_dir: "/home/bb/solar_luoyang/external_data"
   config_dir: config
   nwp_config: config/NWP.yaml
   sat_download: himawari
