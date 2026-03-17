@@ -7,8 +7,11 @@ import torch
 import torch.nn as nn
 from typing import Optional
 import torch
-from .simvp.models import SimVP_Model
-
+from .timesformer import TimeSformerFeatureExtractor
+import logging
+import os
+import contextlib
+import io
 
 class TemporalCNN1d(nn.Module):
     """
@@ -198,6 +201,7 @@ class pv_forecasting_model(nn.Module):
 
         return pv.squeeze(-1)
 
+
 class pv_forecasting_model_vit(nn.Module):
     def __init__(self, in_channels: int = 1, hidden_channels: list = (32, 64, 64), kernel_size: int = 3, out_dim: Optional[int] = None, use_batchnorm: bool = True, dropout: float = 0.0, dev_dn_list: Optional[list] = None):
         super().__init__()
@@ -208,58 +212,43 @@ class pv_forecasting_model_vit(nn.Module):
         self.use_batchnorm = use_batchnorm
         self.dropout = dropout
 
-        if dev_dn_list is not None:
-            self.dev_dn_list = list(dev_dn_list)
-            self.dev_dn_to_idx = {str(dn): i for i, dn in enumerate(dev_dn_list)}
-            num_devices = len(self.dev_dn_list)
-        else:
-            self.dev_dn_list = None
-            self.dev_dn_to_idx = {}
-            num_devices = 1000
+        logging.getLogger("transformers").setLevel(logging.ERROR)
+        os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.sat_extractor = TimeSformerFeatureExtractor(
+                pretrained="facebook/timesformer-base-finetuned-k400",
+                output_format="sequence",
+                normalize=True,
+            )
 
-        pv_features_dim = 64
+        self.inverter_embedding = nn.Embedding(num_embeddings=1000, embedding_dim=16)
+        self.TCN = TemporalCNN1d(in_channels=8, out_channels=64, use_batchnorm=use_batchnorm, dropout=dropout)
+        self.cross_attention = CrossAttention(query_dim=8, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
+        self.pv_feats_head = MLP(in_dim=144, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
+        self.sat_downdim = MLP(in_dim=768, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
+        self.fc = FC(in_dim=64, out_dim=1)
 
-        self.simvp_sat = SimVP_Model([12, 3, 100, 100])
-        self.temporal_conv_pool = TemporalConvPool(16, 64)
-        
-        pv_age = torch.linspace(15, 192*15, 192)
-        self.register_buffer("pv_age_feat", torch.stack([pv_age, torch.log(pv_age)], dim=1))
-        
-        self.pv_temporal_cnn = TemporalCNN1d(in_channels, hidden_channels, kernel_size, pv_features_dim, use_batchnorm, dropout)
-        self.pv_gate = MLP(in_dim=8, hidden_dims=(), out_dim=pv_features_dim, dropout=0.0)
-
-        self.forecast_solar_features_encoder = MLP(in_dim=8, hidden_dims=(16,32), out_dim=32, dropout=0.0)
-
-        self.device_embedding = nn.Embedding(num_embeddings=num_devices, embedding_dim=16)
-        self.device_encoder = MLP(in_dim=16, hidden_dims=(16, 16), out_dim=16, dropout=0.0)
-
-        self.mlp = MLP(in_dim=176, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
-        self.fc = nn.Linear(64, 1)
-
-    def forward(self, device_id: torch.Tensor, x: torch.Tensor, 
-                mask: Optional[torch.Tensor] = None, 
-                pv_ztime: Optional[torch.Tensor] = None, 
-                solar_features: Optional[torch.Tensor] = None, 
+    def forward(self, device_id: torch.Tensor, x: torch.Tensor, mask: Optional[torch.Tensor] = None, 
+                history_solar_features: Optional[torch.Tensor] = None,
+                forecast_solar_features: Optional[torch.Tensor] = None,
                 sat_tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
         
-        pv_features = self.pv_temporal_cnn(x, mask) # [B, 64] pv history features
-        pv_age_ztime = torch.cat([self.pv_age_feat, pv_ztime], dim=1)
-        pv_gate = torch.sigmoid( self.pv_gate(pv_age_ztime) )
-        pv_features = pv_features * pv_gate   # [B, 64]
-        
-        forecast_solar_features = self.forecast_solar_features_encoder(solar_features)
+        x_masked = x * mask.to(x.dtype)
+        pv_history = torch.cat([x_masked, x, history_solar_features.permute(0, 2, 1)], dim=1)  # [B, 8, T]
+        pv_hist_mem = self.TCN(pv_history, mask)      # [B, C_out, T]()
+        KV_hist_mem = pv_hist_mem.permute(0, 2, 1)   # [B, T, C_out]
 
-        device_embedding = self.device_embedding(device_id).repeat(192, 1)
-        device_features = self.device_encoder(device_embedding)
+        forcast_pv_features = self.cross_attention(query=forecast_solar_features, key=KV_hist_mem, value=KV_hist_mem)   #[B,T,D]
+        inverter_features = self.inverter_embedding(device_id).unsqueeze(1).repeat(1, forcast_pv_features.shape[1], 1)
 
-        embed, skip = self.simvp_sat.enc(sat_tensor)
-        z = embed.unsqueeze(0)
-        hid = self.simvp_sat.hid(z)
-        sat_video_features = hid.mean(dim=[3, 4])
-        sat_video_features = self.temporal_conv_pool(sat_video_features).repeat(pv_features.shape[0], 1)
+        sat_tensor = nn.functional.interpolate(sat_tensor.view(-1, 3, *sat_tensor.shape[-2:]), size=(224, 224), mode='bilinear', align_corners=False).view(*sat_tensor.shape[:3], 224, 224)
+        sat_features = self.sat_extractor(sat_tensor)   #[B,T=12,D=768]
+        sat_down_features = self.sat_downdim(sat_features)
 
-        fused = torch.cat([pv_features, forecast_solar_features, device_features, sat_video_features], dim=1)
-        forecast_pv_features = self.mlp(fused)
-        pv = self.fc(forecast_pv_features)
-        
-        return pv
+        forcast_sat_features = self.cross_attention(query=forecast_solar_features, key=sat_down_features, value=sat_down_features)
+
+        fused = torch.cat([forcast_pv_features, forcast_sat_features, inverter_features], dim=2)   # [B=1,T=192,C=144]
+        pv_feats = self.pv_feats_head(fused)
+        pv = self.fc(pv_feats)
+
+        return pv.squeeze(-1)

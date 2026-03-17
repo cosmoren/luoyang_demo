@@ -99,7 +99,7 @@ class infer_online_alg:    # ckpt = torch.load(checkpoint_path, map_location=sel
     
     def inference(self):
         # Read the PV history data
-        timestamps, paths, pv_dict = create_pv_dataframe(path=self.pv_path)
+        timestamps, paths, pv_dict = create_pv_dataframe(path=self.pv_path, num=576)
         timestamps = [t.replace(tzinfo=timezone.utc) if t.tzinfo is None else t for t in timestamps]
         pv_solar_features = compute_solar_features(timestamps, self.latitude, self.longitude)
         pv_solar_features_array = []
@@ -115,14 +115,17 @@ class infer_online_alg:    # ckpt = torch.load(checkpoint_path, map_location=sel
             sin_hod = np.sin(2*np.pi*pv_solar_feature['hour_of_day']/24)
             pv_solar_features_array.append(np.array([sin_azimuth, cos_azimuth, sin_zenith, cos_zenith, sin_hod, cos_hod]))
         pv_solar_features_array = np.asarray(pv_solar_features_array).astype(np.float32)
-        pv_solar_features_tensor = torch.from_numpy(pv_solar_features_array)
+        history_solar_features = torch.from_numpy(pv_solar_features_array).to(self.device)
+        history_solar_features = history_solar_features.unsqueeze(0)  # [B,C,T]=[1,6,576]
+            
 
         # the timestamp of the latest PV data (ensure UTC timezone)
         time0 = timestamps[-1]
 
         # Read satellite images
         latest_sat_timestamp, sat_tensor_np = create_himawari_tensor(self.sat_path, self.latitude, self.longitude, time_span = 10, frame_num = 12, size_km = 500, resample_size = 100)
-
+        sat_tensor = torch.from_numpy(sat_tensor_np.astype(np.float32)).unsqueeze(0).to(self.device)
+        
         # Next 48 hours at 15-minute intervals (192 points), UTC
         forecast_timestamps_utc = [time0 + timedelta(minutes=15 * (i + 1)) for i in range(48 * 4)]
 
@@ -144,25 +147,26 @@ class infer_online_alg:    # ckpt = torch.load(checkpoint_path, map_location=sel
             solar_features_array.append(np.array([sin_azimuth, cos_azimuth, sin_zenith, cos_zenith, sin_dofy, cos_dofy, sin_hod, cos_hod]))
     
         solar_features_array  = np.asarray(solar_features_array).astype(np.float32)  # [192, 8]
-        batch = solar_features_array.shape[0]
-        solar_features_tensor = torch.from_numpy(solar_features_array).to(self.device)
+        forecast_solar_features = torch.from_numpy(solar_features_array).to(self.device)
+        forecast_solar_features = forecast_solar_features.unsqueeze(0)  # [B,C,T]=[1,8,192]
 
-        # Expand once: (12, 6) -> (B, 6, 12) for all devices
-        pv_ztime = pv_solar_features_tensor.unsqueeze(0).repeat(batch, 1, 1).permute(0, 2, 1)[:,:,-1].to(self.device)  # [B, 6, 12]
-        sat_tensor = torch.from_numpy(sat_tensor_np.astype(np.float32)).to(self.device)
-
+        pv_pred_dict = {}
         for key, value in pv_dict.items():
-            dev_idx = self.devDn_list.index(key)
-            mask = (value['inverter_state']==512).astype(int)
-            pv = (value['active_power']/50.0).astype(np.float32)
-            pv = torch.from_numpy(pv).to(self.device)
-            mask = torch.from_numpy(mask).to(self.device)
-            pv = pv.unsqueeze(0).repeat(batch, 1).unsqueeze(1)  # [B, 1, 12]
-            pv_mask = mask.unsqueeze(0).repeat(batch, 1)        # [B, 12]
-            device_id = torch.tensor([dev_idx], dtype=torch.long, device=self.device)
+            dev_idx = torch.tensor(self.devDn_list.index(key), dtype=torch.long, device=self.device)
+            dev_idx = dev_idx.unsqueeze(0)
+            
+            pv_mask = torch.from_numpy((value['inverter_state']==512).astype(np.float32)).to(self.device)
+            pv = torch.from_numpy((value['active_power']/50.0).astype(np.float32)).to(self.device)
+            
+            pv = pv.unsqueeze(0).unsqueeze(1)
+            pv_mask = pv_mask.unsqueeze(0).unsqueeze(1)
 
-            out = self.model(device_id, pv, pv_mask, pv_ztime, solar_features_tensor, sat_tensor)            
+            out = self.model(dev_idx, pv, pv_mask, history_solar_features, forecast_solar_features, sat_tensor)
 
+            zenith_mask = (forecast_solar_features[:,:,3]>0.02)
+            pv_pred = out*50*zenith_mask
+        print(pv_pred.shape)
+        return pv_pred_dict
 
 if __name__ == "__main__":
     inference_online = infer_online_alg(checkpoint_path='path/to/checkpoint.pt')
