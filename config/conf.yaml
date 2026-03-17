@@ -6,19 +6,25 @@ site:
   longitude: 112.43
 
 paths:
-  data_dir: "/home/bb/solar_luoyang/external_data"
+  data_dir: "/home/cosmo/workspace/data"
   config_dir: config
   nwp_config: config/NWP.yaml
   sat_download: himawari
   nwp_download: nwp_download
   nwp_newest: nwp_newest
+  skyimg_download: skyimg
   pv_download: pv
   pv_station_meta: data
   pv_device_path: datasets/XINSHENG_power_total_devices_type1.xlsx
 
+
 nwp:
   solar_subdir: solar
   wind_subdir: wind
+
+# USB camera for sky images (0 = first camera, 1 = second/"other" camera)
+camera:
+  camera_id: 2
 
 download:
   user_agent: "Mozilla/5.0 (compatible; NWP downloader)"

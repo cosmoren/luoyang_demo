@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 # Keys under paths that are relative to data_dir when value is relative
-DATA_DIR_KEYS = ("sat_download", "nwp_download", "nwp_newest", "pv_download")
+DATA_DIR_KEYS = ("sat_download", "nwp_download", "nwp_newest", "pv_download", "skyimg_download")
 
 # All other path keys are relative to project_root when value is relative
 
