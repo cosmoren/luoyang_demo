@@ -203,19 +203,24 @@ class pv_forecasting_model(nn.Module):
 
 
 class pv_forecasting_model_vit(nn.Module):
-    def __init__(self, in_channels: int = 1, hidden_channels: list = (32, 64, 64), kernel_size: int = 3, out_dim: Optional[int] = None, use_batchnorm: bool = True, dropout: float = 0.0, dev_dn_list: Optional[list] = None):
+    def __init__(self, use_batchnorm: bool = True, dropout: float = 0.0, dev_dn_list: Optional[list] = None):
         super().__init__()
-        self.in_channels = in_channels
-        self.hidden_channels = list(hidden_channels)
-        self.kernel_size = kernel_size
-        self.out_dim = out_dim
+
         self.use_batchnorm = use_batchnorm
         self.dropout = dropout
 
         logging.getLogger("transformers").setLevel(logging.ERROR)
         os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+        # TimeSformer for satellite images
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             self.sat_extractor = TimeSformerFeatureExtractor(
+                pretrained="facebook/timesformer-base-finetuned-k400",
+                output_format="sequence",
+                normalize=True,
+            )
+        # TimeSformer for sky imager images
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.skimg_extractor = TimeSformerFeatureExtractor(
                 pretrained="facebook/timesformer-base-finetuned-k400",
                 output_format="sequence",
                 normalize=True,
@@ -224,30 +229,66 @@ class pv_forecasting_model_vit(nn.Module):
         self.inverter_embedding = nn.Embedding(num_embeddings=1000, embedding_dim=16)
         self.TCN = TemporalCNN1d(in_channels=8, out_channels=64, use_batchnorm=use_batchnorm, dropout=dropout)
         self.cross_attention = CrossAttention(query_dim=8, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
-        self.pv_feats_head = MLP(in_dim=144, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
         self.sat_downdim = MLP(in_dim=768, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
+        self.skimg_downdim = MLP(in_dim=768, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
+        self.timefeats_encoder = MLP(in_dim=9, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
+        self.nwp_updim = MLP(in_dim=10, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
+        self.pv_feats_head = MLP(in_dim=272, hidden_dims=(512, 256, 128), out_dim=64, dropout=0.0)
         self.fc = FC(in_dim=64, out_dim=1)
 
-    def forward(self, device_id: torch.Tensor, x: torch.Tensor, mask: Optional[torch.Tensor] = None, 
-                history_solar_features: Optional[torch.Tensor] = None,
-                forecast_solar_features: Optional[torch.Tensor] = None,
-                sat_tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, device_id: torch.Tensor, pv: torch.Tensor, 
+                pv_mask: Optional[torch.Tensor] = None, 
+                pv_timefeats: Optional[torch.Tensor] = None,
+                forecast_timefeats: Optional[torch.Tensor] = None,
+                sat_tensor: Optional[torch.Tensor] = None,
+                sat_timefeats: Optional[torch.Tensor] = None,
+                skimg_tensor: Optional[torch.Tensor] = None,
+                skimg_timefeats: Optional[torch.Tensor] = None,
+                nwp_tensor: Optional[torch.Tensor] = None,
+                nwp_timefeats: Optional[torch.Tensor] = None,) -> torch.Tensor:
         
-        x_masked = x * mask.to(x.dtype)
-        pv_history = torch.cat([x_masked, x, history_solar_features.permute(0, 2, 1)], dim=1)  # [B, 8, T]
-        pv_hist_mem = self.TCN(pv_history, mask)      # [B, C_out, T]()
+        # PV features
+        pv_masked = pv * pv_mask.to(pv.dtype)
+        pv_history = torch.cat([pv_masked, pv_mask, pv_timefeats.permute(0, 2, 1)], dim=1)  # [B, 8, T]
+        pv_hist_mem = self.TCN(pv_history, pv_mask)     # [B, C_out, T]()
         KV_hist_mem = pv_hist_mem.permute(0, 2, 1)   # [B, T, C_out]
-
         forcast_pv_features = self.cross_attention(query=forecast_solar_features, key=KV_hist_mem, value=KV_hist_mem)   #[B,T,D]
-        inverter_features = self.inverter_embedding(device_id).unsqueeze(1).repeat(1, forcast_pv_features.shape[1], 1)
 
-        sat_tensor = nn.functional.interpolate(sat_tensor.view(-1, 3, *sat_tensor.shape[-2:]), size=(224, 224), mode='bilinear', align_corners=False).view(*sat_tensor.shape[:3], 224, 224)
-        sat_features = self.sat_extractor(sat_tensor)   #[B,T=12,D=768]
-        sat_down_features = self.sat_downdim(sat_features)
+        # Satellite features
+        if sat_tensor is None:
+            forecast_sat_features = torch.zeros(sat_tensor.shape[0], forecast_timefeats.shape[1], 64).to(sat_tensor.device)
+        else:
+            sat_tensor = nn.functional.interpolate(sat_tensor.view(-1, 3, *sat_tensor.shape[-2:]), size=(224, 224), mode='bilinear', align_corners=False).view(*sat_tensor.shape[:3], 224, 224)
+            sat_features = self.sat_extractor(sat_tensor)   #[B,T=xx,D=768]
+            sat_down_features = self.sat_downdim(sat_features) # [B,T=xx,D=64]
+            forcast_sat_features = self.cross_attention(query=forecast_timefeats, key=sat_down_features, value=sat_down_features)
+            sat_timefeats_hdim = self.timefeats_encoder(sat_timefeats)
+            forcast_sat_features = forcast_sat_features + sat_timefeats_hdim
 
-        forcast_sat_features = self.cross_attention(query=forecast_solar_features, key=sat_down_features, value=sat_down_features)
+        # Sky imager features
+        if skimg_tensor is None:
+            forecast_skimg_features = torch.zeros(skimg_tensor.shape[0], forecast_timefeats.shape[1], 64).to(skimg_tensor.device)
+        else:
+            skimg_tensor = nn.functional.interpolate(skimg_tensor.view(-1, 3, *skimg_tensor.shape[-2:]), size=(224, 224), mode='bilinear', align_corners=False).view(*skimg_tensor.shape[:3], 224, 224)
+            skimg_features = self.skimg_extractor(skimg_tensor)   #[B,T=12,D=768]
+            skimg_down_features = self.skimg_downdim(skimg_features) # [B,T=12,D=64]
+            forecast_skimg_features = self.cross_attention(query=forecast_timefeats, key=skimg_down_features, value=skimg_down_features)
+            skimg_timefeats_hdim = self.timefeats_encoder(skimg_timefeats)
+            forecast_skimg_features = forecast_skimg_features + skimg_timefeats_hdim
 
-        fused = torch.cat([forcast_pv_features, forcast_sat_features, inverter_features], dim=2)   # [B=1,T=192,C=144]
+        # NWP features
+        if nwp_tensor is None:
+            forecast_nwp_features = torch.zeros(nwp_tensor.shape[0], forecast_timefeats.shape[1], 64).to(nwp_tensor.device)
+        else:
+            nwp_fc_wtime = torch.cat([nwp_tensor, nwp_timefeats.permute(0, 2, 1)], dim=1)
+            nwp_fc_mem = self.nwp_updim(nwp_fc_wtime)
+            forecast_nwp_features = self.cross_attention(query=forecast_timefeats, key=nwp_fc_mem, value=nwp_fc_mem)
+
+        # Inverter features (embeddings)
+        inverter_features = self.inverter_embedding(device_id).unsqueeze(1).repeat(1, forcast_sat_features.shape[1], 1)
+
+        # Fuse and predict
+        fused = torch.cat([forcast_pv_features, forcast_sat_features, forecast_skimg_features, forecast_nwp_features, inverter_features], dim=2)   # [B=1,T=192,C=272]
         pv_feats = self.pv_feats_head(fused)
         pv = self.fc(pv_feats)
 
