@@ -22,6 +22,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 from config_utils import get_resolved_paths
 from models.models import pv_forecasting_model
 from training.luoyang_data_loader import build_train_test_splits
+from training.luoyang_data_loader import build_sample, build_nwp_index, build_sat_index
 from datetime import datetime, timedelta, timezone
 
 CONF_PATH = _PROJECT_ROOT / "config" / "conf.yaml"
@@ -111,6 +112,7 @@ class PVDataset(Dataset):
             conf = yaml.safe_load(f)
         paths = get_resolved_paths(conf, _PROJECT_ROOT)
         self.pv_path = paths["pv_download"]
+        #self.sat_path = "/home/weize/ai4energy_crop/" # test only
         self.sat_path = paths["sat_download"]
         pv_device_path = paths["pv_device_path"]
 
@@ -127,6 +129,17 @@ class PVDataset(Dataset):
             max_test_per_file=1000,
             split=split,
         )
+
+        # satellite index（时间 → 文件）
+        self.sat_time_to_file, self.sat_times = build_sat_index(self.sat_path)
+
+        # NWP index
+        self.solar_issue_map, self.solar_issue_times = build_nwp_index(
+            "/home/weize/ai4energy/luoyang_demo/datasets/112.285_34.700_UTC0_model_solar_v5.csv"
+        ) # change this
+        self.wind_issue_map, self.wind_issue_times = build_nwp_index(
+            "/home/weize/ai4energy/luoyang_demo/datasets/112.285_34.700_UTC0_model_wind_v5.csv"
+        ) # change this
 
     def __len__(self):
         return len(self.samples)
@@ -186,6 +199,25 @@ class PVDataset(Dataset):
         target_pv = torch.from_numpy( (sample['Y'][:,2]/50).astype(np.float32) )
         target_mask = torch.from_numpy( (sample['Y'][:,1]==512).astype(np.float32) )
 
+        # ===== ADDED: satellite + NWP =====
+        # latest PV timestamp 作为 anchor
+        t0 = pd.Timestamp(sample['X'][-1, 0])
+
+        X_sat, X_sat_mask, X_fcst = build_sample(
+            t0,
+            self.sat_time_to_file,
+            self.sat_times,
+            self.solar_issue_map,
+            self.solar_issue_times,
+            self.wind_issue_map,
+            self.wind_issue_times,
+        )
+
+        # 转 tensor（不参与训练，仅返回）
+        X_sat = torch.from_numpy(X_sat.astype(np.float32))
+        X_sat_mask = torch.from_numpy(X_sat_mask.astype(np.float32))
+        X_fcst = torch.from_numpy(X_fcst.astype(np.float32))
+
         return {
             "dev_idx": dev_idx,
             "pv": pv,
@@ -194,6 +226,9 @@ class PVDataset(Dataset):
             "forecast_solar_features": forecast_solar_features,
             "target_pv": target_pv,
             "target_mask": target_mask,
+            "X_sat": X_sat,
+            "X_sat_mask": X_sat_mask,
+            "X_fcst": X_fcst,
         }
 
 
@@ -212,6 +247,9 @@ def collate_batched(batch):
         "forecast_solar_features": torch.stack([s["forecast_solar_features"] for s in batch]),
         "target_pv": torch.stack([s["target_pv"] for s in batch]),
         "target_mask": torch.stack([s["target_mask"] for s in batch]),
+        "X_sat": torch.stack([s["X_sat"] for s in batch]),
+        "X_sat_mask": torch.stack([s["X_sat_mask"] for s in batch]),
+        "X_fcst": torch.stack([s["X_fcst"] for s in batch]),
     }
 
 
@@ -289,6 +327,8 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
 
+    #data_dir = "/home/weize/remote_test_data/" # test only
+    #data_dir = "/home/weize/remote_luoyang_data_626/" # test only
     data_dir = "/mnt/nfs/Ai4Energy/Datasets/luoyang_data_626/"
     train_dataset = PVDataset(data_dir=data_dir, split="train")
     test_dataset = PVDataset(data_dir=data_dir, split="test")
