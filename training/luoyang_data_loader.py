@@ -441,7 +441,7 @@ def build_sat_index(sat_root):
 
     return sat_time_to_file, sat_times
 
-def build_sat_sequence(t0, sat_time_to_file, sat_times, T=12):
+def build_sat_sequence(t0, sat_time_to_file, sat_times, T=10):
     X_sat_list = []
     X_sat_mask = []
 
@@ -620,6 +620,7 @@ def build_sample(
 
     # ========= CONCAT =========
     X_fcst = np.concatenate([solar_block, wind_block], axis=1)  # (T, 6)
+    X_fcst = np.transpose(X_fcst, (1, 0)) # [6, T]
 
     # ========= SAT =========
     X_sat, X_sat_mask = build_sat_sequence(

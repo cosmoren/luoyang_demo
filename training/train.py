@@ -135,11 +135,11 @@ class PVDataset(Dataset):
 
         # NWP index
         self.solar_issue_map, self.solar_issue_times = build_nwp_index(
-            "/home/weize/ai4energy/luoyang_demo/datasets/112.285_34.700_UTC0_model_solar_v5.csv"
-        ) # change this
+            _PROJECT_ROOT/"datasets/112.285_34.700_UTC0_model_solar_v5.csv"
+        )
         self.wind_issue_map, self.wind_issue_times = build_nwp_index(
-            "/home/weize/ai4energy/luoyang_demo/datasets/112.285_34.700_UTC0_model_wind_v5.csv"
-        ) # change this
+            _PROJECT_ROOT/"datasets/112.285_34.700_UTC0_model_wind_v5.csv"
+        )
 
     def __len__(self):
         return len(self.samples)
@@ -214,9 +214,9 @@ class PVDataset(Dataset):
         )
 
         # 转 tensor（不参与训练，仅返回）
-        X_sat = torch.from_numpy(X_sat.astype(np.float32))
-        X_sat_mask = torch.from_numpy(X_sat_mask.astype(np.float32))
-        X_fcst = torch.from_numpy(X_fcst.astype(np.float32))
+        X_sat = torch.from_numpy(X_sat.astype(np.float32)) # [10, 3, 224, 224]
+        X_sat_mask = torch.from_numpy(X_sat_mask.astype(np.float32)) # [10]
+        X_fcst = torch.from_numpy(X_fcst.astype(np.float32)) # [6, 192]
 
         return {
             "dev_idx": dev_idx,
