@@ -112,8 +112,8 @@ class PVDataset(Dataset):
             conf = yaml.safe_load(f)
         paths = get_resolved_paths(conf, _PROJECT_ROOT)
         self.pv_path = paths["pv_download"]
-        self.sat_path = "/home/weize/ai4energy_crop/" # test only
-        #self.sat_path = paths["sat_download"]
+        #self.sat_path = "/home/weize/ai4energy_crop/" # test only
+        self.sat_path = paths["sat_download"]
         pv_device_path = paths["pv_device_path"]
 
         site = conf.get("site", {})
@@ -131,13 +131,13 @@ class PVDataset(Dataset):
         )
 
         # satellite index（时间 → 文件）
-        self.sat_time_to_file, self.sat_times = build_sat_index(self.sat_path)
+        self.sat_time_to_file_mapping, self.sat_times = build_sat_index(self.sat_path)
 
         # NWP index
-        self.solar_issue_map, self.solar_issue_times = build_nwp_index(
+        self.solar_issue_mapping, self.solar_issue_times = build_nwp_index(
             _PROJECT_ROOT/"datasets/112.285_34.700_UTC0_model_solar_v5.csv"
         )
-        self.wind_issue_map, self.wind_issue_times = build_nwp_index(
+        self.wind_issue_mapping, self.wind_issue_times = build_nwp_index(
             _PROJECT_ROOT/"datasets/112.285_34.700_UTC0_model_wind_v5.csv"
         )
 
@@ -205,11 +205,11 @@ class PVDataset(Dataset):
 
         X_sat, X_sat_mask, X_fcst = build_sat_nwp_sample(
             t0,
-            self.sat_time_to_file,
+            self.sat_time_to_file_mapping,
             self.sat_times,
-            self.solar_issue_map,
+            self.solar_issue_mapping,
             self.solar_issue_times,
-            self.wind_issue_map,
+            self.wind_issue_mapping,
             self.wind_issue_times,
         )
 
@@ -327,9 +327,9 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
 
-    data_dir = "/home/weize/remote_test_data/" # test only
+    #data_dir = "/home/weize/remote_test_data/" # test only
     #data_dir = "/home/weize/remote_luoyang_data_626/" # test only
-    #data_dir = "/mnt/nfs/Ai4Energy/Datasets/luoyang_data_626/"
+    data_dir = "/mnt/nfs/Ai4Energy/Datasets/luoyang_data_626/"
     train_dataset = PVDataset(data_dir=data_dir, split="train")
     test_dataset = PVDataset(data_dir=data_dir, split="test")
 

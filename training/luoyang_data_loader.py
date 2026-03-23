@@ -424,30 +424,30 @@ def build_train_test_splits(
 # ===== ADDED sat and NWP utils =====
 def build_sat_index(sat_root):
     sat_root = Path(sat_root)
-    sat_time_to_file = {}
+    sat_time_to_file_mapping = {}
     for npy_path in sat_root.rglob("*.npy"):
         name = npy_path.name
         # 假设格式：20250101_0000.npy
         try:
             t = pd.to_datetime(name.replace(".npy", ""), format="%Y%m%d_%H%M")
-            sat_time_to_file[t] = str(npy_path)
+            sat_time_to_file_mapping[t] = str(npy_path)
         except Exception:
             continue
-    sat_times = sorted(sat_time_to_file.keys())
+    sat_times = sorted(sat_time_to_file_mapping.keys())
     print(f"[SAT] indexed {len(sat_times)} npy files")
-    return sat_time_to_file, sat_times
+    return sat_time_to_file_mapping, sat_times
 
-def build_sat_sequence(t0, sat_time_to_file, sat_times, T=10):
+def build_sat_sequence(t0, sat_time_to_file_mapping, sat_times, T=10):
     X_sat_list = []
     X_sat_mask = []
     for k in range(T):
         tk = t0 - pd.Timedelta(minutes=15 * (T - 1 - k))
-        sat_time = find_latest_sat_time(tk, sat_times)
+        sat_time = find_latest_time(sat_times, tk)
         if sat_time is None:
             img = np.zeros((224, 224, 3), dtype=np.float32)
             found = 0
         else:
-            path = sat_time_to_file.get(pd.Timestamp(sat_time), None)
+            path = sat_time_to_file_mapping.get(pd.Timestamp(sat_time), None)
             if path is None:
                 img = np.zeros((224, 224, 3), dtype=np.float32)
                 found = 0
@@ -458,16 +458,26 @@ def build_sat_sequence(t0, sat_time_to_file, sat_times, T=10):
 
     return np.stack(X_sat_list), np.asarray(X_sat_mask)
 
-def find_latest_sat_time(t0, sat_times):
-    if len(sat_times) == 0:
+def find_latest_time(times, t0, *, to_datetime=True, remove_tz=False):
+    if len(times) == 0:
         return None
-    t0 = pd.Timestamp(t0).to_pydatetime()
-    sat_times = [pd.Timestamp(t).to_pydatetime() for t in sat_times]
-    idx = np.searchsorted(sat_times, t0, side="right") - 1
+    # --- normalize t0 ---
+    if to_datetime:
+        t0 = pd.Timestamp(t0)
+    if remove_tz and getattr(t0, "tzinfo", None):
+        t0 = t0.tz_localize(None)
+    # --- normalize times ---
+    if to_datetime:
+        times = [pd.Timestamp(t) for t in times]
+    if remove_tz:
+        times = [t.tz_localize(None) if getattr(t, "tzinfo", None) else t for t in times]
+    # --- convert to numpy array for searchsorted ---
+    times = np.array(times)
+    idx = np.searchsorted(times, t0, side="right") - 1
     if idx < 0:
         return None
-    return sat_times[idx]
-
+    return times[idx]
+    
 def load_sat_frame(path):
     try:
         img = np.load(path)  # already (H, W, 3)
@@ -519,19 +529,10 @@ def build_sat_nwp_sample(
         for i in range(horizon_steps)
     ]
     target_times = pd.to_datetime(target_times)
-    # ========= helper =========
-    def find_latest_issue(issue_times, t0):
-        issue_times = pd.to_datetime(issue_times)
-        issue_times = [t.tz_localize(None) if t.tzinfo else t for t in issue_times]
-        idx = np.searchsorted(issue_times, t0, side="right") - 1
-        if idx < 0:
-            return None
-        return issue_times[idx]
-
     # ========= SOLAR =========
     solar_block = np.zeros((horizon_steps, 1), dtype=np.float32)  # ssrd
     if solar_issue_map is not None:
-        issue_time = find_latest_issue(solar_issue_times, t0)
+        issue_time = find_latest_time(solar_issue_times, t0, remove_tz=True)
         if issue_time is not None:
             df = solar_issue_map[issue_time].copy()
             df["forecast_time"] = pd.to_datetime(df["forecast_time"])
@@ -556,7 +557,7 @@ def build_sat_nwp_sample(
     # ========= WIND =========
     wind_block = np.zeros((horizon_steps, 5), dtype=np.float32)  # t2m, u10, v10, u100, v100
     if wind_issue_map is not None:
-        issue_time = find_latest_issue(wind_issue_times, t0)
+        issue_time = find_latest_time(wind_issue_times, t0, remove_tz=True)
         if issue_time is not None:
             df = wind_issue_map[issue_time].copy()
             df["forecast_time"] = pd.to_datetime(df["forecast_time"])
