@@ -443,18 +443,23 @@ def build_sat_sequence(t0, sat_time_to_file_mapping, sat_times, T=10):
     for k in range(T):
         tk = t0 - pd.Timedelta(minutes=15 * (T - 1 - k))
         sat_time = find_latest_time(sat_times, tk)
-        if sat_time is None:
-            img = np.zeros((224, 224, 3), dtype=np.float32)
-            found = 0
-        else:
-            path = sat_time_to_file_mapping.get(pd.Timestamp(sat_time), None)
-            if path is None:
-                img = np.zeros((224, 224, 3), dtype=np.float32)
-                found = 0
+        valid = False
+        found = 0
+        if sat_time is not None:
+            delay_min = (tk - sat_time).total_seconds() / 60
+            if delay_min <= 120:
+                valid = True
+                path = sat_time_to_file_mapping.get(pd.Timestamp(sat_time), None)
+                if path is not None:
+                    img, found = load_sat_frame(path)
+                else:
+                    img = np.zeros((224, 224, 3), dtype=np.float32)
             else:
-                img, found = load_sat_frame(path)
+                img = np.zeros((224, 224, 3), dtype=np.float32)
+        else:
+            img = np.zeros((224, 224, 3), dtype=np.float32)
         X_sat_list.append(img)
-        X_sat_mask.append(found)
+        X_sat_mask.append(found * valid)
 
     return np.stack(X_sat_list), np.asarray(X_sat_mask)
 

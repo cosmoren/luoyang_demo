@@ -22,7 +22,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 from config_utils import get_resolved_paths
 from models.models import pv_forecasting_model
 from training.luoyang_data_loader import build_train_test_splits
-from training.luoyang_data_loader import build_sat_nwp_sample, build_nwp_index, build_sat_index
+from training.luoyang_data_loader import build_sat_nwp_sample, build_nwp_index, build_sat_index, find_latest_time
 from datetime import datetime, timedelta, timezone
 
 CONF_PATH = _PROJECT_ROOT / "config" / "conf.yaml"
@@ -30,7 +30,6 @@ FORECAST_STEPS = 192  # 48h at 15-min intervals
 HISTORY_LEN = 12
 SOLAR_FEATURE_DIM = 8
 PV_ZTIME_DIM = 6
-
 
 def load_config():
     with open(CONF_PATH) as f:
@@ -171,7 +170,6 @@ class PVDataset(Dataset):
 
         # the timestamp of the latest PV data (ensure UTC timezone)
         time0 = timestamps[-1]
-
         # Next 48 hours at 15-minute intervals (192 points), UTC
         forecast_timestamps_utc = [time0 + timedelta(minutes=15 * (i + 1)) for i in range(48 * 4)]
         # Compute solar features
@@ -202,7 +200,6 @@ class PVDataset(Dataset):
         # ===== ADDED: satellite + NWP =====
         # latest PV timestamp 作为 anchor
         t0 = pd.Timestamp(sample['X'][-1, 0])
-
         X_sat, X_sat_mask, X_fcst = build_sat_nwp_sample(
             t0,
             self.sat_time_to_file_mapping,
@@ -211,13 +208,13 @@ class PVDataset(Dataset):
             self.solar_issue_times,
             self.wind_issue_mapping,
             self.wind_issue_times,
+            192,
         )
 
         # 转 tensor（不参与训练，仅返回）
         X_sat = torch.from_numpy(X_sat.astype(np.float32)) # [10, 3, 224, 224]
         X_sat_mask = torch.from_numpy(X_sat_mask.astype(np.float32)) # [10]
         X_fcst = torch.from_numpy(X_fcst.astype(np.float32)) # [6, 192]
-
         return {
             "dev_idx": dev_idx,
             "pv": pv,
