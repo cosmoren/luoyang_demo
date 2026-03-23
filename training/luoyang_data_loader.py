@@ -20,6 +20,9 @@ from typing import Iterator
 import numpy as np
 import pandas as pd
 
+from datetime import datetime
+from scipy.ndimage import zoom
+
 # Default path to luoyang_data directory (relative to project root)
 DEFAULT_LUOYANG_DATA_DIR = Path(__file__).resolve().parent / "datasets" / "luoyang_data"
 
@@ -419,37 +422,27 @@ def build_train_test_splits(
         raise ValueError(f"Invalid split: {split}")
 
 # ===== ADDED sat and NWP utils =====
-from datetime import datetime
-
 def build_sat_index(sat_root):
     sat_root = Path(sat_root)
     sat_time_to_file = {}
-
     for npy_path in sat_root.rglob("*.npy"):
         name = npy_path.name
-
         # 假设格式：20250101_0000.npy
         try:
             t = pd.to_datetime(name.replace(".npy", ""), format="%Y%m%d_%H%M")
             sat_time_to_file[t] = str(npy_path)
         except Exception:
             continue
-
     sat_times = sorted(sat_time_to_file.keys())
-
     print(f"[SAT] indexed {len(sat_times)} npy files")
-
     return sat_time_to_file, sat_times
 
 def build_sat_sequence(t0, sat_time_to_file, sat_times, T=10):
     X_sat_list = []
     X_sat_mask = []
-
     for k in range(T):
         tk = t0 - pd.Timedelta(minutes=15 * (T - 1 - k))
-
         sat_time = find_latest_sat_time(tk, sat_times)
-
         if sat_time is None:
             img = np.zeros((224, 224, 3), dtype=np.float32)
             found = 0
@@ -460,39 +453,28 @@ def build_sat_sequence(t0, sat_time_to_file, sat_times, T=10):
                 found = 0
             else:
                 img, found = load_sat_frame(path)
-
         X_sat_list.append(img)
         X_sat_mask.append(found)
 
     return np.stack(X_sat_list), np.asarray(X_sat_mask)
 
 def find_latest_sat_time(t0, sat_times):
-
     if len(sat_times) == 0:
         return None
-
     t0 = pd.Timestamp(t0).to_pydatetime()
-
     sat_times = [pd.Timestamp(t).to_pydatetime() for t in sat_times]
-
     idx = np.searchsorted(sat_times, t0, side="right") - 1
-
     if idx < 0:
         return None
-
     return sat_times[idx]
 
-from scipy.ndimage import zoom
 def load_sat_frame(path):
     try:
         img = np.load(path)  # already (H, W, 3)
-
         img = np.squeeze(img).astype(np.float32)
-
         # ===== ensure shape =====
         if img.ndim != 3 or img.shape[-1] != 3:
             raise ValueError(f"Unexpected shape: {img.shape}")
-
         # ===== resize to 224x224 if needed =====
         if img.shape[0] != 224 or img.shape[1] != 224:
             zoom_factors = (
@@ -501,31 +483,23 @@ def load_sat_frame(path):
                 1,
             )
             img = zoom(img, zoom_factors, order=0)
-
         return img, 1
-
     except Exception:
         return np.zeros((224, 224, 3), dtype=np.float32), 0
 
 def build_nwp_index(csv_path):
-    """
-    Build:
-        issue_time -> dataframe slice
-    """
+    # issue_time -> dataframe slice
     df = pd.read_csv(csv_path, parse_dates=["start_time", "forecast_time"])
-
     issue_map = {}
     issue_times = []
-
     for issue_time, group in df.groupby("start_time"):
         issue_map[issue_time] = group.sort_values("forecast_time")
         issue_times.append(issue_time)
-
     issue_times = sorted(issue_times)
     return issue_map, issue_times
 
-# ===== ADDED =====
-def build_sample(
+# ===== build sat and nwp samples =====
+def build_sat_nwp_sample(
     t0,
     sat_time_to_file,
     sat_times,
@@ -539,19 +513,16 @@ def build_sample(
     t0 = pd.Timestamp(t0)
     if t0.tzinfo is not None:
         t0 = t0.tz_convert(None)
-
     # ========= forecast timeline =========
     target_times = [
         t0 + pd.Timedelta(minutes=15 * (i + 1))
         for i in range(horizon_steps)
     ]
     target_times = pd.to_datetime(target_times)
-    
     # ========= helper =========
     def find_latest_issue(issue_times, t0):
         issue_times = pd.to_datetime(issue_times)
         issue_times = [t.tz_localize(None) if t.tzinfo else t for t in issue_times]
-
         idx = np.searchsorted(issue_times, t0, side="right") - 1
         if idx < 0:
             return None
@@ -559,19 +530,16 @@ def build_sample(
 
     # ========= SOLAR =========
     solar_block = np.zeros((horizon_steps, 1), dtype=np.float32)  # ssrd
-
     if solar_issue_map is not None:
         issue_time = find_latest_issue(solar_issue_times, t0)
         if issue_time is not None:
             df = solar_issue_map[issue_time].copy()
-
             df["forecast_time"] = pd.to_datetime(df["forecast_time"])
             df["forecast_time"] = df["forecast_time"].dt.tz_localize(None)
             cols = []
             if "ssrd" in df.columns:
                 cols.append("ssrd")
             df = df.set_index("forecast_time")[cols]
-
             full_index = df.index.union(target_times)
             df = df.reindex(full_index).sort_index()
             df = df.interpolate(method="time")
@@ -582,19 +550,15 @@ def build_sample(
             df = df.where(gap <= max_gap)
             df = df.loc[target_times]
             df = df.fillna(0.0)
-            
             for i, name in enumerate(["ssrd"]):
                 if name in df.columns:
                     solar_block[:, i] = df[name].values.astype(np.float32)
     # ========= WIND =========
     wind_block = np.zeros((horizon_steps, 5), dtype=np.float32)  # t2m, u10, v10, u100, v100
-
     if wind_issue_map is not None:
         issue_time = find_latest_issue(wind_issue_times, t0)
-
         if issue_time is not None:
             df = wind_issue_map[issue_time].copy()
-
             df["forecast_time"] = pd.to_datetime(df["forecast_time"])
             df["forecast_time"] = df["forecast_time"].dt.tz_localize(None)
             cols = []
@@ -602,7 +566,6 @@ def build_sample(
                 if c in df.columns:
                     cols.append(c)
             df = df.set_index("forecast_time")[cols]
-
             full_index = df.index.union(target_times)
             df = df.reindex(full_index).sort_index()
             df = df.interpolate(method="time")
@@ -613,15 +576,12 @@ def build_sample(
             df = df.where(gap <= max_gap)
             df = df.loc[target_times]
             df = df.fillna(0.0)
-
             for i, name in enumerate(["t2m", "u10", "v10", "u100", "v100"]):
                 if name in df.columns:
                     wind_block[:, i] = df[name].values.astype(np.float32)
-
     # ========= CONCAT =========
-    X_fcst = np.concatenate([solar_block, wind_block], axis=1)  # (T, 6)
+    X_fcst = np.concatenate([solar_block, wind_block], axis=1)  # [T, 6]
     X_fcst = np.transpose(X_fcst, (1, 0)) # [6, T]
-
     # ========= SAT =========
     X_sat, X_sat_mask = build_sat_sequence(
         t0,
@@ -629,7 +589,6 @@ def build_sample(
         sat_times
     )
     X_sat = np.transpose(X_sat, (0, 3, 1, 2)) # [12, 3, 224, 224]
-
     return X_sat, X_sat_mask, X_fcst
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 from config_utils import get_resolved_paths
 from models.models import pv_forecasting_model
 from training.luoyang_data_loader import build_train_test_splits
-from training.luoyang_data_loader import build_sample, build_nwp_index, build_sat_index
+from training.luoyang_data_loader import build_sat_nwp_sample, build_nwp_index, build_sat_index
 from datetime import datetime, timedelta, timezone
 
 CONF_PATH = _PROJECT_ROOT / "config" / "conf.yaml"
@@ -112,8 +112,8 @@ class PVDataset(Dataset):
             conf = yaml.safe_load(f)
         paths = get_resolved_paths(conf, _PROJECT_ROOT)
         self.pv_path = paths["pv_download"]
-        #self.sat_path = "/home/weize/ai4energy_crop/" # test only
-        self.sat_path = paths["sat_download"]
+        self.sat_path = "/home/weize/ai4energy_crop/" # test only
+        #self.sat_path = paths["sat_download"]
         pv_device_path = paths["pv_device_path"]
 
         site = conf.get("site", {})
@@ -203,7 +203,7 @@ class PVDataset(Dataset):
         # latest PV timestamp 作为 anchor
         t0 = pd.Timestamp(sample['X'][-1, 0])
 
-        X_sat, X_sat_mask, X_fcst = build_sample(
+        X_sat, X_sat_mask, X_fcst = build_sat_nwp_sample(
             t0,
             self.sat_time_to_file,
             self.sat_times,
@@ -327,9 +327,9 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
 
-    #data_dir = "/home/weize/remote_test_data/" # test only
+    data_dir = "/home/weize/remote_test_data/" # test only
     #data_dir = "/home/weize/remote_luoyang_data_626/" # test only
-    data_dir = "/mnt/nfs/Ai4Energy/Datasets/luoyang_data_626/"
+    #data_dir = "/mnt/nfs/Ai4Energy/Datasets/luoyang_data_626/"
     train_dataset = PVDataset(data_dir=data_dir, split="train")
     test_dataset = PVDataset(data_dir=data_dir, split="test")
 
