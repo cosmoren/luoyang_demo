@@ -335,6 +335,8 @@ def build_train_test_splits(
         return 3 in months and 4 in months
 
     for file_idx, csv_path in enumerate(all_csvs):
+        if file_idx>5:
+            break
         if verbose:
             print(f"  [{file_idx + 1}/{n_csvs}] {csv_path.name} ...", end=" ", flush=True)
         df = load_csv(csv_path)
