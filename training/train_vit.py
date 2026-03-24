@@ -20,10 +20,11 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from config_utils import get_resolved_paths
-from models.models import pv_forecasting_model
+from models.models import pv_forecasting_model_vit
 from preprocessing.himawari_infer import parse_time_from_nc_name
 from training.luoyang_data_loader import build_train_test_splits
 from datetime import datetime, timedelta, timezone
+import os
 
 CONF_PATH = _PROJECT_ROOT / "config" / "conf.yaml"
 FORECAST_STEPS = 192  # 48h at 15-min intervals
@@ -121,6 +122,34 @@ def delta_time_encoder(timestamps, t0):
     delta_time_tensor = torch.from_numpy(delta_time / 48)
     return delta_time_tensor
 
+def sat_image_tensor(sat_image_path, time0, stepsize=10, timespan=48):
+    if time0.tzinfo is None:
+        time0_utc = time0.replace(tzinfo=timezone.utc)
+    else:
+        time0_utc = time0.astimezone(timezone.utc)
+    # Round down to the nearest stepsize-minute boundary (e.g. 10:15 -> 10:10 when stepsize=10)
+    time0_utc = time0_utc.replace(minute=(time0_utc.minute // stepsize) * stepsize, second=0, microsecond=0)
+    total_steps = int(timespan * 60 // stepsize)
+    filenames = [
+        (time0_utc - timedelta(minutes=i * stepsize)).strftime("%Y%m%d_%H%M")
+        for i in range(total_steps, -1, -1)
+    ]
+
+    timestamps = [time0_utc - timedelta(minutes=i * stepsize) for i in range(total_steps, -1, -1)]
+
+    imgs = []
+    for filename in filenames:
+        if os.path.exists(os.path.join(sat_image_path, filename + ".npy")):
+            img = np.load(os.path.join(sat_image_path, filename + ".npy"))
+        else:
+            img = np.zeros((100, 100, 3), dtype=np.float32)
+        imgs.append(img.astype(np.float32))
+    img_stack = np.stack(imgs, axis=0).transpose(0,3,1,2)  # (N, 3, 100, 100)
+    imgs_tensor = torch.from_numpy(img_stack).float()
+
+    return timestamps, imgs_tensor
+
+
 class PVDataset(Dataset):
     """
     Synthetic dataset with correct shapes for pv_forecasting_model.
@@ -184,8 +213,12 @@ class PVDataset(Dataset):
 
         # load satellite images: NC times in UTC; window [t0-48h, t0] in UTC
         sat_image_path = "/mnt/nfs/Ai4Energy/Datasets/luoyang/luoyang_crop"
-        print('time0:', time0)
-
+        sat_timestamps_utc, sat_tensor = sat_image_tensor(sat_image_path, time0, stepsize=10, timespan=5)
+        sat_solar_features = compute_solar_features(sat_timestamps_utc, self.latitude, self.longitude)
+        sat_timefeats = solar_features_encoder(sat_solar_features)
+        sat_dtimefeats = delta_time_encoder(sat_timestamps_utc, time0)
+        sat_timefeats = torch.cat([sat_timefeats, sat_dtimefeats.unsqueeze(1)], dim=1)
+        
         # target
         target_pv = torch.from_numpy( (sample['Y'][:,2]/50).astype(np.float32) )
         target_mask = torch.from_numpy( (sample['Y'][:,1]==512).astype(np.float32) )
@@ -194,10 +227,14 @@ class PVDataset(Dataset):
             "dev_idx": dev_idx,
             "pv": pv,
             "pv_mask": pv_mask,
-            "history_solar_features": pv_timefeats,
-            "delta_time_hours": pv_dtimefeats,
-            "forecast_solar_features": forecast_timefeats,
-            "sat_filenames": sat_filenames,
+            "pv_timefeats": pv_timefeats,
+            "forecast_timefeats": forecast_timefeats,
+            "sat_tensor": sat_tensor,
+            "sat_timefeats": sat_timefeats,
+            "skimg_tensor": None,
+            "skimg_timefeats": None,
+            "nwp_tensor": None,         # TODO: add nwp features
+            "nwp_timefeats": None,      # TODO: add nwp features
             "target_pv": target_pv,
             "target_mask": target_mask,
         }
@@ -210,16 +247,24 @@ def collate_single(batch):
 
 def collate_batched(batch):
     """Stack list of samples into one dict of tensors with batch dim B in front."""
+    pv_tf = torch.stack([s["pv_timefeats"] for s in batch])
+    fc_tf = torch.stack([s["forecast_timefeats"] for s in batch])
     return {
         "dev_idx": torch.stack([s["dev_idx"] for s in batch]),
         "pv": torch.stack([s["pv"] for s in batch]),
         "pv_mask": torch.stack([s["pv_mask"] for s in batch]),
-        "history_solar_features": torch.stack([s["history_solar_features"] for s in batch]),
-        "forecast_solar_features": torch.stack([s["forecast_solar_features"] for s in batch]),
+        "pv_timefeats": pv_tf,
+        "forecast_timefeats": fc_tf,
+        "history_solar_features": pv_tf,
+        "forecast_solar_features": fc_tf,
+        "sat_tensor": torch.stack([s["sat_tensor"] for s in batch]),
+        "sat_timefeats": torch.stack([s["sat_timefeats"] for s in batch]),
+        "skimg_tensor": None,
+        "skimg_timefeats": None,
+        "nwp_tensor": None,
+        "nwp_timefeats": None,
         "target_pv": torch.stack([s["target_pv"] for s in batch]),
         "target_mask": torch.stack([s["target_mask"] for s in batch]),
-        "delta_time_hours": torch.stack([s["delta_time_hours"] for s in batch]),
-        "sat_filenames": [s["sat_filenames"] for s in batch],
     }
 
 
@@ -233,16 +278,34 @@ def train_one_epoch(model, device, loader, criterion, optimizer):
         if batch_idx > 3000:
             break
         B = batch["dev_idx"].size(0)
-        device_id = batch["dev_idx"].to(device)            # [B]
-        pv = batch["pv"].to(device)                        # [B, C, T_in]
-        mask = batch["pv_mask"].to(device)                 # [B, C, T_in]
-        history_solar_features = batch["history_solar_features"].to(device)
-        forecast_solar_features = batch["forecast_solar_features"].to(device)
+        device_id = batch["dev_idx"].to(device)
+        pv = batch["pv"].to(device)
+        mask = batch["pv_mask"].to(device)
+        pv_timefeats = batch["pv_timefeats"].to(device)
+        forecast_timefeats = batch["forecast_timefeats"].to(device)
+        sat_tensor = batch["sat_tensor"].to(device) if batch["sat_tensor"] is not None else None
+        sat_timefeats = batch["sat_timefeats"].to(device) if batch["sat_timefeats"] is not None else None
+        skimg_tensor = batch["skimg_tensor"].to(device) if batch["skimg_tensor"] is not None else None
+        skimg_timefeats = batch["skimg_timefeats"].to(device) if batch["skimg_timefeats"] is not None else None
+        nwp_tensor = batch["nwp_tensor"].to(device) if batch["nwp_tensor"] is not None else None
+        nwp_timefeats = batch["nwp_timefeats"].to(device) if batch["nwp_timefeats"] is not None else None
         target_pv = batch["target_pv"].to(device)
         target_mask = batch["target_mask"].to(device)
 
         optimizer.zero_grad()
-        pv_pred = model(device_id, pv, mask, history_solar_features, forecast_solar_features)
+        pv_pred = model(
+            device_id,
+            pv,
+            pv_mask=mask,
+            pv_timefeats=pv_timefeats,
+            forecast_timefeats=forecast_timefeats,
+            sat_tensor=sat_tensor,
+            sat_timefeats=sat_timefeats,
+            skimg_tensor=skimg_tensor,
+            skimg_timefeats=skimg_timefeats,
+            nwp_tensor=nwp_tensor,
+            nwp_timefeats=nwp_timefeats,
+        )
         loss = criterion(pv_pred * target_mask, target_pv * target_mask)
         loss.backward()
         optimizer.step()
@@ -263,11 +326,29 @@ def evaluate(model, device, loader, criterion):
             device_id = batch["dev_idx"].to(device)
             pv = batch["pv"].to(device)
             mask = batch["pv_mask"].to(device)
-            history_solar_features = batch["history_solar_features"].to(device)
-            forecast_solar_features = batch["forecast_solar_features"].to(device)
+            pv_timefeats = batch["pv_timefeats"].to(device)
+            forecast_timefeats = batch["forecast_timefeats"].to(device)
+            sat_tensor = batch["sat_tensor"].to(device) if batch["sat_tensor"] is not None else None
+            sat_timefeats = batch["sat_timefeats"].to(device) if batch["sat_timefeats"] is not None else None
+            skimg_tensor = batch["skimg_tensor"].to(device) if batch["skimg_tensor"] is not None else None
+            skimg_timefeats = batch["skimg_timefeats"].to(device) if batch["skimg_timefeats"] is not None else None
+            nwp_tensor = batch["nwp_tensor"].to(device) if batch["nwp_tensor"] is not None else None
+            nwp_timefeats = batch["nwp_timefeats"].to(device) if batch["nwp_timefeats"] is not None else None
             target_pv = batch["target_pv"].to(device)
             target_mask = batch["target_mask"].to(device)
-            pv_pred = model(device_id, pv, mask, history_solar_features, forecast_solar_features)
+            pv_pred = model(
+                device_id,
+                pv,
+                pv_mask=mask,
+                pv_timefeats=pv_timefeats,
+                forecast_timefeats=forecast_timefeats,
+                sat_tensor=sat_tensor,
+                sat_timefeats=sat_timefeats,
+                skimg_tensor=skimg_tensor,
+                skimg_timefeats=skimg_timefeats,
+                nwp_tensor=nwp_tensor,
+                nwp_timefeats=nwp_timefeats,
+            )
             loss = criterion(pv_pred * target_mask, target_pv * target_mask)
             total_loss += loss.item()
             n += B
@@ -278,7 +359,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train PV forecasting model")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--checkpoint_dir", type=str, default=None)
     parser.add_argument("--save_every", type=int, default=5)
     args = parser.parse_args()
@@ -293,7 +374,7 @@ def main():
     num_devices = len(dev_dn_list)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = pv_forecasting_model(out_dim=64, dev_dn_list=dev_dn_list).to(device)
+    model = pv_forecasting_model_vit(dev_dn_list=dev_dn_list).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
 
