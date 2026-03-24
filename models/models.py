@@ -244,7 +244,7 @@ class pv_forecasting_model_vit(nn.Module):
         self.sat_downdim = MLP(in_dim=768, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
         self.skimg_downdim = MLP(in_dim=768, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
         self.timefeats_encoder = MLP(in_dim=9, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
-        self.nwp_updim = MLP(in_dim=10, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
+        self.nwp_updim = MLP(in_dim=16, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
         self.pv_feats_head = MLP(in_dim=272, hidden_dims=(512, 256, 128), out_dim=64, dropout=0.0)
         self.fc = FC(in_dim=64, out_dim=1)
 
@@ -292,7 +292,7 @@ class pv_forecasting_model_vit(nn.Module):
         if nwp_tensor is None:
             forecast_nwp_features = torch.zeros(pv.shape[0], forecast_timefeats.shape[1], 64).to(pv.device)
         else:
-            nwp_fc_wtime = torch.cat([nwp_tensor, nwp_timefeats.permute(0, 2, 1)], dim=1)
+            nwp_fc_wtime = torch.cat([nwp_tensor.permute(0, 2, 1), nwp_timefeats], dim=-1) # [4, 192, 16]
             nwp_fc_mem = self.nwp_updim(nwp_fc_wtime)
             forecast_nwp_features = self.cross_attention_nwp(query=forecast_timefeats, key=nwp_fc_mem, value=nwp_fc_mem)
 

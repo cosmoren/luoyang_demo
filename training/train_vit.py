@@ -149,6 +149,137 @@ def sat_image_tensor(sat_image_path, time0, stepsize=10, timespan=48):
 
     return timestamps, imgs_tensor
 
+def build_nwp_index(csv_path):
+    # issue_time -> dataframe slice
+    df = pd.read_csv(csv_path, parse_dates=["start_time", "forecast_time"])
+    issue_map = {}
+    issue_times = []
+    for issue_time, group in df.groupby("start_time"):
+        issue_map[issue_time] = group.sort_values("forecast_time")
+        issue_times.append(issue_time)
+    issue_times = sorted(issue_times)
+    return issue_map, issue_times
+
+def find_latest_time_stochastic(times, t0, *, 
+                                prob_second=0.5, to_datetime=True, remove_tz=False,
+                                max_delay=None, # e.g. pd.Timedelta(hours=2)
+                                ):
+    if len(times) == 0:
+        return None
+    # --- normalize t0 ---
+    if to_datetime:
+        t0 = pd.Timestamp(t0)
+    if remove_tz and getattr(t0, "tzinfo", None):
+        t0 = t0.tz_localize(None)
+    # --- normalize times ---
+    if to_datetime:
+        times = [pd.Timestamp(t) for t in times]
+    if remove_tz:
+        times = [
+            t.tz_localize(None) if getattr(t, "tzinfo", None) else t
+            for t in times
+        ]
+    times = np.array(times)
+    # --- search ---
+    idx = np.searchsorted(times, t0, side="right") - 1
+    if idx < 0:
+        return None
+    # --- candidate indices ---
+    candidates = [idx]
+    if idx - 1 >= 0:
+        candidates.append(idx - 1)
+    # --- stochastic selection ---
+    if len(candidates) == 2:
+        if np.random.rand() < prob_second:
+            chosen_idx = candidates[1]  # second latest
+        else:
+            chosen_idx = candidates[0]  # latest
+    else:
+        chosen_idx = candidates[0]
+    chosen_time = times[chosen_idx]
+    # --- max delay control ---
+    if max_delay is not None:
+        if (t0 - chosen_time) > max_delay:
+            return None
+    return chosen_time
+
+def build_nwp_tensor(
+    t0,
+    fcst_times,
+    solar_issue_map,
+    solar_issue_times,
+    wind_issue_map,
+    wind_issue_times,
+):
+    # ========= 统一时间 =========
+    t0 = pd.Timestamp(t0)
+    if t0.tzinfo is not None:
+        t0 = t0.tz_localize(None)
+    t0_utc = pd.Timestamp(t0).tz_localize("Asia/Shanghai").tz_convert("UTC").tz_localize(None) # in UTC0
+    # ========= forecast timeline =========
+    target_times = pd.DatetimeIndex(fcst_times).tz_convert("UTC").tz_localize(None) # in UTC0
+    target_times = pd.to_datetime(target_times)
+    horizon_steps = len(target_times)
+    issue_time = None
+    # ========= SOLAR =========
+    solar_block = np.zeros((horizon_steps, 1), dtype=np.float32)  # ssrd
+    if solar_issue_map is not None:
+        issue_time = find_latest_time_stochastic(solar_issue_times, t0_utc, remove_tz=True) # if solar_issue time is UTC0, use t0_utc
+        if issue_time is not None:
+            df = solar_issue_map[issue_time].copy()
+            df["forecast_time"] = pd.to_datetime(df["forecast_time"])
+            df["forecast_time"] = df["forecast_time"].dt.tz_localize(None)
+            cols = []
+            if "ssrd" in df.columns:
+                cols.append("ssrd")
+            df = df.set_index("forecast_time")[cols]
+            full_index = df.index.union(target_times)
+            df = df.reindex(full_index).sort_index()
+            df = df.interpolate(method="time")
+            max_gap = pd.Timedelta("1h")
+            prev_valid = df.index.to_series().where(df.notna().any(axis=1)).ffill()
+            next_valid = df.index.to_series().where(df.notna().any(axis=1)).bfill()
+            gap = next_valid - prev_valid
+            df = df.where(gap <= max_gap)
+            df = df.loc[target_times]
+            df = df.fillna(0.0)
+            for i, name in enumerate(["ssrd"]):
+                if name in df.columns:
+                    solar_block[:, i] = df[name].values.astype(np.float32)
+    # ========= WIND =========
+    wind_block = np.zeros((horizon_steps, 5), dtype=np.float32)  # t2m, u10, v10, u100, v100
+    if wind_issue_map is not None:
+        issue_time = find_latest_time_stochastic(wind_issue_times, t0_utc, remove_tz=True)
+        if issue_time is not None:
+            df = wind_issue_map[issue_time].copy()
+            df["forecast_time"] = pd.to_datetime(df["forecast_time"])
+            df["forecast_time"] = df["forecast_time"].dt.tz_localize(None)
+            cols = []
+            for c in ["t2m", "u10", "v10", "u100", "v100"]:
+                if c in df.columns:
+                    cols.append(c)
+            df = df.set_index("forecast_time")[cols]
+            full_index = df.index.union(target_times)
+            df = df.reindex(full_index).sort_index()
+            df = df.interpolate(method="time")
+            max_gap = pd.Timedelta("1h")
+            prev_valid = df.index.to_series().where(df.notna().any(axis=1)).ffill()
+            next_valid = df.index.to_series().where(df.notna().any(axis=1)).bfill()
+            gap = next_valid - prev_valid
+            df = df.where(gap <= max_gap)
+            df = df.loc[target_times]
+            df = df.fillna(0.0)
+            for i, name in enumerate(["t2m", "u10", "v10", "u100", "v100"]):
+                if name in df.columns:
+                    wind_block[:, i] = df[name].values.astype(np.float32)
+    # ========= issue time diff =====
+    issue_diff_hours = (target_times - issue_time).total_seconds() / 3600
+    issue_diff_hours = np.clip(issue_diff_hours / 48, 0.0, 1.0) # normalize over 48 hours
+    issue_diff_block = np.expand_dims(np.array(issue_diff_hours), 1)
+    # ========= CONCAT =========
+    X_fcst = np.concatenate([solar_block, wind_block, issue_diff_block], axis=1)  # [T, 7]
+    X_fcst = np.transpose(X_fcst, (1, 0)) # [7, T]
+    return torch.from_numpy(X_fcst).float()
 
 class PVDataset(Dataset):
     """
@@ -182,6 +313,14 @@ class PVDataset(Dataset):
             split=split,
         )
 
+        # NWP index
+        self.solar_issue_mapping, self.solar_issue_times = build_nwp_index(
+            _PROJECT_ROOT/"datasets/112.285_34.700_UTC0_model_solar_v5.csv"
+        )
+        self.wind_issue_mapping, self.wind_issue_times = build_nwp_index(
+            _PROJECT_ROOT/"datasets/112.285_34.700_UTC0_model_wind_v5.csv"
+        )
+
     def __len__(self):
         return len(self.samples)
 
@@ -211,14 +350,23 @@ class PVDataset(Dataset):
         forecast_dtimefeats = delta_time_encoder(forecast_timestamps_utc, time0)
         forecast_timefeats = torch.cat([forecast_timefeats, forecast_dtimefeats.unsqueeze(1)], dim=1)
 
+        # load forecast data:
+        nwp_timestamps_utc = [time0 + timedelta(minutes=15 * (i + 1)) for i in range(48 * 4)] # can be different from forecast_timestamps_utc
+        nwp_solar_features = compute_solar_features(nwp_timestamps_utc, self.latitude, self.longitude)
+        nwp_timefeats = solar_features_encoder(nwp_solar_features)
+        nwp_dtimefeats = delta_time_encoder(nwp_timestamps_utc, time0)
+        nwp_timefeats = torch.cat([nwp_timefeats, nwp_dtimefeats.unsqueeze(1)], dim=1)
+        nwp_tensor = build_nwp_tensor(time0, nwp_timestamps_utc, self.solar_issue_mapping, self.solar_issue_times, self.wind_issue_mapping, self.wind_issue_times)
+
         # load satellite images: NC times in UTC; window [t0-48h, t0] in UTC
         sat_image_path = "/mnt/nfs/Ai4Energy/Datasets/luoyang/luoyang_crop"
+        #sat_image_path = "/home/weize/ai4energy_crop/" # test only
         sat_timestamps_utc, sat_tensor = sat_image_tensor(sat_image_path, time0, stepsize=10, timespan=5)
         sat_solar_features = compute_solar_features(sat_timestamps_utc, self.latitude, self.longitude)
         sat_timefeats = solar_features_encoder(sat_solar_features)
         sat_dtimefeats = delta_time_encoder(sat_timestamps_utc, time0)
         sat_timefeats = torch.cat([sat_timefeats, sat_dtimefeats.unsqueeze(1)], dim=1)
-        
+
         # target
         target_pv = torch.from_numpy( (sample['Y'][:,2]/50).astype(np.float32) )
         target_mask = torch.from_numpy( (sample['Y'][:,1]==512).astype(np.float32) )
@@ -233,8 +381,8 @@ class PVDataset(Dataset):
             "sat_timefeats": sat_timefeats,
             "skimg_tensor": None,
             "skimg_timefeats": None,
-            "nwp_tensor": None,         # TODO: add nwp features
-            "nwp_timefeats": None,      # TODO: add nwp features
+            "nwp_tensor": nwp_tensor, # [7, 192]
+            "nwp_timefeats": nwp_timefeats, # [192, 8]
             "target_pv": target_pv,
             "target_mask": target_mask,
         }
@@ -261,8 +409,8 @@ def collate_batched(batch):
         "sat_timefeats": torch.stack([s["sat_timefeats"] for s in batch]),
         "skimg_tensor": None,
         "skimg_timefeats": None,
-        "nwp_tensor": None,
-        "nwp_timefeats": None,
+        "nwp_tensor": torch.stack([s["nwp_tensor"] for s in batch]),
+        "nwp_timefeats": torch.stack([s["nwp_timefeats"] for s in batch]),
         "target_pv": torch.stack([s["target_pv"] for s in batch]),
         "target_mask": torch.stack([s["target_mask"] for s in batch]),
     }
@@ -379,6 +527,8 @@ def main():
     criterion = nn.MSELoss()
 
     data_dir = "/mnt/nfs/Ai4Energy/Datasets/luoyang_data_626/"
+    #data_dir = "/home/weize/remote_test_data/" # test only
+    #data_dir = "/home/weize/remote_luoyang_data_626/" # test only
     train_dataset = PVDataset(data_dir=data_dir, split="train")
     test_dataset = PVDataset(data_dir=data_dir, split="test")
 
@@ -387,14 +537,14 @@ def main():
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_batched,
-        num_workers=24,
+        num_workers=24, # test only, default 24, could be smaller for memory issue
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_batched,
-        num_workers=24,
+        num_workers=24, # test only, default 24, ould be smaller for memory issue
     )
 
     checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else _PROJECT_ROOT / "checkpoints"
