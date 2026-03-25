@@ -32,7 +32,6 @@ HISTORY_LEN = 12
 SOLAR_FEATURE_DIM = 8
 PV_ZTIME_DIM = 6
 
-
 def load_config():
     with open(CONF_PATH) as f:
         conf = yaml.safe_load(f)
@@ -246,6 +245,9 @@ def build_nwp_tensor(
             for i, name in enumerate(["ssrd"]):
                 if name in df.columns:
                     solar_block[:, i] = df[name].values.astype(np.float32)
+                    # normalize
+                    if name == "ssrd":
+                        solar_block[:, i] /= 300.0
     # ========= WIND =========
     wind_block = np.zeros((horizon_steps, 5), dtype=np.float32)  # t2m, u10, v10, u100, v100
     if wind_issue_map is not None:
@@ -272,6 +274,11 @@ def build_nwp_tensor(
             for i, name in enumerate(["t2m", "u10", "v10", "u100", "v100"]):
                 if name in df.columns:
                     wind_block[:, i] = df[name].values.astype(np.float32)
+                    # normalize
+                    if name == "t2m":
+                        wind_block[:, i] = (wind_block[:, i] - 273.15) / 40.0
+                    if name in ["u10", "v10", "u100", "v100"]:
+                        wind_block[:, i] /= 10.0
     # ========= issue time diff =====
     issue_diff_hours = (target_times - issue_time).total_seconds() / 3600
     issue_diff_hours = np.clip(issue_diff_hours / 48, 0.0, 1.0) # normalize over 48 hours
