@@ -14,6 +14,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import yaml
+import hashlib
+import requests
+import re
+from urllib.parse import urlparse
 from pvlib import solarposition
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -148,15 +152,57 @@ def sat_image_tensor(sat_image_path, time0, stepsize=10, timespan=48):
 
     return timestamps, imgs_tensor
 
-def build_nwp_index(csv_path):
-    # issue_time -> dataframe slice
-    df = pd.read_csv(csv_path, parse_dates=["start_time", "forecast_time"])
+def parse_latlon_from_path(path):
+    name = str(path)
+    # match 112.250_34.650
+    m = re.search(r"(\d+\.\d+)_(\d+\.\d+)_UTC", name)
+    if m:
+        lon = float(m.group(1))
+        lat = float(m.group(2))
+        return lat, lon
+    return None, None
+
+# download + cache remote NWP CSV
+def load_csv_with_cache(path, cache_dir):
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path_str = str(path)
+    # ---------- 本地文件 ----------
+    if not path_str.startswith("http"):
+        return pd.read_csv(path, parse_dates=["start_time", "forecast_time"])
+    # 用 short hash + original name 作为文件名（避免重复下载）
+    parsed = urlparse(path_str)
+    base_name = os.path.basename(parsed.path)
+    short_hash = hashlib.md5(path_str.encode()).hexdigest()[:8]
+    fname = f"{short_hash}_{base_name}"
+    cache_path = cache_dir / fname
+    # 如果没缓存就下载
+    if not cache_path.exists():
+        print(f"[NWP] downloading {path_str}")
+        r = requests.get(path_str, timeout=60)
+        r.raise_for_status()
+        with open(cache_path, "wb") as f:
+            f.write(r.content)
+    return pd.read_csv(cache_path, parse_dates=["start_time", "forecast_time"])
+
+def build_nwp_index_multi(csv_paths, cache_dir, target_lat, target_lon):
     issue_map = {}
-    issue_times = []
-    for issue_time, group in df.groupby("start_time"):
-        issue_map[issue_time] = group.sort_values("forecast_time")
-        issue_times.append(issue_time)
-    issue_times = sorted(issue_times)
+    lat0, lon0 = target_lat, target_lon
+    for path in csv_paths:
+        df = load_csv_with_cache(path, cache_dir)
+        df["_source"] = str(path)
+        lat, lon = parse_latlon_from_path(path)
+        for issue_time, group in df.groupby("start_time"):
+            group = group.sort_values("forecast_time")
+            dist = (lat - lat0)**2 + (lon - lon0)**2
+            if issue_time not in issue_map:
+                issue_map[issue_time] = (group, dist)
+            else:
+                _, best_dist = issue_map[issue_time]
+                if dist < best_dist:
+                    issue_map[issue_time] = (group, dist)
+    issue_map = {k: v[0] for k, v in issue_map.items()}
+    issue_times = sorted(issue_map.keys())
     return issue_map, issue_times
 
 def find_latest_time_stochastic(times, t0, *, 
@@ -321,11 +367,21 @@ class PVDataset(Dataset):
         )
 
         # NWP index
-        self.solar_issue_mapping, self.solar_issue_times = build_nwp_index(
-            _PROJECT_ROOT/"datasets/112.285_34.700_UTC0_model_solar_v5.csv"
+        with open(_PROJECT_ROOT/"config"/"NWP.yaml") as f:
+            nwp_conf = yaml.safe_load(f)
+        solar_paths = [_PROJECT_ROOT/"datasets/112.285_34.700_UTC0_model_solar_v5.csv", *nwp_conf["solar"]]
+        wind_paths = [_PROJECT_ROOT/"datasets/112.285_34.700_UTC0_model_wind_v5.csv", *nwp_conf["wind"]]
+        self.solar_issue_mapping, self.solar_issue_times = build_nwp_index_multi(
+            solar_paths,
+            cache_dir=_PROJECT_ROOT/"datasets",
+            target_lat=self.latitude,
+            target_lon=self.longitude,
         )
-        self.wind_issue_mapping, self.wind_issue_times = build_nwp_index(
-            _PROJECT_ROOT/"datasets/112.285_34.700_UTC0_model_wind_v5.csv"
+        self.wind_issue_mapping, self.wind_issue_times = build_nwp_index_multi(
+            wind_paths,
+            cache_dir=_PROJECT_ROOT/"datasets",
+            target_lat=self.latitude,
+            target_lon=self.longitude,
         )
 
     def __len__(self):
@@ -351,13 +407,14 @@ class PVDataset(Dataset):
 
         # Next 48 hours at 15-minute intervals (192 points), UTC
         forecast_timestamps_utc = [time0 + timedelta(minutes=15 * (i + 1)) for i in range(48 * 4)]
+        #forecast_timestamps_utc = [time0 + timedelta(minutes=15), time0 + timedelta(hours=4)] # test only
         # Compute forecast time features
         forecast_solar_features = compute_solar_features(forecast_timestamps_utc, self.latitude, self.longitude)
         forecast_timefeats = solar_features_encoder(forecast_solar_features)
         forecast_dtimefeats = delta_time_encoder(forecast_timestamps_utc, time0)
         forecast_timefeats = torch.cat([forecast_timefeats, forecast_dtimefeats.unsqueeze(1)], dim=1)
 
-        # load forecast data:
+        # load nwp data:
         nwp_timestamps_utc = [time0 + timedelta(minutes=15 * (i + 1)) for i in range(48 * 4)] # can be different from forecast_timestamps_utc
         nwp_solar_features = compute_solar_features(nwp_timestamps_utc, self.latitude, self.longitude)
         nwp_timefeats = solar_features_encoder(nwp_solar_features)
@@ -429,6 +486,7 @@ def train_one_epoch(model, device, loader, criterion, optimizer):
     n = 0
     num_batches = len(loader)
     print('number of batches: ', num_batches)
+    scaler = torch.amp.GradScaler('cuda') # mixed precision
     for batch_idx, batch in enumerate(loader):
         if batch_idx > 3000:
             break
@@ -448,22 +506,26 @@ def train_one_epoch(model, device, loader, criterion, optimizer):
         target_mask = batch["target_mask"].to(device)
 
         optimizer.zero_grad()
-        pv_pred = model(
-            device_id,
-            pv,
-            pv_mask=mask,
-            pv_timefeats=pv_timefeats,
-            forecast_timefeats=forecast_timefeats,
-            sat_tensor=sat_tensor,
-            sat_timefeats=sat_timefeats,
-            skimg_tensor=skimg_tensor,
-            skimg_timefeats=skimg_timefeats,
-            nwp_tensor=nwp_tensor,
-            nwp_timefeats=nwp_timefeats,
-        )
-        loss = criterion(pv_pred * target_mask, target_pv * target_mask)
-        loss.backward()
-        optimizer.step()
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            pv_pred = model(
+                device_id,
+                pv,
+                pv_mask=mask,
+                pv_timefeats=pv_timefeats,
+                forecast_timefeats=forecast_timefeats,
+                sat_tensor=sat_tensor,
+                sat_timefeats=sat_timefeats,
+                skimg_tensor=skimg_tensor,
+                skimg_timefeats=skimg_timefeats,
+                nwp_tensor=nwp_tensor,
+                nwp_timefeats=nwp_timefeats,
+            )
+            loss = criterion(pv_pred * target_mask, target_pv * target_mask)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        #loss.backward()
+        #optimizer.step()
         total_loss += loss.item()
         n += B
     print()
