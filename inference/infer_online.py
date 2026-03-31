@@ -5,7 +5,9 @@ Online inference GUI: PV forecast panels (short/mid/long term), left panel
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import random
 import sys
+import yaml
 
 import matplotlib.dates as mdates
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -25,8 +27,16 @@ from inspect_nc import clean_himawari_dataset
 import xarray as xr
 import re
 from preprocess_nc import LAT_MIN, LAT_MAX, LON_MIN, LON_MAX, VARS_TO_KEEP
+from config_utils import get_infer_online_data_paths
 
 _XINSHENG_EXCEL = _PROJECT_ROOT / "datasets" / "XINSHENG_power_total_devices_type1.xlsx"
+_CONF_PATH = _PROJECT_ROOT / "config" / "conf.yaml"
+
+
+def _load_infer_online_paths() -> dict[str, Path]:
+    with open(_CONF_PATH) as f:
+        conf = yaml.safe_load(f)
+    return get_infer_online_data_paths(conf, _PROJECT_ROOT)
 
 
 def _devdn_display_name(raw: str) -> str:
@@ -76,8 +86,12 @@ try:
 except ImportError:
     _PIL_AVAILABLE = False
 
-NC_PROCESSED_DIR = Path("/home/bb/solar_luoyang/external_data/himawari")
-SKY_IMAGE_DIR = Path("/home/bb/solar_luoyang/luoyang_demo/sky_images")
+_p_infer = _load_infer_online_paths()
+NC_PROCESSED_DIR = _p_infer["nc_processed"]
+SKY_IMAGE_DIR = _p_infer["sky_image"]
+SKY_IMAGE_PRED_DIR = _p_infer["sky_image_pred"]
+NWP_SOLAR_DIR = _p_infer["nwp_solar"]
+NWP_WIND_DIR = _p_infer["nwp_wind"]
 _SKY_IMAGE_TIME_FMTS = [
     "%Y-%m-%d_%H-%M",
     "%Y-%m-%d_%H-%M-%S",
@@ -85,8 +99,21 @@ _SKY_IMAGE_TIME_FMTS = [
     "%Y%m%d_%H%M",
 ]
 
-NWP_SOLAR_DIR = Path("/home/bb/solar_luoyang/external_data/nwp_download/solar")
-NWP_WIND_DIR = Path("/home/bb/solar_luoyang/external_data/nwp_download/wind")
+
+def _parse_sky_image_stem(stem: str) -> datetime | None:
+    """Parse sky image filename stem; supports YYYYMMDDHHMMSS_11 / _12 and legacy patterns."""
+    m = re.match(r"^(\d{14})_(11|12)$", stem)
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
+        except ValueError:
+            return None
+    for fmt in _SKY_IMAGE_TIME_FMTS:
+        try:
+            return datetime.strptime(stem, fmt)
+        except ValueError:
+            continue
+    return None
 
 
 def _load_most_recent_clot(nc_dir: Path):
@@ -180,34 +207,42 @@ def _nc_path_to_time_label(path: Path) -> str:
 
 
 def _find_sky_image_for_time(dir_path: Path, t: datetime) -> Path | None:
-    """Find sky image with timestamp closest to t; try exact 15-min filename first."""
+    """Find sky image with timestamp closest to t; try exact 15-min filename first.
+
+    New names use YYYYMMDDHHMMSS_11 or _12.png (same time); either suffix is fine—pick at random.
+    """
     if not dir_path.is_dir() or not _PIL_AVAILABLE:
         return None
     t_rounded = t.replace(second=0, microsecond=0)
     minute = (t_rounded.minute // 15) * 15
     t_rounded = t_rounded.replace(minute=minute)
-    exact_name = t_rounded.strftime("%Y-%m-%d_%H-%M-%S") + ".png"
-    exact_path = dir_path / exact_name
-    if exact_path.is_file():
-        return exact_path
-    best_path: Path | None = None
+    exact_names = [t_rounded.strftime("%Y-%m-%d_%H-%M-%S") + ".png"]
+    ts_compact = t_rounded.strftime("%Y%m%d%H%M%S")
+    suffix_order = ["11", "12"]
+    random.shuffle(suffix_order)
+    exact_names.extend(f"{ts_compact}_{suf}.png" for suf in suffix_order)
+    for name in exact_names:
+        exact_path = dir_path / name
+        if exact_path.is_file():
+            return exact_path
+    candidates: list[Path] = []
     best_delta: float | None = None
     t_ts = t.timestamp()
     for f in dir_path.iterdir():
         if not f.is_file() or f.suffix.lower() not in (".png", ".jpg", ".jpeg"):
             continue
-        stem = f.stem
-        for fmt in _SKY_IMAGE_TIME_FMTS:
-            try:
-                parsed = datetime.strptime(stem, fmt)
-                delta = abs(parsed.timestamp() - t_ts)
-                if best_delta is None or delta < best_delta:
-                    best_delta = delta
-                    best_path = f
-                break
-            except ValueError:
-                continue
-    return best_path
+        parsed = _parse_sky_image_stem(f.stem)
+        if parsed is None:
+            continue
+        delta = abs(parsed.timestamp() - t_ts)
+        if best_delta is None or delta < best_delta:
+            best_delta = delta
+            candidates = [f]
+        elif delta == best_delta:
+            candidates.append(f)
+    if not candidates:
+        return None
+    return random.choice(candidates)
 
 
 def _load_sky_image(path: Path, max_size: tuple[int, int] = (128, 128)):
@@ -459,7 +494,6 @@ def create_infer_online_gui():
         times, values = _get_pv_series_for_selection(
             latest_pv_pred[0], v1, v2, v3, _luoyang_plant_to_devdns
         )
-        # Plot in UTC+8 local time: data are in UTC, so shift by +8 hours
         for ax, n_pts, hour_interval in [
             (ax_top, 16, 1),
             (ax_mid, 96, 2),
@@ -469,10 +503,10 @@ def create_infer_online_gui():
             ax.set_ylabel("PV power (kW)")
             ax.grid(True, alpha=0.3)
             if times is not None and values is not None and len(times) >= n_pts:
-                # times are UTC; convert to naive UTC+8 for display
                 t_plot = pd.to_datetime(times[:n_pts]) + pd.Timedelta(hours=8)
                 v_plot = values[:n_pts]
                 ax.plot(t_plot, v_plot, color="C0", lw=1.5)
+                ax.scatter(t_plot, v_plot, color="C0", s=10, zorder=3)
                 ax.set_xlim(t_plot.min(), t_plot.max())
                 ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d %H:%M"))
                 ax.xaxis.set_major_locator(mdates.HourLocator(interval=hour_interval))
@@ -538,7 +572,7 @@ def create_infer_online_gui():
         sky_time_label_left.config(text=t_left.strftime("%H:%M:%S"))
         for path, lbl in [
             (_find_sky_image_for_time(SKY_IMAGE_DIR, t_left), sky_image_label_left),
-            (_find_sky_image_for_time(SKY_IMAGE_DIR, t_right), sky_image_label_right),
+            (_find_sky_image_for_time(SKY_IMAGE_PRED_DIR, t_right), sky_image_label_right),
         ]:
             if path is not None:
                 ph = _load_sky_image(path, max_size=(128, 128))

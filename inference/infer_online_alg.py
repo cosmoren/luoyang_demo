@@ -157,8 +157,10 @@ class infer_online_alg:    # ckpt = torch.load(checkpoint_path, map_location=sel
             
             pv_mask = torch.from_numpy((value['inverter_state']==512).astype(np.float32)).to(self.device)
             pv = torch.from_numpy((value['active_power']/50.0).astype(np.float32)).to(self.device)
+            pv_ori = torch.from_numpy((value['active_power']).astype(np.float32)).to(self.device)
             
             pv = pv.unsqueeze(0).unsqueeze(1)
+            pv_ori = pv_ori.unsqueeze(0).unsqueeze(1)
             pv_mask = pv_mask.unsqueeze(0).unsqueeze(1)
 
             out = self.model(dev_idx, pv, pv_mask, history_solar_features, forecast_solar_features)
@@ -170,7 +172,7 @@ class infer_online_alg:    # ckpt = torch.load(checkpoint_path, map_location=sel
             pv_pred_dict[key]['forecast_timestamps_utc'] = forecast_timestamps_utc
             pv_pred_dict[key]['timestamps'] = timestamps
             pv_pred_dict[key]['pv'] = pv.detach().cpu().numpy().squeeze(axis=1)
-
+            pv_pred_dict[key]['pv_ori'] = pv_ori.detach().cpu().numpy().squeeze(axis=1)
         return pv_pred_dict
 
 

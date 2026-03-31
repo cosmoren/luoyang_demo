@@ -3,7 +3,10 @@ Offline inference simulator GUI.
 Updates every 5 seconds. Current time is simulated (not computer time).
 """
 
+import random
+import re
 import sys
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from xml.parsers.expat import model
@@ -43,29 +46,46 @@ _SKY_IMAGE_TIME_FMTS = [
 ]
 
 
+def _parse_sky_image_stem(stem: str) -> datetime | None:
+    """Parse sky image filename stem; supports YYYYMMDDHHMMSS_11 / _12 and legacy patterns."""
+    m = re.match(r"^(\d{14})_(11|12)$", stem)
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
+        except ValueError:
+            return None
+    for fmt in _SKY_IMAGE_TIME_FMTS:
+        try:
+            return datetime.strptime(stem, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def _find_sky_image_for_time(dir_path: Path, t: datetime) -> Path | None:
     """Find the sky image file that best matches the given timestamp.
-    Looks for exact or nearest match in dir_path. Returns None if dir missing or no match."""
+    Looks for exact or nearest match in dir_path. Returns None if dir missing or no match.
+    For YYYYMMDDHHMMSS_11 / _12, timestamps coincide—pick one at random among ties."""
     if not dir_path.is_dir():
         return None
-    best_path: Path | None = None
+    candidates: list[Path] = []
     best_delta: float | None = None
     t_ts = t.timestamp()
     for f in dir_path.iterdir():
         if not f.is_file() or f.suffix.lower() not in (".png", ".jpg", ".jpeg"):
             continue
-        stem = f.stem
-        for fmt in _SKY_IMAGE_TIME_FMTS:
-            try:
-                parsed = datetime.strptime(stem, fmt)
-                delta = abs(parsed.timestamp() - t_ts)
-                if best_delta is None or delta < best_delta:
-                    best_delta = delta
-                    best_path = f
-                break
-            except ValueError:
-                continue
-    return best_path
+        parsed = _parse_sky_image_stem(f.stem)
+        if parsed is None:
+            continue
+        delta = abs(parsed.timestamp() - t_ts)
+        if best_delta is None or delta < best_delta:
+            best_delta = delta
+            candidates = [f]
+        elif delta == best_delta:
+            candidates.append(f)
+    if not candidates:
+        return None
+    return random.choice(candidates)
 
 
 def _load_sky_image(path: Path, max_size: tuple[int, int] = (200, 150)):
@@ -93,20 +113,18 @@ def _preload_sky_images(dir_path: Path, max_size: tuple[int, int] = (64, 64)):
     if not dir_path.is_dir() or not _PIL_AVAILABLE:
         return [], []
 
-    items = []
+    by_time: defaultdict[datetime, list[Path]] = defaultdict(list)
     for f in sorted(dir_path.iterdir()):
         if not f.is_file() or f.suffix.lower() not in (".png", ".jpg", ".jpeg"):
             continue
-        stem = f.stem
-        parsed_time = None
-        for fmt in _SKY_IMAGE_TIME_FMTS:
-            try:
-                parsed_time = datetime.strptime(stem, fmt)
-                break
-            except ValueError:
-                continue
+        parsed_time = _parse_sky_image_stem(f.stem)
         if parsed_time is None:
             continue
+        by_time[parsed_time].append(f)
+
+    items = []
+    for parsed_time in sorted(by_time.keys()):
+        f = random.choice(by_time[parsed_time])
         ph = _load_sky_image(f, max_size=max_size)
         if ph is None:
             continue
