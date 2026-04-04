@@ -1,10 +1,17 @@
 # download_nwp.py is used to download the weather forecast results from the internet and store them in the local directory
-# It need to be put in the crontab to run periodically
-# The remote files are updated at 18:30 (UTC+8) every day
+# Run once: python download_nwp.py
+# Daily at UTC time: python download_nwp.py --schedule  (default 16:00 UTC)
 
+# Or: python download_nwp.py --schedule --utc-time 10:45
+
+# The remote files are updated at 16:00 (UTC+0) every day
+
+import argparse
+import re
+import time
 import yaml
 import shutil
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.request import urlopen, Request
 
@@ -14,6 +21,53 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from config_utils import get_resolved_paths
 
 CONF_PATH = PROJECT_ROOT / "config" / "conf.yaml"
+
+_UTC_TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+
+
+def parse_utc_time(s: str) -> tuple[int, int]:
+    """Parse 'H:MM' or 'HH:MM' into (hour, minute) in 0..23 / 0..59."""
+    m = _UTC_TIME_RE.match(s.strip())
+    if not m:
+        raise ValueError("expected HH:MM (UTC), e.g. 10:45")
+    h, mi = int(m.group(1)), int(m.group(2))
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        raise ValueError("hour must be 0-23, minute 0-59")
+    return h, mi
+
+
+def next_utc_run_after(hour: int, minute: int, now: datetime | None = None) -> tuple[datetime, float]:
+    """Next occurrence of hour:minute UTC strictly after `now` (default: current UTC)."""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return target, (target - now).total_seconds()
+
+
+def seconds_until_next_utc_run(hour: int, minute: int) -> float:
+    _, sec = next_utc_run_after(hour, minute)
+    return sec
+
+
+def run_daily_utc_main(hour: int, minute: int) -> None:
+    """Block forever; call main() every day at hour:minute UTC."""
+    next_at, sec = next_utc_run_after(hour, minute)
+    print(
+        f"Scheduler: main() daily at {hour:02d}:{minute:02d} UTC "
+        f"(next: {next_at.strftime('%Y-%m-%d %H:%M:%S')} UTC, in {sec:.0f}s)"
+    )
+    while True:
+        time.sleep(seconds_until_next_utc_run(hour, minute))
+        try:
+            main()
+        except Exception as e:
+            print(f"Scheduled run failed: {e}")
+        next_at, sec = next_utc_run_after(hour, minute)
+        print(f"Next run: {next_at.strftime('%Y-%m-%d %H:%M:%S')} UTC (in {sec:.0f}s)")
 
 
 def load_conf():
@@ -137,4 +191,27 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Download NWP data; optional daily UTC schedule.")
+    parser.add_argument(
+        "--schedule",
+        action="store_true",
+        help="Run main() every day at --utc-time (UTC); default 16:00 UTC if omitted",
+    )
+    parser.add_argument(
+        "--utc-time",
+        metavar="HH:MM",
+        default=None,
+        help="Daily run time in UTC (default with --schedule: 16:00), e.g. 10:45",
+    )
+    args = parser.parse_args()
+    if args.schedule:
+        utc_str = args.utc_time or "16:00"
+        try:
+            h, m = parse_utc_time(utc_str)
+        except ValueError as e:
+            parser.error(str(e))
+        run_daily_utc_main(h, m)
+    else:
+        if args.utc_time:
+            parser.error("--utc-time is only valid with --schedule")
+        main()

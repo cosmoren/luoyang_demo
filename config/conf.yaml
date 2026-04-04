@@ -6,10 +6,11 @@ site:
   longitude: 112.43
 
 paths:
-  data_dir: "/data/external_data"
+  data_dir: "/home/cosmo/workspace/external_data"
   config_dir: config
   nwp_config: config/NWP.yaml
   sat_download: himawari
+  sat_cropped: himawari_cropped
   nwp_download: nwp_download
   nwp_newest: nwp_newest
   # Under data_dir: camera/download base and inference sky folders (see sky_image_subpath)

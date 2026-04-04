@@ -9,6 +9,7 @@ from typing import Optional
 # Keys under paths that are relative to data_dir when value is relative
 DATA_DIR_KEYS = (
     "sat_download",
+    "sat_cropped",
     "nwp_download",
     "nwp_newest",
     "pv_download",

@@ -5,6 +5,9 @@ import sys
 import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+import numpy as np
+import pandas as pd
+from pvlib import solarposition
 
 import yaml
 
@@ -12,6 +15,7 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 from config_utils import get_resolved_paths
+from preprocessing.nc_processing import nc_crop_mask
 
 CONF_PATH = PROJECT_ROOT / "config" / "conf.yaml"
 PASSWORDS_PATH = PROJECT_ROOT / "config" / "passwords.yaml"
@@ -21,7 +25,19 @@ BASE_DIR = "/pub/himawari/L2/CLP/010"
 CHECK_INTERVAL = 600  # 10 minutes
 MAX_FILES = 24
 HOURS_BACK_INIT = 6   # how far back to scan on first run
+ZENITH_SKIP_DEG = 95.0  # skip download when apparent solar zenith exceeds this (night / deep twilight)
 # =========================================
+
+
+def apparent_solar_zenith_deg(lat: float, lon: float, when: datetime | None = None) -> float:
+    """Apparent zenith at site (degrees) at `when` (UTC if naive)."""
+    if when is None:
+        when = datetime.now(timezone.utc)
+    ts = pd.Timestamp(when)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    solpos = solarposition.get_solarposition(pd.DatetimeIndex([ts]), lat, lon)
+    return float(solpos["apparent_zenith"].iloc[0])
 
 
 def load_conf():
@@ -100,13 +116,23 @@ def list_remote_files(ftp, hours_back):
     return files
 
 
-def download_file(ftp, remote_dir, filename, local_dir):
+def download_file(ftp, remote_dir, filename, local_dir, local_dir_cropped, lat, lon):
+    z = apparent_solar_zenith_deg(lat, lon)
+    print('z: ', z)
+    if z > ZENITH_SKIP_DEG:
+        print(f"Skip {filename}: apparent solar zenith {z:.1f}° > {ZENITH_SKIP_DEG}° (site night)")
+        return
+
     os.makedirs(local_dir, exist_ok=True)
     local_path = os.path.join(local_dir, filename)
 
     ftp.cwd(remote_dir)
     with open(local_path, "wb") as f:
         ftp.retrbinary(f"RETR {filename}", f.write)
+
+    cropped_sat_image = nc_crop_mask(local_path, lat0=lat, lon0=lon, size_km=500, resample_size=100)
+    os.makedirs(local_dir_cropped, exist_ok=True)
+    np.save(os.path.join(local_dir_cropped, filename.replace(".nc", ".npy")), cropped_sat_image)
 
     print(f"Downloaded: {filename}")
 
@@ -136,18 +162,18 @@ def delete_oldest_local(local_dir):
         print(f"Deleted oldest: {fname}")
 
 
-def initial_download(local_dir, ftp_host, ftp_user, ftp_pass):
+def initial_download(local_dir, local_dir_cropped, lat, lon, ftp_host, ftp_user, ftp_pass):
     ftp = connect_ftp(ftp_host, ftp_user, ftp_pass)
     files = list_remote_files(ftp, HOURS_BACK_INIT)
 
     files.sort(reverse=True)  # newest first
     for t, name, rdir in files[:MAX_FILES]:
-        download_file(ftp, rdir, name, local_dir)
+        download_file(ftp, rdir, name, local_dir, local_dir_cropped, lat, lon)
 
     ftp.quit()
 
 
-def check_for_updates(local_dir, ftp_host, ftp_user, ftp_pass):
+def check_for_updates(local_dir, local_dir_cropped, lat, lon, ftp_host, ftp_user, ftp_pass):
     ftp = connect_ftp(ftp_host, ftp_user, ftp_pass)
 
     # Look back far enough to catch multiple new files
@@ -169,7 +195,7 @@ def check_for_updates(local_dir, ftp_host, ftp_user, ftp_pass):
         return
 
     for t, name, rdir in new_files:
-        download_file(ftp, rdir, name, local_dir)
+        download_file(ftp, rdir, name, local_dir, local_dir_cropped, lat, lon)
 
     delete_oldest_local(local_dir)
     ftp.quit()
@@ -179,16 +205,22 @@ def main():
     conf = load_conf()
     paths = get_resolved_paths(conf, PROJECT_ROOT)
     local_dir = paths["sat_download"]
+    local_dir_cropped = paths["sat_cropped"]
+    site = conf.get("site")
+    lat = site.get("latitude")
+    lon = site.get("longitude")
+    
     ftp_host, ftp_user, ftp_pass = load_ftp_credentials()
     os.makedirs(local_dir, exist_ok=True)
-
+    os.makedirs(local_dir_cropped, exist_ok=True)
+    
     if len(local_files(local_dir)) < MAX_FILES:
         print("Initial download...")
-        initial_download(local_dir, ftp_host, ftp_user, ftp_pass)
+        initial_download(local_dir, local_dir_cropped, lat, lon, ftp_host, ftp_user, ftp_pass)
 
     while True:
         try:
-            check_for_updates(local_dir, ftp_host, ftp_user, ftp_pass)
+            check_for_updates(local_dir, local_dir_cropped, lat, lon,ftp_host, ftp_user, ftp_pass)
         except Exception as e:
             print(f"Error: {e}")
 
