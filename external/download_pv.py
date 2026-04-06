@@ -196,10 +196,12 @@ class NorthAPI:
         if resp.status_code == 200 and resp.json()["success"] is True:
             print("get real kpi success")
             return resp.json()["data"]
-        else:
-            print(f"get real kpi failed：{resp.json()}")
-            sys.exit(1)
-        # return resp
+        try:
+            err_body = resp.json()
+        except Exception:
+            err_body = resp.text
+        print(f"get real kpi failed：{err_body}")
+        return None
     def get_history_kpi(self, dev_ids: List[str], dev_type_id: int, start_time: str, end_time: str):
 
 
@@ -347,6 +349,9 @@ class NorthFetcher(TimeParser):
         data_list = []
         for i in range(0, len(dev_ids), 100):
             real_kpi = self.api.get_real_kpi(dev_ids[i: i + 100], 1)
+            if real_kpi is None:
+                print("Skipping this PV fetch cycle; will retry on the next interval.")
+                return
             # ['devId', 'sn', 'dataItemMap']
             # [1000000333620909, ES2230149107, ]
             for j, each_real_kpi in enumerate(real_kpi):
@@ -375,6 +380,7 @@ if __name__ == "__main__":
     conf = load_conf()
     paths = get_resolved_paths(conf, PROJECT_ROOT)
     save_dir = paths["pv_download"]
+    save_dir.mkdir(parents=True, exist_ok=True)
     device_path = str(paths["pv_device_path"]) if paths.get("pv_device_path") else None
     station_meta_save_dir = str(paths["pv_station_meta"]) if paths.get("pv_station_meta") else None
 
