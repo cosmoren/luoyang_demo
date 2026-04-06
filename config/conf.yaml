@@ -6,18 +6,20 @@ site:
   longitude: 112.43
 
 paths:
-  data_dir: "/home/cosmo/workspace/external_data"
+  data_dir: "/data/data"
   config_dir: config
   nwp_config: config/NWP.yaml
   sat_download: himawari
-  sat_cropped: himawari_cropped
   nwp_download: nwp_download
   nwp_newest: nwp_newest
-  # Under data_dir: camera/download base and inference sky folders (see sky_image_subpath)
-  skyimg_download: skimg
-  skyimg_pred_download: skimg_pred
-  # Relative path under skyimg_download and skyimg_pred_download (same subpath for both)
-  sky_image_subpath: asi16/asi_16613/20260331
+  # Under data_dir: camera/download base and inference sky folders
+  skyimg_download: skyimg
+  skyimg_pred: skyimg_pred
+  # asi: skyimg_download / sky_image_asi_16613_subpath; pred: skyimg_pred / sky_image_asi_16613_subpath
+  sky_image_asi_16613_subpath: asi_16613
+  # wylc: skyimg_download / sky_image_wylc_subpath; pred: skyimg_pred / same (optional sky_image_wylc_pred_subpath)
+  sky_image_wylc_subpath: wylc
+  # sky_image_wylc_pred_subpath: ...  # optional; only needed for custom layouts
   pv_download: pv
   pv_station_meta: data
   pv_device_path: datasets/XINSHENG_power_total_devices_type1.xlsx

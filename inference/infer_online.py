@@ -90,6 +90,10 @@ _p_infer = _load_infer_online_paths()
 NC_PROCESSED_DIR = _p_infer["nc_processed"]
 SKY_IMAGE_DIR = _p_infer["sky_image"]
 SKY_IMAGE_PRED_DIR = _p_infer["sky_image_pred"]
+SKY_IMAGE_WYL_DIR = _p_infer["sky_image_wylc"]
+SKY_IMAGE_WYL_PRED_DIR = _p_infer["sky_image_wylc_pred"]
+# Row caption matches the leaf directory from paths.sky_image_wylc_subpath
+SKY_WYL_ROW_LABEL = SKY_IMAGE_WYL_DIR.name
 NWP_SOLAR_DIR = _p_infer["nwp_solar"]
 NWP_WIND_DIR = _p_infer["nwp_wind"]
 _SKY_IMAGE_TIME_FMTS = [
@@ -116,6 +120,64 @@ def _parse_sky_image_stem(stem: str) -> datetime | None:
     return None
 
 
+def _parse_wylc_ori_stem(stem: str) -> datetime | None:
+    """Parse wylc camera stem: ori + YYYYMMDDHHMMSS (14 digits), case-insensitive ori prefix."""
+    if len(stem) < 3 + 14:
+        return None
+    pfx, rest = stem[:3], stem[3:3 + 14]
+    if pfx.lower() != "ori" or not rest.isdigit():
+        return None
+    try:
+        return datetime.strptime(rest, "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+
+
+def _iter_wylc_jpg_files(root: Path):
+    """JPG/JPEG in root and immediate child dirs (matches typical date subfolders)."""
+    try:
+        top = list(root.iterdir())
+    except OSError:
+        return
+    for f in top:
+        if f.is_file() and f.suffix.lower() in (".jpg", ".jpeg"):
+            yield f
+    try:
+        for sub in top:
+            if not sub.is_dir():
+                continue
+            try:
+                for f in sub.iterdir():
+                    if f.is_file() and f.suffix.lower() in (".jpg", ".jpeg"):
+                        yield f
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
+def _find_newest_wylc_ori_image(dir_path: Path) -> tuple[Path | None, datetime | None]:
+    """Pick oriYYYYMMDDHHMMSS.jpg with the latest timestamp in the stem; tie-break by mtime."""
+    if not dir_path.is_dir() or not _PIL_AVAILABLE:
+        return None, None
+    best_path: Path | None = None
+    best_dt: datetime | None = None
+    best_mtime: float = 0.0
+    for f in _iter_wylc_jpg_files(dir_path):
+        dt = _parse_wylc_ori_stem(f.stem)
+        if dt is None:
+            continue
+        try:
+            mt = f.stat().st_mtime
+        except OSError:
+            continue
+        if best_dt is None or dt > best_dt or (dt == best_dt and mt > best_mtime):
+            best_dt = dt
+            best_path = f
+            best_mtime = mt
+    return best_path, best_dt
+
+
 def _load_most_recent_clot(nc_dir: Path):
     """Load latest *valid* NC from nc_dir, crop to ROI, return (path, CLOT) or None.
 
@@ -132,6 +194,7 @@ def _load_most_recent_clot(nc_dir: Path):
         try:
             if path.stat().st_size <= 0:
                 continue
+            print (path)
             ds = xr.open_dataset(path, decode_timedelta=True)
             roi = ds.sel(
                 latitude=slice(LAT_MAX, LAT_MIN),
@@ -371,23 +434,38 @@ def create_infer_online_gui():
     sky_group = tk.LabelFrame(left_panel, text="Sky images", padx=4, pady=4)
     sky_group.pack(anchor="nw", fill=tk.X)
 
-    sky_row = tk.Frame(sky_group)
-    sky_row.pack()
+    sky_grid = tk.Frame(sky_group)
+    sky_grid.pack()
 
-    sky_left_frame = tk.Frame(sky_row)
-    sky_left_frame.pack(side=tk.LEFT, padx=(0, 8))
-    sky_time_label_left = tk.Label(sky_left_frame, text="--:--:--", font=font_time)
+    sky_cell_asi = tk.Frame(sky_grid)
+    sky_cell_asi.grid(row=0, column=0, padx=(0, 8), pady=(0, 6), sticky="n")
+    sky_time_label_left = tk.Label(sky_cell_asi, text="--:--:--", font=font_time)
     sky_time_label_left.pack()
-    sky_image_label_left = tk.Label(sky_left_frame, text="No Image", font=font_time, fg="gray")
-    sky_image_label_left.pack()
-    tk.Label(sky_left_frame, text="Current", font=font_time).pack()
+    sky_image_label_asi = tk.Label(sky_cell_asi, text="No Image", font=font_time, fg="gray")
+    sky_image_label_asi.pack()
+    tk.Label(sky_cell_asi, text="asi_16613", font=font_time).pack()
 
-    sky_right_frame = tk.Frame(sky_row)
-    sky_right_frame.pack(side=tk.LEFT)
-    tk.Label(sky_right_frame, text="+15 min", font=font_time).pack()
-    sky_image_label_right = tk.Label(sky_right_frame, text="No Image", font=font_time, fg="gray")
-    sky_image_label_right.pack()
-    tk.Label(sky_right_frame, text="Predicted", font=font_time).pack()
+    sky_cell_asi_pred = tk.Frame(sky_grid)
+    sky_cell_asi_pred.grid(row=0, column=1, padx=(0, 0), pady=(0, 6), sticky="n")
+    tk.Label(sky_cell_asi_pred, text="+15 min", font=font_time).pack()
+    sky_image_label_asi_pred = tk.Label(sky_cell_asi_pred, text="No Image", font=font_time, fg="gray")
+    sky_image_label_asi_pred.pack()
+    tk.Label(sky_cell_asi_pred, text="Predicted", font=font_time).pack()
+
+    sky_cell_wylc = tk.Frame(sky_grid)
+    sky_cell_wylc.grid(row=1, column=0, padx=(0, 8), pady=0, sticky="n")
+    sky_time_label_wylc = tk.Label(sky_cell_wylc, text="--:--:--", font=font_time)
+    sky_time_label_wylc.pack()
+    sky_image_label_wylc = tk.Label(sky_cell_wylc, text="No Image", font=font_time, fg="gray")
+    sky_image_label_wylc.pack()
+    tk.Label(sky_cell_wylc, text=SKY_WYL_ROW_LABEL, font=font_time).pack()
+
+    sky_cell_wylc_pred = tk.Frame(sky_grid)
+    sky_cell_wylc_pred.grid(row=1, column=1, padx=(0, 0), pady=0, sticky="n")
+    tk.Label(sky_cell_wylc_pred, text="+15 min", font=font_time).pack()
+    sky_image_label_wylc_pred = tk.Label(sky_cell_wylc_pred, text="No Image", font=font_time, fg="gray")
+    sky_image_label_wylc_pred.pack()
+    tk.Label(sky_cell_wylc_pred, text="Predicted", font=font_time).pack()
 
     met_frame = tk.LabelFrame(left_panel, text="Forecast data", padx=4, pady=4)
     met_frame.pack(anchor="nw", fill=tk.X, pady=(8, 0))
@@ -568,12 +646,10 @@ def create_infer_online_gui():
         sky_photo_ref.clear()
         # Floor display time to whole minute (seconds=0) for label
         t_left = now_local.replace(second=0, microsecond=0)
-        t_right = now_local + timedelta(minutes=15)
-        sky_time_label_left.config(text=t_left.strftime("%H:%M:%S"))
-        for path, lbl in [
-            (_find_sky_image_for_time(SKY_IMAGE_DIR, t_left), sky_image_label_left),
-            (_find_sky_image_for_time(SKY_IMAGE_PRED_DIR, t_right), sky_image_label_right),
-        ]:
+        t_right = t_left + timedelta(minutes=15)
+        t_hms = t_left.strftime("%H:%M:%S")
+
+        def _apply_sky_path(path: Path | None, lbl: tk.Label):
             if path is not None:
                 ph = _load_sky_image(path, max_size=(128, 128))
                 if ph is not None:
@@ -591,6 +667,25 @@ def create_infer_online_gui():
                     lbl.config(image=blank_photo, text="")
                 else:
                     lbl.config(image="", text="No Image")
+
+        asi_path = _find_sky_image_for_time(SKY_IMAGE_DIR, t_left)
+        asi_file_dt = _parse_sky_image_stem(asi_path.stem) if asi_path is not None else None
+        if asi_file_dt is not None:
+            sky_time_label_left.config(text=asi_file_dt.strftime("%H:%M:%S"))
+        else:
+            sky_time_label_left.config(text=t_hms)
+        _apply_sky_path(asi_path, sky_image_label_asi)
+        _apply_sky_path(_find_sky_image_for_time(SKY_IMAGE_PRED_DIR, t_right), sky_image_label_asi_pred)
+
+        wylc_path, wylc_dt = _find_newest_wylc_ori_image(SKY_IMAGE_WYL_DIR)
+        if wylc_dt is not None:
+            sky_time_label_wylc.config(text=wylc_dt.strftime("%H:%M:%S"))
+        else:
+            sky_time_label_wylc.config(text=t_hms)
+        _apply_sky_path(wylc_path, sky_image_label_wylc)
+
+        wylc_pred_path, _ = _find_newest_wylc_ori_image(SKY_IMAGE_WYL_PRED_DIR)
+        _apply_sky_path(wylc_pred_path, sky_image_label_wylc_pred)
 
         # NWP forecast (UTC+8) for SSRD and wind speed: use latest CSVs,
         # pick the two most recent forecast times <= now_local.
@@ -635,10 +730,6 @@ def create_infer_online_gui():
         now_local = datetime.now(UTC8)
         utc_var.set(now_utc.strftime("%Y-%m-%d %H:%M:%S"))
         local_var.set(f"{now_local.strftime('%Y-%m-%d %H:%M:%S')} UTC+8")
-        # Keep sky time label aligned to whole minute of current time,
-        # even though the image content itself only refreshes once per minute.
-        t_left = now_local.replace(second=0, microsecond=0)
-        sky_time_label_left.config(text=t_left.strftime("%H:%M:%S"))
         root.after(1000, update_time)
 
     root.after(0, update_visuals)
