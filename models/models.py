@@ -13,6 +13,72 @@ import os
 import contextlib
 import io
 
+# [ADDED] Lightweight CNN encoder
+class SatCNN(nn.Module):
+    def __init__(self, in_ch=3, out_ch=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, 32, 3, stride=2, padding=1),  # ↓2
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),     # ↓4
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, out_ch, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.net(x)  # [B*T, C, H', W']
+
+# [ADDED] ConvLSTM cell
+class ConvLSTMCell(nn.Module):
+    def __init__(self, input_dim, hidden_dim, kernel_size=3):
+        super().__init__()
+        padding = kernel_size // 2
+        self.hidden_dim = hidden_dim
+
+        self.conv = nn.Conv2d(
+            input_dim + hidden_dim,
+            4 * hidden_dim,
+            kernel_size,
+            padding=padding,
+        )
+
+    def forward(self, x, h, c):
+        combined = torch.cat([x, h], dim=1)
+        gates = self.conv(combined)
+        i, f, o, g = torch.chunk(gates, 4, dim=1)
+
+        i = torch.sigmoid(i)
+        f = torch.sigmoid(f)
+        o = torch.sigmoid(o)
+        g = torch.tanh(g)
+
+        c_next = f * c + i * g
+        h_next = o * torch.tanh(c_next)
+
+        return h_next, c_next
+
+# [ADDED] ConvLSTM wrapper
+class ConvLSTM(nn.Module):
+    def __init__(self, input_dim=64, hidden_dim=64):
+        super().__init__()
+        self.cell = ConvLSTMCell(input_dim, hidden_dim)
+        self.hidden_dim = hidden_dim
+
+    def forward(self, x):
+        # x: [B, T, C, H, W]
+        B, T, C, H, W = x.shape
+
+        h = torch.zeros(B, self.hidden_dim, H, W, device=x.device)
+        c = torch.zeros(B, self.hidden_dim, H, W, device=x.device)
+
+        outputs = []
+        for t in range(T):
+            h, c = self.cell(x[:, t], h, c)
+            outputs.append(h)
+
+        return torch.stack(outputs, dim=1)  # [B, T, C, H, W]
+
 class TemporalCNN1d(nn.Module):
     """
     1D temporal CNN. Input [B, C, T], output [B, C_out, T].
@@ -220,12 +286,17 @@ class pv_forecasting_model_vit(nn.Module):
         )
 
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            '''
             self.sat_extractor = TimeSformerFeatureExtractor(
                 pretrained="facebook/timesformer-base-finetuned-k400",
                 output_format="sequence",
                 normalize=True,
                 config=config,
             )
+            '''
+            self.sat_cnn = SatCNN(in_ch=3, out_ch=64)
+            self.sat_convlstm = ConvLSTM(input_dim=64, hidden_dim=64)
+            self.sat_pool = nn.AdaptiveAvgPool2d(1)
         # TimeSformer for sky imager images
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             self.skimg_extractor = TimeSformerFeatureExtractor(
@@ -238,7 +309,7 @@ class pv_forecasting_model_vit(nn.Module):
         self.inverter_embedding = nn.Embedding(num_embeddings=1000, embedding_dim=16)
         self.TCN = TemporalCNN1d(in_channels=11, out_channels=64, use_batchnorm=use_batchnorm, dropout=dropout)
         self.cross_attention_pv = CrossAttention(query_dim=9, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
-        self.cross_attention_sat = CrossAttention(query_dim=9, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
+        self.cross_attention_sat = CrossAttention(query_dim=9, key_dim=64, value_dim=64, embed_dim=64, num_heads=2, dropout=dropout)
         self.cross_attention_skimg = CrossAttention(query_dim=9, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
         self.cross_attention_nwp = CrossAttention(query_dim=9, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
         self.sat_downdim = MLP(in_dim=768, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
@@ -267,6 +338,7 @@ class pv_forecasting_model_vit(nn.Module):
         forecast_pv_features = self.cross_attention_pv(query=forecast_timefeats, key=KV_hist_mem, value=KV_hist_mem)   #[B,T,D]
 
         # Satellite features    
+        '''
         if sat_tensor is None:
             forecast_sat_features = torch.zeros(pv.shape[0], forecast_timefeats.shape[1], 64).to(pv.device)
         else:
@@ -276,7 +348,34 @@ class pv_forecasting_model_vit(nn.Module):
             sat_down_features = self.sat_downdim(sat_features) # [B,T=xx,D=64]
             sat_down_features = sat_down_features + sat_timefeats_hdim
             forecast_sat_features = self.cross_attention_sat(query=forecast_timefeats, key=sat_down_features, value=sat_down_features)
-
+        '''
+        # [MODIFIED] satellite branch
+        if sat_tensor is None:
+            forecast_sat_features = torch.zeros(pv.shape[0], forecast_timefeats.shape[1], 64).to(pv.device)
+        else:
+            B, T, C, H, W = sat_tensor.shape
+            x = sat_tensor.view(B * T, C, H, W)
+            feat = self.sat_cnn(x)  # [B*T, 64, H', W']
+            _, C2, H2, W2 = feat.shape
+            feat = feat.view(B, T, C2, H2, W2)
+            lstm_out = self.sat_convlstm(feat)  # [B, T, C, H, W]
+            # 对每一帧做 spatial pooling，保留 T 维
+            sat_seq = self.sat_pool(
+                lstm_out.view(B * T, C2, H2, W2)
+            ).view(B, T, C2)   # [B,T,64]
+            # 把卫星时间特征也加进去
+            sat_timefeats_hdim = self.timefeats_encoder(sat_timefeats)   # [B,T,64]
+            sat_seq = sat_seq + sat_timefeats_hdim
+            # 用真实的 T 帧做 cross attention，而不是 repeat 一个向量
+            forecast_sat_features = self.cross_attention_sat(
+                query=forecast_timefeats,   # [B,192,9]
+                key=sat_seq,                # [B,T,64]
+                value=sat_seq,              # [B,T,64]
+            )
+            # mask for time, test only
+            #mask = torch.zeros_like(forecast_sat_features) 
+            #mask[:, 15, :] = 1 # 0 or 15
+            #forecast_sat_features = forecast_sat_features * mask
         # Sky imager features
         if skimg_tensor is None:
             forecast_skimg_features = torch.zeros(pv.shape[0], forecast_timefeats.shape[1], 64).to(pv.device)

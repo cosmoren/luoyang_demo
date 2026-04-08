@@ -137,9 +137,7 @@ def sat_image_tensor(sat_image_path, time0, stepsize=10, timespan=48):
         (time0_utc - timedelta(minutes=i * stepsize)).strftime("%Y%m%d_%H%M")
         for i in range(total_steps, -1, -1)
     ]
-
     timestamps = [time0_utc - timedelta(minutes=i * stepsize) for i in range(total_steps, -1, -1)]
-
     imgs = []
     for filename in filenames:
         if os.path.exists(os.path.join(sat_image_path, filename + ".npy")):
@@ -389,6 +387,7 @@ class PVDataset(Dataset):
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
+        pred_time_stamp = sample['Y'][:, 0]
         devDn = sample['station_id']    # get the devDn
         dev_idx = torch.tensor(self.devDn_list.index(devDn), dtype=torch.long)
         timestamps = sample['X'][:,0]
@@ -434,8 +433,10 @@ class PVDataset(Dataset):
         # target
         target_pv = torch.from_numpy( (sample['Y'][:,2]/50).astype(np.float32) )
         target_mask = torch.from_numpy( (sample['Y'][:,1]==512).astype(np.float32) )
-
+        #target_mask[:] = 0 # test only
+        #target_mask[15] = 1 # test only 0 or 15
         return {
+            "pred_time_stamp": pred_time_stamp, # [192]
             "dev_idx": dev_idx,
             "pv": pv,
             "pv_mask": pv_mask,
@@ -462,6 +463,7 @@ def collate_batched(batch):
     pv_tf = torch.stack([s["pv_timefeats"] for s in batch])
     fc_tf = torch.stack([s["forecast_timefeats"] for s in batch])
     return {
+        "pred_time_stamp": np.stack([pd.to_datetime(s["pred_time_stamp"]) for s in batch]),
         "dev_idx": torch.stack([s["dev_idx"] for s in batch]),
         "pv": torch.stack([s["pv"] for s in batch]),
         "pv_mask": torch.stack([s["pv_mask"] for s in batch]),
@@ -480,13 +482,12 @@ def collate_batched(batch):
     }
 
 
-def train_one_epoch(model, device, loader, criterion, optimizer):
+def train_one_epoch(model, device, loader, criterion, optimizer, scaler):
     model.train()
     total_loss = 0.0
     n = 0
     num_batches = len(loader)
     print('number of batches: ', num_batches)
-    scaler = torch.amp.GradScaler('cuda') # mixed precision
     for batch_idx, batch in enumerate(loader):
         if batch_idx > 3000:
             break
@@ -531,16 +532,47 @@ def train_one_epoch(model, device, loader, criterion, optimizer):
     print()
     return total_loss / max(n, 1)
 
+def calc_metrics_from_inv_statistics(inv_statistics):
+    total_target_pv_profile = {}
+    total_pv_pred_profile = {}
+    valid_sample_mask = None
+    for v in inv_statistics.values():
+        for i in range(v['count']):
+            start_time_stamp = v['pred_time_stamp'][i][0]
+            key = pd.Timestamp(start_time_stamp).to_datetime64()
+            valid_sample_mask = v['mask'][i].cpu().numpy() if not isinstance(valid_sample_mask, np.ndarray) else valid_sample_mask
+            if key not in total_pv_pred_profile:
+                total_pv_pred_profile[key] = (v['pv_pred'][i] * v['mask'][i]).cpu().numpy()
+            else:
+                total_pv_pred_profile[key] += (v['pv_pred'][i] * v['mask'][i]).cpu().numpy()
+            if key not in total_target_pv_profile:
+                total_target_pv_profile[key] = (v['target_pv'][i] * v['mask'][i]).cpu().numpy()
+            else:
+                total_target_pv_profile[key] += (v['target_pv'][i] * v['mask'][i]).cpu().numpy()
+    err_list = []
+    pv_scal_factor = 50 # from Yuan Ren, PVs were normalized over 50kw
+    for key in total_pv_pred_profile:
+        valid = valid_sample_mask > 0
+        err_for_1_time_stamp = (total_pv_pred_profile[key] - total_target_pv_profile[key])[valid]
+        for i in range(err_for_1_time_stamp.shape[0]):
+            err_list.append(err_for_1_time_stamp[i])
+    err_list = np.array(err_list)
+    mae = np.mean(np.abs(err_list)) * pv_scal_factor
+    rmse = np.sqrt(np.mean(err_list ** 2)) * pv_scal_factor
+
+    return mae, rmse
 
 def evaluate(model, device, loader, criterion):
     """Compute mean loss on a dataset (e.g. test set). No gradient."""
     model.eval()
     total_loss = 0.0
     n = 0
+    inv_statistics = {}
     with torch.no_grad():
         for batch in loader:
             B = batch["dev_idx"].size(0)
             device_id = batch["dev_idx"].to(device)
+            pred_time_stamp = batch["pred_time_stamp"]
             pv = batch["pv"].to(device)
             mask = batch["pv_mask"].to(device)
             pv_timefeats = batch["pv_timefeats"].to(device)
@@ -566,13 +598,31 @@ def evaluate(model, device, loader, criterion):
                 nwp_tensor=nwp_tensor,
                 nwp_timefeats=nwp_timefeats,
             )
+            for i in range(B):
+                idx = str(device_id[i].item())
+                if idx not in inv_statistics:
+                    inv_statistics[idx] = {'count': 1,
+                    'pred_time_stamp': [pred_time_stamp[i]],
+                    'target_pv': [target_pv[i]], 'pv_pred': [pv_pred[i]], 'mask': [target_mask[i]],
+                    'masked_pv_err': [(target_pv[i] - pv_pred[i]) * target_mask[i]]}
+                else:
+                    inv_statistics[idx]['count'] += 1
+                    inv_statistics[idx]['pred_time_stamp'].append(pred_time_stamp[i])
+                    inv_statistics[idx]['target_pv'].append(target_pv[i])
+                    inv_statistics[idx]['pv_pred'].append(pv_pred[i])
+                    inv_statistics[idx]['mask'].append(target_mask[i])
+                    inv_statistics[idx]['masked_pv_err'].append((target_pv[i] - pv_pred[i]) * target_mask[i])
             loss = criterion(pv_pred * target_mask, target_pv * target_mask)
             total_loss += loss.item()
             n += B
+            #if n % (B * 10) == 0:
+            #    print("n ", n , " B*(len loader) ", B*len(loader))
+    mae, rmse = calc_metrics_from_inv_statistics(inv_statistics)
+    print("mae ", mae, " rmse ", rmse, " max_pv_output ", 54.6*1000)
     return total_loss / max(n, 1)
 
 
-def main():
+def main(eval_only = False):
     parser = argparse.ArgumentParser(description="Train PV forecasting model")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -591,30 +641,42 @@ def main():
     num_devices = len(dev_dn_list)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = pv_forecasting_model_vit(dev_dn_list=dev_dn_list).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    if not eval_only:
+        model = pv_forecasting_model_vit(dev_dn_list=dev_dn_list).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
 
     data_dir = "/mnt/nfs/Ai4Energy/Datasets/luoyang_data_626/"
     #data_dir = "/home/weize/remote_test_data/" # test only
     #data_dir = "/home/weize/remote_luoyang_data_626/" # test only
-    train_dataset = PVDataset(data_dir=data_dir, split="train")
+    if not eval_only:
+        train_dataset = PVDataset(data_dir=data_dir, split="train")
     test_dataset = PVDataset(data_dir=data_dir, split="test")
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collate_batched,
-        num_workers=24, # test only, default 24, could be smaller for memory issue
-    )
+    if not eval_only:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            collate_fn=collate_batched,
+            num_workers=24, # test only, default 24, could be smaller for memory issue
+        )
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_batched,
-        num_workers=24, # test only, default 24, ould be smaller for memory issue
+        num_workers=24, # test only, default 24, could be smaller for memory issue
     )
+    if eval_only:
+        ckpt_path = _PROJECT_ROOT / "checkpoints_192/pv_forecast_epoch_10.pt"
+        ckpt = torch.load(ckpt_path, map_location=device)
+        model = pv_forecasting_model_vit(dev_dn_list=ckpt["dev_dn_list"]).to(device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        model.eval()
+        eval_loss = evaluate(model, device, test_loader, criterion)
+        print(f"Eval loss: {eval_loss:.6f}")
+        return
 
     checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else _PROJECT_ROOT / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -622,8 +684,9 @@ def main():
     initial_test_loss = evaluate(model, device, test_loader, criterion)
     print(f"Initial test loss: {initial_test_loss:.6f}")
 
+    scaler = torch.amp.GradScaler('cuda') # mixed precision
     for epoch in range(1, args.epochs + 1):
-        avg_loss = train_one_epoch(model, device, train_loader, criterion, optimizer)
+        avg_loss = train_one_epoch(model, device, train_loader, criterion, optimizer, scaler)
         test_loss = evaluate(model, device, test_loader, criterion)
         print(f"Epoch {epoch}/{args.epochs}  train_loss={avg_loss:.6f}  test_loss={test_loss:.6f}")
 
@@ -649,4 +712,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(eval_only = False)
