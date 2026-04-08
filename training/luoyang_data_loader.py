@@ -20,8 +20,8 @@ from typing import Iterator
 import numpy as np
 import pandas as pd
 
-# Default path to luoyang_data directory (relative to project root)
-DEFAULT_LUOYANG_DATA_DIR = Path(__file__).resolve().parent / "datasets" / "luoyang_data"
+# Default path to per-station CSV directory
+DEFAULT_LUOYANG_DATA_DIR = Path("/data/luoyang_data_626")
 
 # Column name for inverter state (column G in the CSV)
 INVERTER_STATE_COL = "inverter_state"
@@ -34,29 +34,22 @@ DEFAULT_COLUMNS = [
     "active_power",
 ]
 
-# Input: 12 rows, 5-min spacing
-INPUT_LEN = 576
-INPUT_INTERVAL_MIN = 5
-
-# Output: 192 rows, 15-min spacing (48 hours)
-OUTPUT_LEN = 192
-OUTPUT_INTERVAL_MIN = 15
-# In 5-min rows: one 15-min step = 3 rows
-OUTPUT_STRIDE = OUTPUT_INTERVAL_MIN // INPUT_INTERVAL_MIN  # 3
-
 
 def _is_valid_sample(
     df: pd.DataFrame,
     start_input: int,
     end_input: int,
     inverter_col: str = INVERTER_STATE_COL,
+    *,
+    pv_output_len: int = 192,
+    pv_output_stride: int = 3,
 ) -> bool:
     """True if input window and output window each have at least one inverter_state == 512."""
     inv = pd.to_numeric(df[inverter_col], errors="coerce").fillna(0).astype(int)
     valid = inv == VALID_STATE
     if not valid.iloc[start_input : end_input + 1].any():
         return False
-    output_indices = [end_input + 1 + k * OUTPUT_STRIDE for k in range(OUTPUT_LEN)]
+    output_indices = [end_input + 1 + k * pv_output_stride for k in range(pv_output_len)]
     if not valid.iloc[output_indices].any():
         return False
     return True
@@ -70,15 +63,15 @@ def _find_valid_sample_ranges(
     Find all (start_input, end_input) index pairs that satisfy:
     - Input: 12 consecutive rows ending at end_input; at least one has inverter_state == 512.
     - Output: 192 rows at 15-min spacing starting at end_input+1; at least one has inverter_state == 512.
-    - end_input + 1 + (OUTPUT_LEN - 1) * OUTPUT_STRIDE < len(df).
+    - end_input + 1 + (192 - 1) * 3 < len(df)  (192 output steps, stride 3 rows in 5-min CSV).
 
-    Returns list of (start_input, end_input) where input = df.iloc[start_input:end_input+1] (12 rows), 
-    output = df.iloc[end_input+1 : end_input+1 + OUTPUT_LEN*OUTPUT_STRIDE : OUTPUT_STRIDE].
+    Returns list of (start_input, end_input) where input = df.iloc[start_input:end_input+1] (576 rows),
+    output = df.iloc[end_input+1 : end_input+1 + 192*3 : 3].
     """
     n = len(df)
-    min_end = INPUT_LEN - 1
-    # Last output index = end_input + 1 + (OUTPUT_LEN-1)*OUTPUT_STRIDE must be <= n-1
-    max_end = n - 2 - (OUTPUT_LEN - 1) * OUTPUT_STRIDE
+    min_end = 576 - 1
+    # Last output index = end_input + 1 + (192-1)*3 must be <= n-1
+    max_end = n - 2 - (192 - 1) * 3
     if max_end < min_end:
         return []
 
@@ -87,14 +80,14 @@ def _find_valid_sample_ranges(
     valid_arr = valid_state.values
 
     end_inputs = np.arange(min_end, max_end + 1, dtype=np.intp)
-    output_indices_2d = end_inputs[:, None] + 1 + np.arange(OUTPUT_LEN, dtype=np.intp) * OUTPUT_STRIDE
+    output_indices_2d = end_inputs[:, None] + 1 + np.arange(192, dtype=np.intp) * 3
     valid_output = valid_arr[output_indices_2d].any(axis=1)
 
     result = []
     for i, end_input in enumerate(end_inputs):
         if not valid_output[i]:
             continue
-        start_input = end_input - INPUT_LEN + 1
+        start_input = end_input - 576 + 1
         input_slice = slice(start_input, end_input + 1)
         if not valid_state.iloc[input_slice].any():
             continue
@@ -169,12 +162,15 @@ def _extract_one_sample(
     end_input: int,
     cols_in: list[str],
     cols_out: list[str],
+    *,
+    pv_output_len: int = 192,
+    pv_output_stride: int = 3,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Extract one (12, 3) input and (192, 3) output from loaded df; returns (X, Y). collectTime is string."""
     cols_in_f = [c for c in cols_in if c in df.columns]
     cols_out_f = [c for c in cols_out if c in df.columns]
     X = _dataframe_to_array(df.iloc[start_input : end_input + 1], cols_in_f)
-    output_indices = [end_input + 1 + k * OUTPUT_STRIDE for k in range(OUTPUT_LEN)]
+    output_indices = [end_input + 1 + k * pv_output_stride for k in range(pv_output_len)]
     Y = _dataframe_to_array(df.iloc[output_indices], cols_out_f)
     return X, Y
 
@@ -237,7 +233,7 @@ def iter_batches(
             for batch_pos in positions:
                 start_input, end_input = ranges[rng.integers(0, len(ranges))]
                 if batch_pos == 0 and "collectTime" in df.columns:
-                    out_last_idx = end_input + 1 + (OUTPUT_LEN - 1) * OUTPUT_STRIDE
+                    out_last_idx = end_input + 1 + (192 - 1) * 3
                     tc = df["collectTime"]
                     time_strs = (
                         str(tc.iloc[start_input]),
@@ -269,7 +265,7 @@ def iter_batches(
             for batch_pos in list(positions_unfilled):
                 start_input, end_input = ranges[rng.integers(0, len(ranges))]
                 if time_strs is None and batch_pos == 0 and "collectTime" in df.columns:
-                    out_last_idx = end_input + 1 + (OUTPUT_LEN - 1) * OUTPUT_STRIDE
+                    out_last_idx = end_input + 1 + (192 - 1) * 3
                     tc = df["collectTime"]
                     time_strs = (
                         str(tc.iloc[start_input]),
@@ -300,27 +296,40 @@ def iter_batches(
 
 def build_train_test_splits(
     data_dir: Path | str | None = None,
-    test_start: str = "2025-01-01 00:00:00",
-    test_end: str = "2025-03-31 23:59:59.999999",
-    max_train_per_file: int = 200,
+    test_start: str = "2026-01-01 00:00:00",
+    test_end: str = "2026-03-31 23:59:59.999999",
+    max_train_per_file: int = 2000,
     max_test_per_file: int = 200,
     split: str = "train",
     verbose: bool = True,
+    *,
+    pv_input_len: int = 576,
+    pv_input_interval_min: int = 5,
+    pv_output_len: int = 192,
+    pv_output_interval_min: int = 15,
 ) -> list[dict]:
     """
     Go over all CSV files sequentially by time; classify each valid sample as training or testing.
-    - Testing: all input and output collectTime in [test_start, test_end] (test_start default: 2025-01-01 00:00:00).
+    - Testing: all input and output collectTime in [test_start, test_end] (test_start default: 2026-01-01 00:00:00).
     - Training: otherwise (all before test_start or all after test_end).
     - Discard: if input or output collectTime spans March to April (has timestamps in both March and April).
 
-    Does not pre-scan for valid samples. Uniformly samples max_train_per_file (2500) and
-    max_test_per_file (3200) end_input indices per CSV; for each candidate, validates on
-    extract (inverter_state); if invalid, skips. May yield fewer than 2500/3200 per file.
-    Saves to two pkl files. Returns (n_train, n_test).
+    Rows per output step in the CSV: pv_output_interval_min // pv_input_interval_min (e.g. 15//5 = 3).
+
+    Does not pre-scan for valid samples. Uniformly samples max_train_per_file and max_test_per_file
+    end_input indices per CSV; for each candidate, validates on extract (inverter_state); if invalid, skips.
+    Returns a list of sample dicts for the requested split.
     """
     data_dir = Path(data_dir or DEFAULT_LUOYANG_DATA_DIR)
     if not data_dir.is_dir():
         raise FileNotFoundError(f"Data dir not found: {data_dir}")
+    if pv_input_interval_min <= 0 or pv_output_interval_min <= 0:
+        raise ValueError("pv_input_interval_min and pv_output_interval_min must be positive")
+    if pv_output_interval_min % pv_input_interval_min:
+        raise ValueError(
+            "pv_output_interval_min must be a multiple of pv_input_interval_min"
+        )
+    pv_output_stride = pv_output_interval_min // pv_input_interval_min
     t_start = pd.Timestamp(test_start)
     t_end = pd.Timestamp(test_end)
 
@@ -335,8 +344,8 @@ def build_train_test_splits(
         return 3 in months and 4 in months
 
     for file_idx, csv_path in enumerate(all_csvs):
-        if file_idx>5:
-            break
+        # if file_idx>5:
+        #     break
         if verbose:
             print(f"  [{file_idx + 1}/{n_csvs}] {csv_path.name} ...", end=" ", flush=True)
         df = load_csv(csv_path)
@@ -345,9 +354,9 @@ def build_train_test_splits(
                 print("skip (no inverter_state)")
             continue
         n = len(df)
-        min_end = INPUT_LEN - 1
-        # Last output index = end_input + 1 + (OUTPUT_LEN-1)*OUTPUT_STRIDE must be <= n-1
-        max_end = n - 2 - (OUTPUT_LEN - 1) * OUTPUT_STRIDE
+        min_end = pv_input_len - 1
+        # Last output index = end_input + 1 + (pv_output_len-1)*pv_output_stride must be <= n-1
+        max_end = n - 2 - (pv_output_len - 1) * pv_output_stride
         if max_end < min_end:
             if verbose:
                 print("skip (too short)")
@@ -362,11 +371,18 @@ def build_train_test_splits(
         
         if  split == "train":
             for end_input in train_candidates:
-                start_input = end_input - INPUT_LEN + 1
-                if not _is_valid_sample(df, start_input, end_input, INVERTER_STATE_COL):
+                start_input = end_input - pv_input_len + 1
+                if not _is_valid_sample(
+                    df,
+                    start_input,
+                    end_input,
+                    INVERTER_STATE_COL,
+                    pv_output_len=pv_output_len,
+                    pv_output_stride=pv_output_stride,
+                ):
                     continue
                 input_times = tc.iloc[start_input : end_input + 1]
-                output_indices = [end_input + 1 + k * OUTPUT_STRIDE for k in range(OUTPUT_LEN)]
+                output_indices = [end_input + 1 + k * pv_output_stride for k in range(pv_output_len)]
                 output_times = tc.iloc[output_indices]
                 inp_min, inp_max = input_times.min(), input_times.max()
                 out_min, out_max = output_times.min(), output_times.max()
@@ -376,7 +392,15 @@ def build_train_test_splits(
                             out_min >= t_start and out_max <= t_end)
                 if in_window:
                     continue  # training candidate must be outside test window
-                X, Y = _extract_one_sample(df, start_input, end_input, cols_in, cols_out)
+                X, Y = _extract_one_sample(
+                    df,
+                    start_input,
+                    end_input,
+                    cols_in,
+                    cols_out,
+                    pv_output_len=pv_output_len,
+                    pv_output_stride=pv_output_stride,
+                )
                 station_code = str(df["stationCode"].iloc[start_input]) if "stationCode" in df.columns else ""
                 train_list.append({
                     "X": X, "Y": Y,
@@ -389,11 +413,18 @@ def build_train_test_splits(
 
         elif split == "test":
             for end_input in test_candidates:
-                start_input = end_input - INPUT_LEN + 1
-                if not _is_valid_sample(df, start_input, end_input, INVERTER_STATE_COL):
+                start_input = end_input - pv_input_len + 1
+                if not _is_valid_sample(
+                    df,
+                    start_input,
+                    end_input,
+                    INVERTER_STATE_COL,
+                    pv_output_len=pv_output_len,
+                    pv_output_stride=pv_output_stride,
+                ):
                     continue
                 input_times = tc.iloc[start_input : end_input + 1]
-                output_indices = [end_input + 1 + k * OUTPUT_STRIDE for k in range(OUTPUT_LEN)]
+                output_indices = [end_input + 1 + k * pv_output_stride for k in range(pv_output_len)]
                 output_times = tc.iloc[output_indices]
                 inp_min, inp_max = input_times.min(), input_times.max()
                 out_min, out_max = output_times.min(), output_times.max()
@@ -403,7 +434,15 @@ def build_train_test_splits(
                             out_min >= t_start and out_max <= t_end)
                 if not in_window:
                     continue  # test candidate must be in test window
-                X, Y = _extract_one_sample(df, start_input, end_input, cols_in, cols_out)
+                X, Y = _extract_one_sample(
+                    df,
+                    start_input,
+                    end_input,
+                    cols_in,
+                    cols_out,
+                    pv_output_len=pv_output_len,
+                    pv_output_stride=pv_output_stride,
+                )
                 station_code = str(df["stationCode"].iloc[start_input]) if "stationCode" in df.columns else ""
                 test_list.append({
                     "X": X, "Y": Y,
@@ -422,27 +461,28 @@ def build_train_test_splits(
 
 
 if __name__ == "__main__":
-    # Build train/test splits and save to pkl; print progress and final counts
+    # Build train/test lists (one split per call), then save to pickle.
     data_dir = DEFAULT_LUOYANG_DATA_DIR
+    print (f"Data dir: {data_dir}")
     train_pkl = data_dir.parent / "training_samples.pkl"
     test_pkl = data_dir.parent / "testing_samples.pkl"
     print("Building train/test splits ...")
     print(f"  Data dir:    {data_dir}")
-    print(f"  Test window: 2025-01-01 00:00:00 to 2025-03-31 23:59:59")
-    print(f"  Max training per CSV: 2500 (uniformly sampled if more)")
-    print(f"  Max testing per CSV:  3200 (uniformly sampled if more)")
+    print(f"  Test window: 2026-01-01 00:00:00 to 2026-03-31 23:59:59")
     print(f"  Train pkl:   {train_pkl}")
     print(f"  Test pkl:    {test_pkl}")
-    print("Progress:")
-    n_train, n_test = build_train_test_splits(
-        data_dir=data_dir,
-        train_pkl=train_pkl,
-        test_pkl=test_pkl,
-        verbose=True,
-    )
+    print("Progress (train):")
+    train_list = build_train_test_splits(data_dir=data_dir, split="train", verbose=True)
+    print("Progress (test):")
+    test_list = build_train_test_splits(data_dir=data_dir, split="test", verbose=True)
+    train_pkl.parent.mkdir(parents=True, exist_ok=True)
+    with open(train_pkl, "wb") as f:
+        pickle.dump(train_list, f)
+    with open(test_pkl, "wb") as f:
+        pickle.dump(test_list, f)
     print("Done.")
-    print(f"  Training samples: {n_train}  (saved to {train_pkl})")
-    print(f"  Testing samples:  {n_test}   (saved to {test_pkl})")
+    print(f"  Training samples: {len(train_list)}  (saved to {train_pkl})")
+    print(f"  Testing samples:  {len(test_list)}   (saved to {test_pkl})")
 
     # # Training-style: iter_batches, no dataset built in advance
     # data_dir = DEFAULT_LUOYANG_DATA_DIR
