@@ -9,6 +9,9 @@ paths:
   data_dir: "/data/data"
   config_dir: config
   nwp_config: config/NWP.yaml
+  pv_download: pv
+  pv_station_meta: data
+  pv_device_path: datasets/XINSHENG_power_total_devices_type1.xlsx
   sat_download: himawari
   nwp_download: nwp_download
   nwp_newest: nwp_newest
@@ -19,11 +22,17 @@ paths:
   sky_image_asi_16613_subpath: asi_16613
   # wylc: skyimg_download / sky_image_wylc_subpath; pred: skyimg_pred / same (optional sky_image_wylc_pred_subpath)
   sky_image_wylc_subpath: wylc
+  
+  # The following is for training and testing
+  # train/test sky image dirs (directly under data_dir, e.g. /data/data/asi_16613_train)
+  sky_image_train_path: asi_16613_train
+  sky_image_test_path: asi_16613_test
   # sky_image_wylc_pred_subpath: ...  # optional; only needed for custom layouts
-  pv_download: pv
-  pv_station_meta: data
-  pv_device_path: datasets/XINSHENG_power_total_devices_type1.xlsx
-
+  pv_train_path: luoyang_data_626_train
+  pv_test_path: luoyang_data_626_test
+  # sta image training/testing
+  sat_train_path: himawari_cropped_train
+  sat_test_path: himawari_cropped_test
 
 nwp:
   solar_subdir: solar

@@ -1,16 +1,19 @@
 """
 Helpers for per-station PV CSVs (5-minute rows, ``collectTime`` sorted).
 
-``load_csv`` / ``build_training_set`` are used by ``training.train``; inverter column name and
+``load_csv`` / ``list_csv_files`` are used by ``training.train``; inverter column name and
 valid-state code are shared constants for masks and filtering.
+
+``list_skyimg_files`` lists sky-image assets named ``YYYYMMDDHHMMSS_12`` (+ optional extension).
 """
 
+import re
 from pathlib import Path
 
 import pandas as pd
 
-# Default path to per-station CSV directory
-DEFAULT_LUOYANG_DATA_DIR = Path("/data/luoyang_data_626")
+# Stem must be 14-digit timestamp + "_12" (e.g. 20260103120000_12.jpg -> stem matches).
+_SKYIMG_FILENAME_STEM_RE = re.compile(r"^\d{14}_12$")
 
 INVERTER_STATE_COL = "inverter_state"
 VALID_STATE = 512
@@ -27,7 +30,7 @@ def load_csv(csv_path: Path | str) -> pd.DataFrame:
     return df
 
 
-def build_training_set(
+def list_csv_files(
     start_idx: int = 0,
     end_idx: int = 625,
     data_dir: Path | str | None = None,
@@ -38,7 +41,7 @@ def build_training_set(
     ``end_idx`` is inclusive (last file index). E.g. ``start_idx=0``, ``end_idx=625`` selects all
     626 files. ``end_idx`` must not exceed ``_MAX_TRAINING_CSV_INDEX`` (625).
     """
-    data_dir = Path(data_dir or DEFAULT_LUOYANG_DATA_DIR)
+    data_dir = Path(data_dir)
     if not data_dir.is_dir():
         raise FileNotFoundError(f"Data dir not found: {data_dir}")
     all_csvs: list[Path] = sorted(data_dir.glob("*.csv"))
@@ -56,3 +59,31 @@ def build_training_set(
             f"end_idx ({end_idx}) out of range (n={n}); valid inclusive indices are 0..{n - 1}"
         )
     return all_csvs[start_idx : end_idx + 1]
+
+
+def list_skyimg_files(data_dir: Path | str) -> list[Path]:
+    """
+    Return sorted paths to regular files in ``data_dir`` whose **stem** is ``YYYYMMDDHHMMSS_12``
+    (14 digits, underscore, literal ``12``). Any file extension is allowed; extension is not part of
+    the pattern check.
+    """
+    root = Path(data_dir)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Data dir not found: {root}")
+    out: list[Path] = []
+    for p in root.iterdir():
+        if not p.is_file():
+            continue
+        if re.compile(r"^\d{14}_12$").match(p.stem):
+            out.append(p)
+    out.sort(key=lambda x: x.name)
+    return out
+
+
+def build_training_set(
+    start_idx: int = 0,
+    end_idx: int = 625,
+    data_dir: Path | str | None = None,
+) -> list[Path]:
+    """Backward-compatible alias for ``list_csv_files``."""
+    return list_csv_files(start_idx=start_idx, end_idx=end_idx, data_dir=data_dir)

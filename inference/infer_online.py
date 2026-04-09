@@ -194,7 +194,7 @@ def _load_most_recent_clot(nc_dir: Path):
         try:
             if path.stat().st_size <= 0:
                 continue
-            print (path)
+            # print (path)
             ds = xr.open_dataset(path, decode_timedelta=True)
             roi = ds.sel(
                 latitude=slice(LAT_MAX, LAT_MIN),

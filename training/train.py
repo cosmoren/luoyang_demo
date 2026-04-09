@@ -15,6 +15,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import yaml
 from pvlib import solarposition
+from PIL import Image
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
@@ -24,25 +25,67 @@ from models.models import pv_forecasting_model
 from training.data_loader import (
     INVERTER_STATE_COL,
     VALID_STATE,
-    build_training_set,
+    list_csv_files,
     load_csv,
 )
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
 CONF_PATH = _PROJECT_ROOT / "config" / "conf.yaml"
-DEFAULT_TRAIN_DATA_DIR = "/data/luoyang_data_626_train"
-DEFAULT_TEST_DATA_DIR = "/data/luoyang_data_626_test"
-DEFAULT_TEST_ANCHOR_STRIDE_MIN = 120    # e.g. 1200 min / 5 min CSV row = stride 240 anchors
-FORECAST_STEPS = 192  # 48h at 15-min intervals
-HISTORY_LEN = 12
-SOLAR_FEATURE_DIM = 8
-PV_ZTIME_DIM = 6
+SKYIMG_SPATIAL_SIZE = 224
+STAIMG_NPY_SHAPE_HWC = (100, 100, 3)
+DEFAULT_TEST_ANCHOR_STRIDE_MIN = 12000
 
 
 def load_config():
     with open(CONF_PATH) as f:
         conf = yaml.safe_load(f)
     return conf
+
+
+def get_training_paths_from_conf(conf: dict | None = None) -> dict[str, str]:
+    """
+    Resolve PV CSV, sky image, and Himawari NPY dirs from ``conf.yaml`` ``paths``:
+    ``pv_train_path`` / ``pv_test_path``, ``sky_image_train_path`` / ``sky_image_test_path``,
+    and ``sat_*`` as direct children of ``data_dir`` (e.g. ``/data/data/asi_16613_train``).
+    """
+    if conf is None:
+        conf = load_config()
+    paths_cfg = conf.get("paths", {})
+    resolved = get_resolved_paths(conf, _PROJECT_ROOT)
+    data_dir = resolved.get("data_dir")
+    if data_dir is None:
+        raise ValueError("conf paths.data_dir is required")
+
+    def _req(key: str) -> str:
+        v = paths_cfg.get(key)
+        if v is None or str(v).strip() == "":
+            raise KeyError(f"conf paths.{key} is required")
+        return str(v)
+
+    pv_train = (data_dir / _req("pv_train_path")).resolve()
+    pv_test = (data_dir / _req("pv_test_path")).resolve()
+    sky_train = (data_dir / _req("sky_image_train_path")).resolve()
+    sky_test = (data_dir / _req("sky_image_test_path")).resolve()
+    sta_train = (data_dir / _req("sat_train_path")).resolve()
+    sta_test = (data_dir / _req("sat_test_path")).resolve()
+    print (f"pv_train: {pv_train}")
+    print (f"pv_test: {pv_test}")
+    print (f"sky_train: {sky_train}")
+    print (f"sky_test: {sky_test}")
+    print (f"sta_train: {sta_train}")
+    print (f"sta_test: {sta_test}")
+
+    return {
+        "pv_train_dir": str(pv_train),
+        "pv_test_dir": str(pv_test),
+        "skyimg_train_dir": str(sky_train),
+        "skyimg_test_dir": str(sky_test),
+        "staimg_train_dir": str(sta_train),
+        "staimg_test_dir": str(sta_test),
+    }
+
+
+_TRAINING_PATH_DEFAULTS = get_training_paths_from_conf()
 
 
 def utc_to_local_solar_time_pvlib(utc_times: pd.DatetimeIndex, longitude: float) -> pd.DatetimeIndex:
@@ -112,11 +155,23 @@ class PVDataset(Dataset):
     Test (``split="test"``): ``__len__`` = ``len(sample_files) * num_test_windows``; anchors are
     fixed on a grid every ``test_anchor_stride_min`` minutes along the CSV row axis (no Y validity
     filter). All files with the same row count share the same ``num_test_windows``.
+
+    Sky images (under ``data_dir`` / ``sky_image_{train,test}_path``, ``YYYYMMDDHHMMSS_12.jpg``): history sequence
+    ends at the last X ``collectTime``; forecast sequence starts at the first Y ``collectTime``;
+    step size defaults to ``pv_input_interval_min`` (same spacing as consecutive X rows when ``_sx``).
+    Missing files → black ``(3, H, W)`` tensors resized to ``SKYIMG_SPATIAL_SIZE``.
+
+    Himawari NPY (``staimg``): names ``NC_H09_YYYYMMDD_HHMM_L2CLP010_FLDK.02401_02401.npy`` with
+    ``YYYYMMDD_HHMM`` in UTC; ``collectTime`` is interpreted as Asia/Shanghai local, converted to UTC,
+    then floored to 10-minute boundaries for the key timestep. History/forecast windows step in UTC
+    (default 8 frames, 10 min). Arrays are float32 ``(100,100,3)`` HWC; missing files → zeros.
     """
 
     def __init__(
         self,
-        data_dir: str,
+        pv_dir: str,
+        skyimg_dir: str,
+        staimg_dir: str,
         *,
         split: str = "train",
         csv_interval_min: int = 5,
@@ -125,10 +180,20 @@ class PVDataset(Dataset):
         pv_output_interval_min: int = 15,
         pv_output_len: int = 192,
         test_anchor_stride_min: int = DEFAULT_TEST_ANCHOR_STRIDE_MIN,
+        skyimg_window_size: int = 30,
+        skyimg_time_resolution_min: int | None = None,
+        staimg_window_size: int = 24,
+        staimg_time_resolution_min: int = 10,
     ):
         if split not in ("train", "test"):
             raise ValueError("split must be 'train' or 'test'")
         self.split = split
+        if skyimg_window_size < 1:
+            raise ValueError("skyimg_window_size must be >= 1")
+        self.skyimg_window_size = skyimg_window_size
+        if staimg_window_size < 1:
+            raise ValueError("staimg_window_size must be >= 1")
+        self.staimg_window_size = staimg_window_size
         if csv_interval_min <= 0 or pv_input_interval_min % csv_interval_min:
             raise ValueError("pv_input_interval_min must be a positive multiple of csv_interval_min")
         if pv_output_interval_min % csv_interval_min:
@@ -138,6 +203,15 @@ class PVDataset(Dataset):
         self.pv_input_len = pv_input_len
         self.pv_output_len = pv_output_len
         self.pv_output_interval_min = pv_output_interval_min
+        _sky_dt = skyimg_time_resolution_min if skyimg_time_resolution_min is not None else pv_input_interval_min
+        if _sky_dt <= 0:
+            raise ValueError("skyimg_time_resolution_min / pv_input_interval_min must be positive")
+        self._skyimg_dt_min = _sky_dt
+        self._skyimg_dir = Path(skyimg_dir).resolve()
+        if staimg_time_resolution_min <= 0:
+            raise ValueError("staimg_time_resolution_min must be positive")
+        self._staimg_dt_min = staimg_time_resolution_min
+        self._staimg_dir = Path(staimg_dir).resolve()
         if test_anchor_stride_min <= 0 or test_anchor_stride_min % csv_interval_min:
             raise ValueError(
                 "test_anchor_stride_min must be a positive multiple of csv_interval_min "
@@ -149,8 +223,6 @@ class PVDataset(Dataset):
         with open(CONF_PATH) as f:
             conf = yaml.safe_load(f)
         paths = get_resolved_paths(conf, _PROJECT_ROOT)
-        self.pv_path = paths["pv_download"]
-        self.sat_path = paths["sat_download"]
         pv_device_path = paths["pv_device_path"]
 
         site = conf.get("site", {})
@@ -160,9 +232,9 @@ class PVDataset(Dataset):
         pv_device_df = pd.read_excel(pv_device_path)
         self.devDn_list = pv_device_df["devDn"].dropna().unique().tolist()
 
-        self.sample_files = build_training_set(0, 625, data_dir=data_dir)
+        self.sample_files = list_csv_files(0, 625, data_dir=pv_dir)
         if not self.sample_files:
-            raise FileNotFoundError(f"No CSV files in {data_dir!r}")
+            raise FileNotFoundError(f"No CSV files in {pv_dir!r}")
 
         ref_df = load_csv(self.sample_files[0])
         n = len(ref_df)
@@ -180,8 +252,6 @@ class PVDataset(Dataset):
         y_off = sy + np.arange(ly, dtype=np.intp) * sy
         x_tail = (-(lx - 1) * sx + np.arange(lx, dtype=np.intp) * sx).reshape(1, -1)
         self._csv_row_count = n
-        self._anchors = anchors
-        self._y_off = y_off
         self._y_idx_per_anchor = anchors[:, None] + y_off[None, :]
         self._x_idx_per_anchor = anchors[:, None] + x_tail
 
@@ -218,7 +288,7 @@ class PVDataset(Dataset):
         print(f"Valid files: {len(self.sample_files)} ({self.split}{_tw})")
         if not self.sample_files:
             raise RuntimeError(
-                f"No CSV files left after prefilter for split={self.split!r} in data_dir={data_dir!r}"
+                f"No CSV files left after prefilter for split={self.split!r} in pv_dir={pv_dir!r}"
                 + (
                     f" (train requires at least one Y row with {INVERTER_STATE_COL}=={VALID_STATE})"
                     if self.split == "train"
@@ -230,6 +300,111 @@ class PVDataset(Dataset):
         if self.split == "train":
             return len(self.sample_files)
         return len(self.sample_files) * self._num_test_windows
+
+    @staticmethod
+    def _sky_collect_ts_local(ts_raw) -> pd.Timestamp:
+        """Local-time timestamp for sky filenames; seconds floored to 0."""
+        ts = pd.Timestamp(ts_raw)
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+        return ts.replace(second=0, microsecond=0, nanosecond=0)
+
+    def _sky_jpg_path(self, ts: pd.Timestamp) -> Path:
+        stem = ts.strftime("%Y%m%d%H%M%S") + "_12"
+        return self._skyimg_dir / f"{stem}.jpg"
+
+    def _black_sky_tensor(self) -> torch.Tensor:
+        return torch.zeros((3, SKYIMG_SPATIAL_SIZE, SKYIMG_SPATIAL_SIZE), dtype=torch.float32)
+
+    def _load_sky_tensor(self, path: Path) -> torch.Tensor:
+        try:
+            if path.is_file():
+                try:
+                    resample = Image.Resampling.LANCZOS
+                except AttributeError:
+                    resample = Image.LANCZOS
+                with Image.open(path) as im:
+                    im = im.convert("RGB")
+                    im = im.resize((SKYIMG_SPATIAL_SIZE, SKYIMG_SPATIAL_SIZE), resample)
+                    arr = np.asarray(im, dtype=np.float32) / 255.0
+                return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+        except Exception:
+            pass
+        return self._black_sky_tensor()
+
+    def _history_sky_frame_times(self, t_end: pd.Timestamp) -> list[pd.Timestamp]:
+        t_end = self._sky_collect_ts_local(t_end)
+        w = self.skyimg_window_size
+        return [
+            t_end - timedelta(minutes=(w - 1 - i) * self._skyimg_dt_min) for i in range(w)
+        ]
+
+    def _forecast_sky_frame_times(self, t_start: pd.Timestamp) -> list[pd.Timestamp]:
+        t_start = self._sky_collect_ts_local(t_start)
+        w = self.skyimg_window_size
+        return [t_start + timedelta(minutes=i * self._skyimg_dt_min) for i in range(w)]
+
+    def _stack_sky_frames(self, frame_times: list[pd.Timestamp]) -> torch.Tensor:
+        return torch.stack(
+            [self._load_sky_tensor(self._sky_jpg_path(t)) for t in frame_times], dim=0
+        )
+
+    @staticmethod
+    def _staimg_floor_utc_10min(ts_utc_naive: pd.Timestamp) -> pd.Timestamp:
+        u = pd.Timestamp(ts_utc_naive)
+        m = (int(u.minute) // 10) * 10
+        return u.replace(minute=m, second=0, microsecond=0, nanosecond=0)
+
+    def _staimg_utc_key_time(self, ts_raw) -> pd.Timestamp:
+        """UTC naive timestamp floored to 10 min; derived from local collectTime (Asia/Shanghai)."""
+        local_naive = self._sky_collect_ts_local(ts_raw)
+        # ambiguous=True: older pandas rejects ambiguous="infer" on Timestamp.tz_localize;
+        # Asia/Shanghai has no DST so wall times are not ambiguous.
+        loc = local_naive.tz_localize("Asia/Shanghai", ambiguous=True)
+        u = loc.tz_convert("UTC").tz_localize(None)
+        return self._staimg_floor_utc_10min(u)
+
+    def _staimg_npy_path(self, t_utc_naive: pd.Timestamp) -> Path:
+        u = self._staimg_floor_utc_10min(t_utc_naive)
+        stem = (
+            f"NC_H09_{u.strftime('%Y%m%d')}_{u.strftime('%H%M')}_L2CLP010_FLDK.02401_02401"
+        )
+        return self._staimg_dir / f"{stem}.npy"
+
+    def _dummy_staimg_tensor(self) -> torch.Tensor:
+        h, w, c = STAIMG_NPY_SHAPE_HWC
+        return torch.zeros((c, h, w), dtype=torch.float32)
+
+    def _load_staimg_tensor(self, path: Path) -> torch.Tensor:
+        try:
+            if path.is_file():
+                arr = np.load(path, allow_pickle=False)
+                if arr.shape == STAIMG_NPY_SHAPE_HWC and arr.dtype == np.float32:
+                    return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+        except Exception:
+            pass
+        return self._dummy_staimg_tensor()
+
+    def _history_staimg_frame_utc_times(self, t_end_raw) -> list[pd.Timestamp]:
+        t_end_utc = self._staimg_utc_key_time(t_end_raw)
+        w = self.staimg_window_size
+        return [
+            self._staimg_floor_utc_10min(
+                t_end_utc - timedelta(minutes=(w - 1 - i) * self._staimg_dt_min)
+            )
+            for i in range(w)
+        ]
+
+    def _forecast_staimg_frame_utc_times(self, t_start_raw) -> list[pd.Timestamp]:
+        t0_utc = self._staimg_utc_key_time(t_start_raw)
+        w = self.staimg_window_size
+        return [
+            self._staimg_floor_utc_10min(t0_utc + timedelta(minutes=i * self._staimg_dt_min))
+            for i in range(w)
+        ]
+
+    def _stack_staimg_frames(self, frame_utc_times: list[pd.Timestamp]) -> torch.Tensor:
+        return torch.stack([self._load_staimg_tensor(self._staimg_npy_path(t)) for t in frame_utc_times], dim=0)
 
     def _build_sample(self, df: pd.DataFrame, dev_idx: torch.Tensor, r: int) -> dict:
         x_idx = self._x_idx_per_anchor[r]
@@ -298,6 +473,22 @@ class PVDataset(Dataset):
         target_pv = torch.from_numpy((pow_y / 50.0).astype(np.float32))
         target_mask = torch.from_numpy((inv_y == VALID_STATE).astype(np.float32))
 
+        t_x_end = sub_x["collectTime"].iloc[-1]
+        t_y0 = sub_y["collectTime"].iloc[0]
+        history_frame_times = self._history_sky_frame_times(t_x_end)
+        forecast_frame_times = self._forecast_sky_frame_times(t_y0)
+        history_skyimg = self._stack_sky_frames(history_frame_times)
+        forecast_skyimg = self._stack_sky_frames(forecast_frame_times)
+        history_sky_ts = [t.strftime("%Y%m%d%H%M%S") for t in history_frame_times]
+        forecast_sky_ts = [t.strftime("%Y%m%d%H%M%S") for t in forecast_frame_times]
+
+        history_staimg_utc = self._history_staimg_frame_utc_times(t_x_end)
+        forecast_staimg_utc = self._forecast_staimg_frame_utc_times(t_y0)
+        history_staimg = self._stack_staimg_frames(history_staimg_utc)
+        forecast_staimg = self._stack_staimg_frames(forecast_staimg_utc)
+        history_staimg_ts = [t.strftime("%Y%m%d%H%M") for t in history_staimg_utc]
+        forecast_staimg_ts = [t.strftime("%Y%m%d%H%M") for t in forecast_staimg_utc]
+
         return {
             "dev_idx": dev_idx,
             "pv": pv,
@@ -306,6 +497,16 @@ class PVDataset(Dataset):
             "forecast_solar_features": forecast_solar_features,
             "target_pv": target_pv,
             "target_mask": target_mask,
+            "history_skyimg": history_skyimg,
+            "forecast_skyimg": forecast_skyimg,
+            "history_staimg": history_staimg,
+            "forecast_staimg": forecast_staimg,
+            "x_last_collect_time": str(pd.Timestamp(t_x_end)),
+            "y_first_collect_time": str(pd.Timestamp(t_y0)),
+            "history_sky_ts": history_sky_ts,
+            "forecast_sky_ts": forecast_sky_ts,
+            "history_staimg_ts": history_staimg_ts,
+            "forecast_staimg_ts": forecast_staimg_ts,
         }
 
     def __getitem__(self, idx):
@@ -353,11 +554,6 @@ class PVDataset(Dataset):
         return self._build_sample(df, dev_idx, r)
 
 
-def collate_single(batch):
-    """Collate so we get a list of samples; we run model once per sample (batch_size 1 or loop)."""
-    return batch
-
-
 def collate_batched(batch):
     """Stack list of samples into one dict of tensors with batch dim B in front."""
     return {
@@ -368,14 +564,32 @@ def collate_batched(batch):
         "forecast_solar_features": torch.stack([s["forecast_solar_features"] for s in batch]),
         "target_pv": torch.stack([s["target_pv"] for s in batch]),
         "target_mask": torch.stack([s["target_mask"] for s in batch]),
+        "history_skyimg": torch.stack([s["history_skyimg"] for s in batch]),
+        "forecast_skyimg": torch.stack([s["forecast_skyimg"] for s in batch]),
+        "history_staimg": torch.stack([s["history_staimg"] for s in batch]),
+        "forecast_staimg": torch.stack([s["forecast_staimg"] for s in batch]),
+        "x_last_collect_time": tuple(s["x_last_collect_time"] for s in batch),
+        "y_first_collect_time": tuple(s["y_first_collect_time"] for s in batch),
+        "history_sky_ts": tuple(s["history_sky_ts"] for s in batch),
+        "forecast_sky_ts": tuple(s["forecast_sky_ts"] for s in batch),
+        "history_staimg_ts": tuple(s["history_staimg_ts"] for s in batch),
+        "forecast_staimg_ts": tuple(s["forecast_staimg_ts"] for s in batch),
     }
 
 
 def loader_test(
     *,
-    train_data_dir: str = DEFAULT_TRAIN_DATA_DIR,
-    test_data_dir: str = DEFAULT_TEST_DATA_DIR,
+    pv_train_dir: str = _TRAINING_PATH_DEFAULTS["pv_train_dir"],
+    pv_test_dir: str = _TRAINING_PATH_DEFAULTS["pv_test_dir"],
+    skyimg_train_dir: str = _TRAINING_PATH_DEFAULTS["skyimg_train_dir"],
+    skyimg_test_dir: str = _TRAINING_PATH_DEFAULTS["skyimg_test_dir"],
+    staimg_train_dir: str = _TRAINING_PATH_DEFAULTS["staimg_train_dir"],
+    staimg_test_dir: str = _TRAINING_PATH_DEFAULTS["staimg_test_dir"],
     test_anchor_stride_min: int = DEFAULT_TEST_ANCHOR_STRIDE_MIN,
+    skyimg_window_size: int = 30,
+    skyimg_time_resolution_min: int | None = None,
+    staimg_window_size: int = 24,
+    staimg_time_resolution_min: int = 10,
     batch_size: int = 4,
     epochs: int = 1,
     max_batches: int | None = None,
@@ -390,10 +604,24 @@ def loader_test(
     if max_batches is not None and max_batches < 1:
         raise ValueError("max_batches must be >= 1 when set")
 
-    train_dir = str(Path(train_data_dir).resolve())
-    test_dir = str(Path(test_data_dir).resolve())
+    pv_train_dir = str(Path(pv_train_dir).resolve())
+    pv_test_dir = str(Path(pv_test_dir).resolve())
+    skyimg_train_dir = str(Path(skyimg_train_dir).resolve())
+    skyimg_test_dir = str(Path(skyimg_test_dir).resolve())
+    staimg_train_dir = str(Path(staimg_train_dir).resolve())
+    staimg_test_dir = str(Path(staimg_test_dir).resolve())
 
-    train_dataset = PVDataset(data_dir=train_dir, split="train")
+    train_dataset = PVDataset(
+        pv_dir=pv_train_dir,
+        skyimg_dir=skyimg_train_dir,
+        staimg_dir=staimg_train_dir,
+        split="train",
+        test_anchor_stride_min=test_anchor_stride_min,
+        skyimg_window_size=skyimg_window_size,
+        skyimg_time_resolution_min=skyimg_time_resolution_min,
+        staimg_window_size=staimg_window_size,
+        staimg_time_resolution_min=staimg_time_resolution_min,
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -404,11 +632,17 @@ def loader_test(
 
     test_dataset: PVDataset | None = None
     test_loader: DataLoader | None = None
-    if test_dir != train_dir:
+    if pv_test_dir != pv_train_dir:
         test_dataset = PVDataset(
-            data_dir=test_dir,
+            pv_dir=pv_test_dir,
+            skyimg_dir=skyimg_test_dir,
+            staimg_dir=staimg_test_dir,
             split="test",
             test_anchor_stride_min=test_anchor_stride_min,
+            skyimg_window_size=skyimg_window_size,
+            skyimg_time_resolution_min=skyimg_time_resolution_min,
+            staimg_window_size=staimg_window_size,
+            staimg_time_resolution_min=staimg_time_resolution_min,
         )
         test_loader = DataLoader(
             test_dataset,
@@ -418,13 +652,13 @@ def loader_test(
             num_workers=num_workers,
         )
 
-    print(f"loader_test: train_data_dir={train_dir!r}")
+    print(f"loader_test: train_data_dir={pv_train_dir!r}")
     print(f"  train_dataset: {len(train_dataset)} files  batches/epoch={len(train_loader)}  epochs={epochs}")
     if max_batches is not None:
         print(f"  max_batches/epoch={max_batches}")
     if test_loader is not None:
         assert test_dataset is not None
-        print(f"loader_test: test_data_dir={test_dir!r}")
+        print(f"loader_test: test_data_dir={pv_test_dir!r}")
         print(f"  test_dataset:  {len(test_dataset)} files  batches/epoch={len(test_loader)}")
 
     def _run_split(name: str, loader: DataLoader) -> None:
@@ -436,8 +670,25 @@ def loader_test(
                     f"  [{name}] epoch {epoch + 1}/{epochs} batch {batch_idx}: ",
                     end="",
                 )
-                parts = [f"{k} {tuple(batch[k].shape)} {batch[k].dtype}" for k in batch]
+                tensor_keys = [k for k in batch if torch.is_tensor(batch[k])]
+                parts = [f"{k} {tuple(batch[k].shape)} {batch[k].dtype}" for k in tensor_keys]
                 print(", ".join(parts))
+                B = batch["dev_idx"].size(0)
+                for i in range(B):
+                    print(
+                        f"    [{i}] x_last_collectTime={batch['x_last_collect_time'][i]!r} "
+                        f"y_first_collectTime={batch['y_first_collect_time'][i]!r}"
+                    )
+                    print(f"        history_sky_ts: {list(batch['history_sky_ts'][i])}")
+                    print(f"        forecast_sky_ts: {list(batch['forecast_sky_ts'][i])}")
+                    print(
+                        f"        history_staimg_ts (UTC YYYYMMDDHHMM): "
+                        f"{list(batch['history_staimg_ts'][i])}"
+                    )
+                    print(
+                        f"        forecast_staimg_ts (UTC YYYYMMDDHHMM): "
+                        f"{list(batch['forecast_staimg_ts'][i])}"
+                    )
 
     _run_split("train", train_loader)
     if test_loader is not None:
@@ -517,16 +768,28 @@ def main():
         help="Only build train/test loaders and print a few batches; skip training.",
     )
     parser.add_argument(
-        "--train_data_dir",
+        "--pv_train_dir",
         type=str,
-        default=DEFAULT_TRAIN_DATA_DIR,
-        help=f"Training CSV directory (default: {DEFAULT_TRAIN_DATA_DIR!r}).",
+        default=_TRAINING_PATH_DEFAULTS["pv_train_dir"],
+        help=f"Training CSV directory (default from conf: {_TRAINING_PATH_DEFAULTS['pv_train_dir']!r}).",
     )
     parser.add_argument(
-        "--test_data_dir",
+        "--pv_test_dir",
         type=str,
-        default=DEFAULT_TEST_DATA_DIR,
-        help=f"Eval/test CSV directory (default: {DEFAULT_TEST_DATA_DIR!r}).",
+        default=_TRAINING_PATH_DEFAULTS["pv_test_dir"],
+        help=f"Eval/test CSV directory (default from conf: {_TRAINING_PATH_DEFAULTS['pv_test_dir']!r}).",
+    )
+    parser.add_argument(
+        "--skyimg_train_dir",
+        type=str,
+        default=_TRAINING_PATH_DEFAULTS["skyimg_train_dir"],
+        help=f"Training skyimg directory (default from conf: {_TRAINING_PATH_DEFAULTS['skyimg_train_dir']!r}).",
+    )
+    parser.add_argument(
+        "--skyimg_test_dir",
+        type=str,
+        default=_TRAINING_PATH_DEFAULTS["skyimg_test_dir"],
+        help=f"Eval/test skyimg directory (default from conf: {_TRAINING_PATH_DEFAULTS['skyimg_test_dir']!r}).",
     )
     parser.add_argument(
         "--loader-test-epochs",
@@ -546,13 +809,57 @@ def main():
         default=DEFAULT_TEST_ANCHOR_STRIDE_MIN,
         help="For split=test: minutes between consecutive eval anchors (multiple of CSV row interval, default 120).",
     )
+    parser.add_argument(
+        "--skyimg_window_size",
+        type=int,
+        default=30,
+        help="Number of sky images per history and per forecast sequence (default: 8).",
+    )
+    parser.add_argument(
+        "--skyimg_time_resolution_min",
+        type=int,
+        default=1,
+        help="Minutes between consecutive sky frames; default: same as PV X spacing (pv_input_interval_min, 5).",
+    )
+    parser.add_argument(
+        "--staimg_train_dir",
+        type=str,
+        default=_TRAINING_PATH_DEFAULTS["staimg_train_dir"],
+        help=f"Himawari NPY train dir (default from conf: {_TRAINING_PATH_DEFAULTS['staimg_train_dir']!r}).",
+    )
+    parser.add_argument(
+        "--staimg_test_dir",
+        type=str,
+        default=_TRAINING_PATH_DEFAULTS["staimg_test_dir"],
+        help=f"Himawari NPY test dir (default from conf: {_TRAINING_PATH_DEFAULTS['staimg_test_dir']!r}).",
+    )
+    parser.add_argument(
+        "--staimg_window_size",
+        type=int,
+        default=24,
+        help="Number of Himawari NPY frames per history and per forecast sequence (default: 8).",
+    )
+    parser.add_argument(
+        "--staimg_time_resolution_min",
+        type=int,
+        default=10,
+        help="Minutes between consecutive staimg frames in UTC (default: 10).",
+    )
     args = parser.parse_args()
 
     if args.loader_test:
         loader_test(
-            train_data_dir=args.train_data_dir,
-            test_data_dir=args.test_data_dir,
+            pv_train_dir=args.pv_train_dir,
+            pv_test_dir=args.pv_test_dir,
+            skyimg_train_dir=args.skyimg_train_dir,
+            skyimg_test_dir=args.skyimg_test_dir,
+            staimg_train_dir=args.staimg_train_dir,
+            staimg_test_dir=args.staimg_test_dir,
             test_anchor_stride_min=args.test_anchor_stride_min,
+            skyimg_window_size=args.skyimg_window_size,
+            skyimg_time_resolution_min=args.skyimg_time_resolution_min,
+            staimg_window_size=args.staimg_window_size,
+            staimg_time_resolution_min=args.staimg_time_resolution_min,
             batch_size=args.batch_size,
             epochs=args.loader_test_epochs,
             max_batches=args.loader_test_max_batches,
@@ -566,20 +873,32 @@ def main():
         raise FileNotFoundError(f"pv_device_path not found: {pv_device_path}")
     pv_device_df = pd.read_excel(pv_device_path)
     dev_dn_list = pv_device_df["devDn"].dropna().unique().tolist()
-    num_devices = len(dev_dn_list)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = pv_forecasting_model(out_dim=64, dev_dn_list=dev_dn_list).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
 
-    train_dir = args.train_data_dir
-    test_dir = args.test_data_dir
-    train_dataset = PVDataset(data_dir=train_dir, split="train")
+    train_dataset = PVDataset(
+        pv_dir=args.pv_train_dir,
+        skyimg_dir=args.skyimg_train_dir,
+        staimg_dir=args.staimg_train_dir,
+        split="train",
+        test_anchor_stride_min=args.test_anchor_stride_min,
+        skyimg_window_size=args.skyimg_window_size,
+        skyimg_time_resolution_min=args.skyimg_time_resolution_min,
+        staimg_window_size=args.staimg_window_size,
+        staimg_time_resolution_min=args.staimg_time_resolution_min,
+    )
     test_dataset = PVDataset(
-        data_dir=test_dir,
+        pv_dir=args.pv_test_dir,
+        skyimg_dir=args.skyimg_test_dir,
+        staimg_dir=args.staimg_test_dir,
         split="test",
         test_anchor_stride_min=args.test_anchor_stride_min,
+        skyimg_window_size=args.skyimg_window_size,
+        skyimg_time_resolution_min=args.skyimg_time_resolution_min,
+        staimg_window_size=args.staimg_window_size,
+        staimg_time_resolution_min=args.staimg_time_resolution_min,
     )
 
     train_loader = DataLoader(
