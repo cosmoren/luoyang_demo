@@ -13,6 +13,8 @@ import os
 import contextlib
 import io
 
+SAT_TYPE = 0 # 0: timesformer 1: CNN+convLSTM
+
 # [ADDED] Lightweight CNN encoder
 class SatCNN(nn.Module):
     def __init__(self, in_ch=3, out_ch=64):
@@ -286,17 +288,17 @@ class pv_forecasting_model_vit(nn.Module):
         )
 
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            '''
-            self.sat_extractor = TimeSformerFeatureExtractor(
-                pretrained="facebook/timesformer-base-finetuned-k400",
-                output_format="sequence",
-                normalize=True,
-                config=config,
-            )
-            '''
-            self.sat_cnn = SatCNN(in_ch=3, out_ch=64)
-            self.sat_convlstm = ConvLSTM(input_dim=64, hidden_dim=64)
-            self.sat_pool = nn.AdaptiveAvgPool2d(1)
+            if SAT_TYPE == 0:
+                self.sat_extractor = TimeSformerFeatureExtractor(
+                    pretrained="facebook/timesformer-base-finetuned-k400",
+                    output_format="sequence",
+                    normalize=True,
+                    config=config,
+                )
+            if SAT_TYPE == 1:
+                self.sat_cnn = SatCNN(in_ch=3, out_ch=64)
+                self.sat_convlstm = ConvLSTM(input_dim=64, hidden_dim=64)
+                self.sat_pool = nn.AdaptiveAvgPool2d(1)
         # TimeSformer for sky imager images
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             self.skimg_extractor = TimeSformerFeatureExtractor(
@@ -338,44 +340,43 @@ class pv_forecasting_model_vit(nn.Module):
         forecast_pv_features = self.cross_attention_pv(query=forecast_timefeats, key=KV_hist_mem, value=KV_hist_mem)   #[B,T,D]
 
         # Satellite features    
-        '''
-        if sat_tensor is None:
-            forecast_sat_features = torch.zeros(pv.shape[0], forecast_timefeats.shape[1], 64).to(pv.device)
-        else:
-            sat_tensor = nn.functional.interpolate(sat_tensor.view(-1, 3, *sat_tensor.shape[-2:]), size=(224, 224), mode='bilinear', align_corners=False).view(*sat_tensor.shape[:3], 224, 224)
-            sat_features = self.sat_extractor(sat_tensor[:,-24:,:,:,:])   #[B,T=xx,D=768]
-            sat_timefeats_hdim = self.timefeats_encoder(sat_timefeats[:,-24:,:])
-            sat_down_features = self.sat_downdim(sat_features) # [B,T=xx,D=64]
-            sat_down_features = sat_down_features + sat_timefeats_hdim
-            forecast_sat_features = self.cross_attention_sat(query=forecast_timefeats, key=sat_down_features, value=sat_down_features)
-        '''
-        # [MODIFIED] satellite branch
-        if sat_tensor is None:
-            forecast_sat_features = torch.zeros(pv.shape[0], forecast_timefeats.shape[1], 64).to(pv.device)
-        else:
-            B, T, C, H, W = sat_tensor.shape
-            x = sat_tensor.view(B * T, C, H, W)
-            feat = self.sat_cnn(x)  # [B*T, 64, H', W']
-            _, C2, H2, W2 = feat.shape
-            feat = feat.view(B, T, C2, H2, W2)
-            lstm_out = self.sat_convlstm(feat)  # [B, T, C, H, W]
-            # 对每一帧做 spatial pooling，保留 T 维
-            sat_seq = self.sat_pool(
-                lstm_out.view(B * T, C2, H2, W2)
-            ).view(B, T, C2)   # [B,T,64]
-            # 把卫星时间特征也加进去
-            sat_timefeats_hdim = self.timefeats_encoder(sat_timefeats)   # [B,T,64]
-            sat_seq = sat_seq + sat_timefeats_hdim
-            # 用真实的 T 帧做 cross attention，而不是 repeat 一个向量
-            forecast_sat_features = self.cross_attention_sat(
-                query=forecast_timefeats,   # [B,192,9]
-                key=sat_seq,                # [B,T,64]
-                value=sat_seq,              # [B,T,64]
-            )
-            # mask for time, test only
-            #mask = torch.zeros_like(forecast_sat_features) 
-            #mask[:, 15, :] = 1 # 0 or 15
-            #forecast_sat_features = forecast_sat_features * mask
+        if SAT_TYPE == 0:
+            if sat_tensor is None:
+                forecast_sat_features = torch.zeros(pv.shape[0], forecast_timefeats.shape[1], 64).to(pv.device)
+            else:
+                sat_tensor = nn.functional.interpolate(sat_tensor.view(-1, 3, *sat_tensor.shape[-2:]), size=(224, 224), mode='bilinear', align_corners=False).view(*sat_tensor.shape[:3], 224, 224)
+                sat_features = self.sat_extractor(sat_tensor[:,-24:,:,:,:])   #[B,T=xx,D=768]
+                sat_timefeats_hdim = self.timefeats_encoder(sat_timefeats[:,-24:,:])
+                sat_down_features = self.sat_downdim(sat_features) # [B,T=xx,D=64]
+                sat_down_features = sat_down_features + sat_timefeats_hdim
+                forecast_sat_features = self.cross_attention_sat(query=forecast_timefeats, key=sat_down_features, value=sat_down_features)
+        if SAT_TYPE == 1:
+            if sat_tensor is None:
+                forecast_sat_features = torch.zeros(pv.shape[0], forecast_timefeats.shape[1], 64).to(pv.device)
+            else:
+                B, T, C, H, W = sat_tensor.shape
+                x = sat_tensor.view(B * T, C, H, W)
+                feat = self.sat_cnn(x)  # [B*T, 64, H', W']
+                _, C2, H2, W2 = feat.shape
+                feat = feat.view(B, T, C2, H2, W2)
+                lstm_out = self.sat_convlstm(feat)  # [B, T, C, H, W]
+                # 对每一帧做 spatial pooling，保留 T 维
+                sat_seq = self.sat_pool(
+                    lstm_out.view(B * T, C2, H2, W2)
+                ).view(B, T, C2)   # [B,T,64]
+                # 把卫星时间特征也加进去
+                sat_timefeats_hdim = self.timefeats_encoder(sat_timefeats)   # [B,T,64]
+                sat_seq = sat_seq + sat_timefeats_hdim
+                # 用真实的 T 帧做 cross attention，而不是 repeat 一个向量
+                forecast_sat_features = self.cross_attention_sat(
+                    query=forecast_timefeats,   # [B,192,9]
+                    key=sat_seq,                # [B,T,64]
+                    value=sat_seq,              # [B,T,64]
+                )
+                # mask for time, test only
+                mask = torch.zeros_like(forecast_sat_features) 
+                mask[:, 0, :] = 1 # 0 or 15
+                forecast_sat_features = forecast_sat_features * mask
         # Sky imager features
         if skimg_tensor is None:
             forecast_skimg_features = torch.zeros(pv.shape[0], forecast_timefeats.shape[1], 64).to(pv.device)
