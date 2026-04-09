@@ -13,7 +13,7 @@ import os
 import contextlib
 import io
 
-SAT_TYPE = 0 # 0: timesformer 1: CNN+convLSTM
+SAT_TYPE = 1 # 0: timesformer 1: CNN+convLSTM
 
 # [ADDED] Lightweight CNN encoder
 class SatCNN(nn.Module):
@@ -374,9 +374,9 @@ class pv_forecasting_model_vit(nn.Module):
                     value=sat_seq,              # [B,T,64]
                 )
                 # mask for time, test only
-                mask = torch.zeros_like(forecast_sat_features) 
-                mask[:, 0, :] = 1 # 0 or 15
-                forecast_sat_features = forecast_sat_features * mask
+                #mask = torch.zeros_like(forecast_sat_features) 
+                #mask[:, 0, :] = 1 # 0 or 15
+                #forecast_sat_features = forecast_sat_features * mask
         # Sky imager features
         if skimg_tensor is None:
             forecast_skimg_features = torch.zeros(pv.shape[0], forecast_timefeats.shape[1], 64).to(pv.device)
