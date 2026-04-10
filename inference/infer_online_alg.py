@@ -1,7 +1,9 @@
 import sys
+import time
 import yaml
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -16,6 +18,84 @@ from models.models import pv_forecasting_model
 import torch
 
 CONF_PATH = _PROJECT_ROOT / "config" / "conf.yaml"
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+POLL_INTERVAL_SEC = 120
+TRIGGER_HOUR = 8
+TRIGGER_MINUTE = 55
+VALID_LAST_HOUR = 9
+VALID_LAST_MINUTE = 0
+FORECAST_CSV_DIR = Path(__file__).resolve().parent / "daily_forecast_csv"
+
+
+def sleep_until_shanghai_0855_if_before() -> None:
+    """Wait until local 08:55 if the daily cycle has not reached that time yet."""
+    while True:
+        now = datetime.now(SHANGHAI_TZ)
+        target = now.replace(hour=TRIGGER_HOUR, minute=TRIGGER_MINUTE, second=0, microsecond=0)
+        if now >= target:
+            return
+        sec = (target - now).total_seconds()
+        time.sleep(min(POLL_INTERVAL_SEC, max(0.0, sec)))
+
+
+def sleep_until_tomorrow_shanghai_0855() -> None:
+    """After a successful export, wait until 08:55 on the next calendar day (Shanghai)."""
+    while True:
+        now = datetime.now(SHANGHAI_TZ)
+        tomorrow = now.date() + timedelta(days=1)
+        target = datetime(
+            tomorrow.year,
+            tomorrow.month,
+            tomorrow.day,
+            TRIGGER_HOUR,
+            TRIGGER_MINUTE,
+            0,
+            tzinfo=SHANGHAI_TZ,
+        )
+        sec = (target - now).total_seconds()
+        if sec <= 1.0:
+            return
+        time.sleep(min(POLL_INTERVAL_SEC, sec))
+
+
+def last_history_is_shanghai_0900(timestamps: list) -> bool:
+    t = timestamps[-1]
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    else:
+        t = t.astimezone(timezone.utc)
+    loc = t.astimezone(SHANGHAI_TZ)
+    return loc.hour == VALID_LAST_HOUR and loc.minute == VALID_LAST_MINUTE
+
+
+def save_total_forecast_csv(pv_pred_dict: dict, out_dir: Path) -> Path:
+    if not pv_pred_dict:
+        raise ValueError("pv_pred_dict is empty")
+    sample = next(iter(pv_pred_dict.values()))
+    forecast_ts = sample["forecast_timestamps_utc"]
+    n = len(forecast_ts)
+    total = np.zeros(n, dtype=np.float32)
+    for _key, payload in pv_pred_dict.items():
+        arr = np.squeeze(payload["pv_pred"]).astype(np.float32, copy=False).reshape(-1)
+        if arr.size != n:
+            raise ValueError(f"Expected {n} forecast steps, got {arr.size} after squeeze")
+        total += arr
+
+    dtime_strs = []
+    for t in forecast_ts:
+        tu = t.replace(tzinfo=timezone.utc) if t.tzinfo is None else t.astimezone(timezone.utc)
+        tl = tu.astimezone(SHANGHAI_TZ)
+        dtime_strs.append(tl.strftime("%Y-%m-%d %H:%M:%S"))
+
+    ts_last = sample["timestamps"][-1]
+    tu_last = ts_last.replace(tzinfo=timezone.utc) if ts_last.tzinfo is None else ts_last.astimezone(timezone.utc)
+    file_stem = tu_last.astimezone(SHANGHAI_TZ).strftime("%Y-%m-%d")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{file_stem}.csv"
+    df = pd.DataFrame({"dtime": dtime_strs, "predictions": total.astype(np.float32)})
+    df.to_csv(out_path, index=False)
+    return out_path
 
 
 def utc_to_local_solar_time_pvlib(utc_times: pd.DatetimeIndex, longitude: float) -> pd.DatetimeIndex:
@@ -177,9 +257,20 @@ class infer_online_alg:    # ckpt = torch.load(checkpoint_path, map_location=sel
 
 
 if __name__ == "__main__":
-    inference_online = infer_online_alg(checkpoint_path='./checkpoints/pv_forecast_epoch_10.pt')
-    pv_pred_dict = inference_online.inference()
-    print (pv_pred_dict['NE=333858485']['pv_pred'].shape)
-    print (len(pv_pred_dict['NE=333858485']['timestamps']))
-    print (len(pv_pred_dict['NE=333858485']['forecast_timestamps_utc']))
-    print (pv_pred_dict['NE=333858485']['pv'].shape)
+    checkpoint_path = _PROJECT_ROOT / "checkpoints" / "pv_forecast_epoch_10.pt"
+    inference_online = infer_online_alg(checkpoint_path=str(checkpoint_path))
+
+    while True:
+        sleep_until_shanghai_0855_if_before()
+
+        while True:
+            pv_pred_dict = inference_online.inference()
+            sample_ts = next(iter(pv_pred_dict.values()))["timestamps"]
+            if last_history_is_shanghai_0900(sample_ts):
+                out_path = save_total_forecast_csv(pv_pred_dict, FORECAST_CSV_DIR)
+                print(f"Saved aggregated forecast: {out_path}")
+                break
+
+            time.sleep(POLL_INTERVAL_SEC)
+
+        sleep_until_tomorrow_shanghai_0855()
