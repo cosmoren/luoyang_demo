@@ -343,6 +343,8 @@ def build_train_test_splits(
         months = {ts_min.month, ts_max.month}
         return 3 in months and 4 in months
 
+    print('dddddddddDD: ', len(all_csvs))
+
     for file_idx, csv_path in enumerate(all_csvs):
         # if file_idx>5:
         #     break

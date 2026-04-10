@@ -378,7 +378,7 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
 
-    data_dir = "/mnt/nfs/Ai4Energy/Datasets/luoyang_data_626/"
+    data_dir = "/home/hw1/workspace/luoyang_data_626/"
     train_dataset = PVDataset(data_dir=data_dir, split="train")
     test_dataset = PVDataset(data_dir=data_dir, split="test")
 

@@ -180,20 +180,65 @@ class pv_forecasting_model(nn.Module):
         self.use_batchnorm = use_batchnorm
         self.dropout = dropout
 
+        # PV branch: x_masked + x (2 ch) + pv_timefeats (8 solar + 1 delta_t per step = 9)
+        self._pv_timefeat_dim = 9
         self.inverter_embedding = nn.Embedding(num_embeddings=1000, embedding_dim=16)
-        self.TCN = TemporalCNN1d(in_channels=8, out_channels=64, use_batchnorm=use_batchnorm, dropout=dropout)
-        self.cross_attention = CrossAttention(query_dim=8, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
+        tcn_in = 2 + self._pv_timefeat_dim
+        self.TCN = TemporalCNN1d(in_channels=tcn_in, out_channels=64, use_batchnorm=use_batchnorm, dropout=dropout)
+        self.cross_attention = CrossAttention(
+            query_dim=self._pv_timefeat_dim, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout
+        )
         self.pv_feats_head = MLP(in_dim=80, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
         self.fc = FC(in_dim=64, out_dim=1)
 
-    def forward(self, device_id: torch.Tensor, x: torch.Tensor, mask: Optional[torch.Tensor] = None, history_solar_features: Optional[torch.Tensor] = None, forecast_solar_features: Optional[torch.Tensor] = None) -> torch.Tensor:
-        
-        x_masked = x * mask.to(x.dtype)
-        pv_history = torch.cat([x_masked, x, history_solar_features.permute(0, 2, 1)], dim=1)  # [B, 8, T]
-        pv_hist_mem = self.TCN(pv_history, mask)      # [B, C_out, T]()
-        KV_hist_mem = pv_hist_mem.permute(0, 2, 1)   # [B, T, C_out]
+    def forward(
+        self,
+        device_id: torch.Tensor,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        pv_timefeats: Optional[torch.Tensor] = None,
+        forecast_timefeats: Optional[torch.Tensor] = None,
+        history_solar_features: Optional[torch.Tensor] = None,
+        forecast_solar_features: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: [B, 1, T_in] PV history (power).
+            mask: [B, 1, T_in] valid mask.
+            pv_timefeats: [B, T_in, C_tf] aligned with history (C_tf=9 from dataloader).
+            forecast_timefeats: [B, T_out, C_tf] query timesteps for prediction.
+            history_solar_features / forecast_solar_features: legacy names ([B, T, 6] / [B, T, 8]),
+                zero-padded to C_tf=9 when shorter.
+        """
+        if pv_timefeats is None:
+            pv_timefeats = history_solar_features
+        if forecast_timefeats is None:
+            forecast_timefeats = forecast_solar_features
+        if pv_timefeats is None or forecast_timefeats is None:
+            raise ValueError(
+                "pv_timefeats and forecast_timefeats (or legacy history_solar_features / forecast_solar_features) are required"
+            )
 
-        forcast_pv_features = self.cross_attention(query=forecast_solar_features, key=KV_hist_mem, value=KV_hist_mem)   #[B,T,D]
+        def _pad_timefeat(t: torch.Tensor, want: int) -> torch.Tensor:
+            c = t.size(-1)
+            if c == want:
+                return t
+            if c < want:
+                pad = want - c
+                return torch.nn.functional.pad(t, (0, pad))
+            return t[..., :want]
+
+        pv_timefeats = _pad_timefeat(pv_timefeats, self._pv_timefeat_dim)
+        forecast_timefeats = _pad_timefeat(forecast_timefeats, self._pv_timefeat_dim)
+
+        x_masked = x * mask.to(x.dtype)
+        # [B, T, C] -> [B, C, T]
+        hist_tf = pv_timefeats.permute(0, 2, 1)
+        pv_history = torch.cat([x_masked, x, hist_tf], dim=1)
+        pv_hist_mem = self.TCN(pv_history, mask)
+        KV_hist_mem = pv_hist_mem.permute(0, 2, 1)
+
+        forcast_pv_features = self.cross_attention(query=forecast_timefeats, key=KV_hist_mem, value=KV_hist_mem)
         inverter_features = self.inverter_embedding(device_id).unsqueeze(1).repeat(1, forcast_pv_features.shape[1], 1)
         fused = torch.cat([forcast_pv_features, inverter_features], dim=2)
         pv_feats = self.pv_feats_head(fused)
