@@ -69,6 +69,3 @@ training:
   num_workers: 24
   # null = run every batch in an epoch
   train_max_batches_per_epoch: null
-  # Used with --loader-test only
-  loader_test_batch_size: 16
-  loader_test_num_workers: 0

@@ -52,8 +52,6 @@ TRAINING_HPARAM_KEYS = frozenset({
     "save_every",
     "num_workers",
     "train_max_batches_per_epoch",
-    "loader_test_batch_size",
-    "loader_test_num_workers",
 })
 
 
@@ -641,154 +639,6 @@ def collate_batched(batch):
     }
 
 
-def loader_test(
-    *,
-    pv_train_dir: str = _TRAINING_PATH_DEFAULTS["pv_train_dir"],
-    pv_test_dir: str = _TRAINING_PATH_DEFAULTS["pv_test_dir"],
-    skyimg_train_dir: str = _TRAINING_PATH_DEFAULTS["skyimg_train_dir"],
-    skyimg_test_dir: str = _TRAINING_PATH_DEFAULTS["skyimg_test_dir"],
-    staimg_train_dir: str = _TRAINING_PATH_DEFAULTS["staimg_train_dir"],
-    staimg_test_dir: str = _TRAINING_PATH_DEFAULTS["staimg_test_dir"],
-    csv_interval_min: int = _TRAINING_HPARAM_DEFAULTS["csv_interval_min"],
-    pv_input_interval_min: int = _TRAINING_HPARAM_DEFAULTS["pv_input_interval_min"],
-    pv_input_len: int = _TRAINING_HPARAM_DEFAULTS["pv_input_len"],
-    pv_output_interval_min: int = _TRAINING_HPARAM_DEFAULTS["pv_output_interval_min"],
-    pv_output_len: int = _TRAINING_HPARAM_DEFAULTS["pv_output_len"],
-    test_anchor_stride_min: int = _TRAINING_HPARAM_DEFAULTS["test_anchor_stride_min"],
-    skyimg_window_size: int = _TRAINING_HPARAM_DEFAULTS["skyimg_window_size"],
-    skyimg_time_resolution_min: int = _TRAINING_HPARAM_DEFAULTS["skyimg_time_resolution_min"],
-    skyimg_spatial_size: int = _TRAINING_HPARAM_DEFAULTS["skyimg_spatial_size"],
-    staimg_window_size: int = _TRAINING_HPARAM_DEFAULTS["staimg_window_size"],
-    staimg_time_resolution_min: int = _TRAINING_HPARAM_DEFAULTS["staimg_time_resolution_min"],
-    staimg_npy_shape_hwc: tuple[int, int, int] = _TRAINING_HPARAM_DEFAULTS["staimg_npy_shape_hwc"],
-    batch_size: int = _TRAINING_HPARAM_DEFAULTS["loader_test_batch_size"],
-    epochs: int = 1,
-    max_batches: int | None = None,
-    num_workers: int = _TRAINING_HPARAM_DEFAULTS["loader_test_num_workers"],
-) -> dict:
-    """
-    :class:`PVDataset` / ``DataLoader`` for ``train_data_dir`` and, if it differs from
-    ``test_data_dir`` after resolving paths, a second loader for the test folder.
-    """
-    if epochs < 1:
-        raise ValueError("epochs must be >= 1")
-    if max_batches is not None and max_batches < 1:
-        raise ValueError("max_batches must be >= 1 when set")
-
-    pv_train_dir = str(Path(pv_train_dir).resolve())
-    pv_test_dir = str(Path(pv_test_dir).resolve())
-    skyimg_train_dir = str(Path(skyimg_train_dir).resolve())
-    skyimg_test_dir = str(Path(skyimg_test_dir).resolve())
-    staimg_train_dir = str(Path(staimg_train_dir).resolve())
-    staimg_test_dir = str(Path(staimg_test_dir).resolve())
-
-    train_dataset = PVDataset(
-        pv_dir=pv_train_dir,
-        skyimg_dir=skyimg_train_dir,
-        staimg_dir=staimg_train_dir,
-        split="train",
-        csv_interval_min=csv_interval_min,
-        pv_input_interval_min=pv_input_interval_min,
-        pv_input_len=pv_input_len,
-        pv_output_interval_min=pv_output_interval_min,
-        pv_output_len=pv_output_len,
-        test_anchor_stride_min=test_anchor_stride_min,
-        skyimg_window_size=skyimg_window_size,
-        skyimg_time_resolution_min=skyimg_time_resolution_min,
-        skyimg_spatial_size=skyimg_spatial_size,
-        staimg_window_size=staimg_window_size,
-        staimg_time_resolution_min=staimg_time_resolution_min,
-        staimg_npy_shape_hwc=staimg_npy_shape_hwc,
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=collate_batched,
-        num_workers=num_workers,
-    )
-
-    test_dataset: PVDataset | None = None
-    test_loader: DataLoader | None = None
-    if pv_test_dir != pv_train_dir:
-        test_dataset = PVDataset(
-            pv_dir=pv_test_dir,
-            skyimg_dir=skyimg_test_dir,
-            staimg_dir=staimg_test_dir,
-            split="test",
-            csv_interval_min=csv_interval_min,
-            pv_input_interval_min=pv_input_interval_min,
-            pv_input_len=pv_input_len,
-            pv_output_interval_min=pv_output_interval_min,
-            pv_output_len=pv_output_len,
-            test_anchor_stride_min=test_anchor_stride_min,
-            skyimg_window_size=skyimg_window_size,
-            skyimg_time_resolution_min=skyimg_time_resolution_min,
-            skyimg_spatial_size=skyimg_spatial_size,
-            staimg_window_size=staimg_window_size,
-            staimg_time_resolution_min=staimg_time_resolution_min,
-            staimg_npy_shape_hwc=staimg_npy_shape_hwc,
-        )
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=collate_batched,
-            num_workers=num_workers,
-        )
-
-    print(f"loader_test: train_data_dir={pv_train_dir!r}")
-    print(f"  train_dataset: {len(train_dataset)} files  batches/epoch={len(train_loader)}  epochs={epochs}")
-    if max_batches is not None:
-        print(f"  max_batches/epoch={max_batches}")
-    if test_loader is not None:
-        assert test_dataset is not None
-        print(f"loader_test: test_data_dir={pv_test_dir!r}")
-        print(f"  test_dataset:  {len(test_dataset)} files  batches/epoch={len(test_loader)}")
-
-    def _run_split(name: str, loader: DataLoader) -> None:
-        for epoch in range(epochs):
-            for batch_idx, batch in enumerate(loader):
-                if max_batches is not None and batch_idx >= max_batches:
-                    break
-                print(
-                    f"  [{name}] epoch {epoch + 1}/{epochs} batch {batch_idx}: ",
-                    end="",
-                )
-                tensor_keys = [k for k in batch if torch.is_tensor(batch[k])]
-                parts = [f"{k} {tuple(batch[k].shape)} {batch[k].dtype}" for k in tensor_keys]
-                print(", ".join(parts))
-                B = batch["dev_idx"].size(0)
-                for i in range(B):
-                    print(
-                        f"    [{i}] x_last_collectTime={batch['x_last_collect_time'][i]!r} "
-                        f"y_first_collectTime={batch['y_first_collect_time'][i]!r}"
-                    )
-                    print(f"        history_sky_ts: {list(batch['history_sky_ts'][i])}")
-                    print(f"        forecast_sky_ts: {list(batch['forecast_sky_ts'][i])}")
-                    print(
-                        f"        history_staimg_ts (UTC YYYYMMDDHHMM): "
-                        f"{list(batch['history_staimg_ts'][i])}"
-                    )
-                    print(
-                        f"        forecast_staimg_ts (UTC YYYYMMDDHHMM): "
-                        f"{list(batch['forecast_staimg_ts'][i])}"
-                    )
-
-    _run_split("train", train_loader)
-    if test_loader is not None:
-        _run_split("test", test_loader)
-
-    out: dict = {
-        "train_dataset": train_dataset,
-        "train_loader": train_loader,
-    }
-    if test_dataset is not None and test_loader is not None:
-        out["test_dataset"] = test_dataset
-        out["test_loader"] = test_loader
-    return out
-
-
 def train_one_epoch(model, device, loader, criterion, optimizer, max_batches: int | None = None):
     model.train()
     total_loss = 0.0
@@ -849,11 +699,6 @@ def main():
     parser.add_argument("--checkpoint_dir", type=str, default=None)
     parser.add_argument("--save_every", type=int, default=h["save_every"])
     parser.add_argument(
-        "--loader-test",
-        action="store_true",
-        help="Only build train/test loaders and print a few batches; skip training.",
-    )
-    parser.add_argument(
         "--pv_train_dir",
         type=str,
         default=_TRAINING_PATH_DEFAULTS["pv_train_dir"],
@@ -876,18 +721,6 @@ def main():
         type=str,
         default=_TRAINING_PATH_DEFAULTS["skyimg_test_dir"],
         help=f"Eval/test skyimg directory (default from conf: {_TRAINING_PATH_DEFAULTS['skyimg_test_dir']!r}).",
-    )
-    parser.add_argument(
-        "--loader-test-epochs",
-        type=int,
-        default=1,
-        help="With --loader-test: number of full DataLoader passes (epochs).",
-    )
-    parser.add_argument(
-        "--loader-test-max-batches",
-        type=int,
-        default=None,
-        help="With --loader-test: max batches per epoch (default: full epoch).",
     )
     parser.add_argument(
         "--csv_interval_min",
@@ -977,47 +810,8 @@ def main():
         default=h["train_max_batches_per_epoch"],
         help="Stop each training epoch after this many batches (default from conf; null = no cap).",
     )
-    parser.add_argument(
-        "--loader_test_batch_size",
-        type=int,
-        default=h["loader_test_batch_size"],
-        help="With --loader-test: batch size (default from conf).",
-    )
-    parser.add_argument(
-        "--loader_test_num_workers",
-        type=int,
-        default=h["loader_test_num_workers"],
-        help="With --loader-test: DataLoader num_workers (default from conf).",
-    )
     args = parser.parse_args()
     staimg_hwc = tuple(args.staimg_npy_shape_hwc)
-
-    if args.loader_test:
-        loader_test(
-            pv_train_dir=args.pv_train_dir,
-            pv_test_dir=args.pv_test_dir,
-            skyimg_train_dir=args.skyimg_train_dir,
-            skyimg_test_dir=args.skyimg_test_dir,
-            staimg_train_dir=args.staimg_train_dir,
-            staimg_test_dir=args.staimg_test_dir,
-            csv_interval_min=args.csv_interval_min,
-            pv_input_interval_min=args.pv_input_interval_min,
-            pv_input_len=args.pv_input_len,
-            pv_output_interval_min=args.pv_output_interval_min,
-            pv_output_len=args.pv_output_len,
-            test_anchor_stride_min=args.test_anchor_stride_min,
-            skyimg_window_size=args.skyimg_window_size,
-            skyimg_time_resolution_min=args.skyimg_time_resolution_min,
-            skyimg_spatial_size=args.skyimg_spatial_size,
-            staimg_window_size=args.staimg_window_size,
-            staimg_time_resolution_min=args.staimg_time_resolution_min,
-            staimg_npy_shape_hwc=staimg_hwc,
-            batch_size=args.loader_test_batch_size,
-            epochs=args.loader_test_epochs,
-            max_batches=args.loader_test_max_batches,
-            num_workers=args.loader_test_num_workers,
-        )
-        return
 
     conf = load_config()
     paths = get_resolved_paths(conf, _PROJECT_ROOT)
