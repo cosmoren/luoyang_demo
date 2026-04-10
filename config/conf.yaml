@@ -22,7 +22,7 @@ paths:
   sky_image_asi_16613_subpath: asi_16613
   # wylc: skyimg_download / sky_image_wylc_subpath; pred: skyimg_pred / same (optional sky_image_wylc_pred_subpath)
   sky_image_wylc_subpath: wylc
-  
+
   # The following is for training and testing
   # train/test sky image dirs (directly under data_dir, e.g. /data/data/asi_16613_train)
   sky_image_train_path: asi_16613_train
@@ -44,3 +44,29 @@ camera:
 
 download:
   user_agent: "Mozilla/5.0 (compatible; NWP downloader)"
+
+# Hyperparameters for training/train.py (CLI flags override these when passed)
+training:
+  # PVDataset: CSV spacing and PV window geometry
+  csv_interval_min: 5 # Do not change unless the csv file has a different time resolution
+  pv_input_interval_min: 5 # multiple of 5 or csv_interval_min
+  pv_input_len: 576
+  pv_output_interval_min: 15 # multiple of 5 or csv_interval_min
+  pv_output_len: 192
+  test_anchor_stride_min: 12000
+  # Sky / Himawari stacks
+  skyimg_window_size: 30 # the newest frame has aligned time with the last PV output row
+  skyimg_time_resolution_min: 1
+  staimg_window_size: 24 # the newest frame has aligned time with the last PV output row
+  staimg_time_resolution_min: 10 # multiple of 10
+  # Optimization and training loop
+  epochs: 50
+  lr: 0.001
+  batch_size: 16
+  save_every: 5
+  num_workers: 24
+  # null = run every batch in an epoch
+  train_max_batches_per_epoch: null
+  # Used with --loader-test only
+  loader_test_batch_size: 16
+  loader_test_num_workers: 0

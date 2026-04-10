@@ -33,13 +33,49 @@ from datetime import timedelta
 CONF_PATH = _PROJECT_ROOT / "config" / "conf.yaml"
 SKYIMG_SPATIAL_SIZE = 224
 STAIMG_NPY_SHAPE_HWC = (100, 100, 3)
-DEFAULT_TEST_ANCHOR_STRIDE_MIN = 12000
+
+BASE_TRAINING_HPARAMS: dict = {
+    "csv_interval_min": 5,
+    "pv_input_interval_min": 5,
+    "pv_output_interval_min": 15,
+    "pv_input_len": 576,
+    "pv_output_len": 192,
+    "test_anchor_stride_min": 120,
+    "skyimg_window_size": 30,
+    "skyimg_time_resolution_min": 1,
+    "staimg_window_size": 24,
+    "staimg_time_resolution_min": 10,
+    "epochs": 50,
+    "lr": 1e-3,
+    "batch_size": 16,
+    "save_every": 5,
+    "num_workers": 24,
+    "train_max_batches_per_epoch": None,
+    "loader_test_batch_size": 4,
+    "loader_test_num_workers": 0,
+}
+ALLOWED_TRAINING_HPARAM_KEYS = frozenset(BASE_TRAINING_HPARAMS.keys())
 
 
 def load_config():
     with open(CONF_PATH) as f:
         conf = yaml.safe_load(f)
     return conf
+
+
+def get_training_hparams_from_conf(conf: dict | None = None) -> dict:
+    """Merge ``conf['training']`` into :data:`BASE_TRAINING_HPARAMS` (unknown keys ignored)."""
+    if conf is None:
+        conf = load_config()
+    out = dict(BASE_TRAINING_HPARAMS)
+    raw = conf.get("training")
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if k in ALLOWED_TRAINING_HPARAM_KEYS:
+                out[k] = v
+    if isinstance(out["lr"], str):
+        out["lr"] = float(out["lr"])
+    return out
 
 
 def get_training_paths_from_conf(conf: dict | None = None) -> dict[str, str]:
@@ -68,12 +104,6 @@ def get_training_paths_from_conf(conf: dict | None = None) -> dict[str, str]:
     sky_test = (data_dir / _req("sky_image_test_path")).resolve()
     sta_train = (data_dir / _req("sat_train_path")).resolve()
     sta_test = (data_dir / _req("sat_test_path")).resolve()
-    print (f"pv_train: {pv_train}")
-    print (f"pv_test: {pv_test}")
-    print (f"sky_train: {sky_train}")
-    print (f"sky_test: {sky_test}")
-    print (f"sta_train: {sta_train}")
-    print (f"sta_test: {sta_test}")
 
     return {
         "pv_train_dir": str(pv_train),
@@ -85,7 +115,12 @@ def get_training_paths_from_conf(conf: dict | None = None) -> dict[str, str]:
     }
 
 
-_TRAINING_PATH_DEFAULTS = get_training_paths_from_conf()
+def _load_training_defaults() -> tuple[dict[str, str], dict]:
+    conf = load_config()
+    return get_training_paths_from_conf(conf), get_training_hparams_from_conf(conf)
+
+
+_TRAINING_PATH_DEFAULTS, _TRAINING_HPARAM_DEFAULTS = _load_training_defaults()
 
 
 def utc_to_local_solar_time_pvlib(utc_times: pd.DatetimeIndex, longitude: float) -> pd.DatetimeIndex:
@@ -158,13 +193,13 @@ class PVDataset(Dataset):
 
     Sky images (under ``data_dir`` / ``sky_image_{train,test}_path``, ``YYYYMMDDHHMMSS_12.jpg``): history sequence
     ends at the last X ``collectTime``; forecast sequence starts at the first Y ``collectTime``;
-    step size defaults to ``pv_input_interval_min`` (same spacing as consecutive X rows when ``_sx``).
+    step size is ``skyimg_time_resolution_min`` (independent of PV CSV spacing).
     Missing files → black ``(3, H, W)`` tensors resized to ``SKYIMG_SPATIAL_SIZE``.
 
     Himawari NPY (``staimg``): names ``NC_H09_YYYYMMDD_HHMM_L2CLP010_FLDK.02401_02401.npy`` with
     ``YYYYMMDD_HHMM`` in UTC; ``collectTime`` is interpreted as Asia/Shanghai local, converted to UTC,
     then floored to 10-minute boundaries for the key timestep. History/forecast windows step in UTC
-    (default 8 frames, 10 min). Arrays are float32 ``(100,100,3)`` HWC; missing files → zeros.
+    (sizes from ``conf.yaml`` ``training``). Arrays are float32 ``(100,100,3)`` HWC; missing files → zeros.
     """
 
     def __init__(
@@ -174,16 +209,16 @@ class PVDataset(Dataset):
         staimg_dir: str,
         *,
         split: str = "train",
-        csv_interval_min: int = 5,
-        pv_input_interval_min: int = 5,
-        pv_input_len: int = 576,
-        pv_output_interval_min: int = 15,
-        pv_output_len: int = 192,
-        test_anchor_stride_min: int = DEFAULT_TEST_ANCHOR_STRIDE_MIN,
-        skyimg_window_size: int = 30,
-        skyimg_time_resolution_min: int | None = None,
-        staimg_window_size: int = 24,
-        staimg_time_resolution_min: int = 10,
+        csv_interval_min: int = _TRAINING_HPARAM_DEFAULTS["csv_interval_min"],
+        pv_input_interval_min: int = _TRAINING_HPARAM_DEFAULTS["pv_input_interval_min"],
+        pv_input_len: int = _TRAINING_HPARAM_DEFAULTS["pv_input_len"],
+        pv_output_interval_min: int = _TRAINING_HPARAM_DEFAULTS["pv_output_interval_min"],
+        pv_output_len: int = _TRAINING_HPARAM_DEFAULTS["pv_output_len"],
+        test_anchor_stride_min: int = _TRAINING_HPARAM_DEFAULTS["test_anchor_stride_min"],
+        skyimg_window_size: int = _TRAINING_HPARAM_DEFAULTS["skyimg_window_size"],
+        skyimg_time_resolution_min: int = _TRAINING_HPARAM_DEFAULTS["skyimg_time_resolution_min"],
+        staimg_window_size: int = _TRAINING_HPARAM_DEFAULTS["staimg_window_size"],
+        staimg_time_resolution_min: int = _TRAINING_HPARAM_DEFAULTS["staimg_time_resolution_min"],
     ):
         if split not in ("train", "test"):
             raise ValueError("split must be 'train' or 'test'")
@@ -203,10 +238,9 @@ class PVDataset(Dataset):
         self.pv_input_len = pv_input_len
         self.pv_output_len = pv_output_len
         self.pv_output_interval_min = pv_output_interval_min
-        _sky_dt = skyimg_time_resolution_min if skyimg_time_resolution_min is not None else pv_input_interval_min
-        if _sky_dt <= 0:
-            raise ValueError("skyimg_time_resolution_min / pv_input_interval_min must be positive")
-        self._skyimg_dt_min = _sky_dt
+        if skyimg_time_resolution_min <= 0:
+            raise ValueError("skyimg_time_resolution_min must be positive")
+        self._skyimg_dt_min = skyimg_time_resolution_min
         self._skyimg_dir = Path(skyimg_dir).resolve()
         if staimg_time_resolution_min <= 0:
             raise ValueError("staimg_time_resolution_min must be positive")
@@ -585,15 +619,20 @@ def loader_test(
     skyimg_test_dir: str = _TRAINING_PATH_DEFAULTS["skyimg_test_dir"],
     staimg_train_dir: str = _TRAINING_PATH_DEFAULTS["staimg_train_dir"],
     staimg_test_dir: str = _TRAINING_PATH_DEFAULTS["staimg_test_dir"],
-    test_anchor_stride_min: int = DEFAULT_TEST_ANCHOR_STRIDE_MIN,
-    skyimg_window_size: int = 30,
-    skyimg_time_resolution_min: int | None = None,
-    staimg_window_size: int = 24,
-    staimg_time_resolution_min: int = 10,
-    batch_size: int = 4,
+    csv_interval_min: int = _TRAINING_HPARAM_DEFAULTS["csv_interval_min"],
+    pv_input_interval_min: int = _TRAINING_HPARAM_DEFAULTS["pv_input_interval_min"],
+    pv_input_len: int = _TRAINING_HPARAM_DEFAULTS["pv_input_len"],
+    pv_output_interval_min: int = _TRAINING_HPARAM_DEFAULTS["pv_output_interval_min"],
+    pv_output_len: int = _TRAINING_HPARAM_DEFAULTS["pv_output_len"],
+    test_anchor_stride_min: int = _TRAINING_HPARAM_DEFAULTS["test_anchor_stride_min"],
+    skyimg_window_size: int = _TRAINING_HPARAM_DEFAULTS["skyimg_window_size"],
+    skyimg_time_resolution_min: int = _TRAINING_HPARAM_DEFAULTS["skyimg_time_resolution_min"],
+    staimg_window_size: int = _TRAINING_HPARAM_DEFAULTS["staimg_window_size"],
+    staimg_time_resolution_min: int = _TRAINING_HPARAM_DEFAULTS["staimg_time_resolution_min"],
+    batch_size: int = _TRAINING_HPARAM_DEFAULTS["loader_test_batch_size"],
     epochs: int = 1,
     max_batches: int | None = None,
-    num_workers: int = 0,
+    num_workers: int = _TRAINING_HPARAM_DEFAULTS["loader_test_num_workers"],
 ) -> dict:
     """
     :class:`PVDataset` / ``DataLoader`` for ``train_data_dir`` and, if it differs from
@@ -616,6 +655,11 @@ def loader_test(
         skyimg_dir=skyimg_train_dir,
         staimg_dir=staimg_train_dir,
         split="train",
+        csv_interval_min=csv_interval_min,
+        pv_input_interval_min=pv_input_interval_min,
+        pv_input_len=pv_input_len,
+        pv_output_interval_min=pv_output_interval_min,
+        pv_output_len=pv_output_len,
         test_anchor_stride_min=test_anchor_stride_min,
         skyimg_window_size=skyimg_window_size,
         skyimg_time_resolution_min=skyimg_time_resolution_min,
@@ -638,6 +682,11 @@ def loader_test(
             skyimg_dir=skyimg_test_dir,
             staimg_dir=staimg_test_dir,
             split="test",
+            csv_interval_min=csv_interval_min,
+            pv_input_interval_min=pv_input_interval_min,
+            pv_input_len=pv_input_len,
+            pv_output_interval_min=pv_output_interval_min,
+            pv_output_len=pv_output_len,
             test_anchor_stride_min=test_anchor_stride_min,
             skyimg_window_size=skyimg_window_size,
             skyimg_time_resolution_min=skyimg_time_resolution_min,
@@ -704,14 +753,14 @@ def loader_test(
     return out
 
 
-def train_one_epoch(model, device, loader, criterion, optimizer):
+def train_one_epoch(model, device, loader, criterion, optimizer, max_batches: int | None = None):
     model.train()
     total_loss = 0.0
     n = 0
     num_batches = len(loader)
-    print('number of batches: ', num_batches)
+    print("number of batches: ", num_batches)
     for batch_idx, batch in enumerate(loader):
-        if batch_idx > 3000:
+        if max_batches is not None and batch_idx >= max_batches:
             break
         B = batch["dev_idx"].size(0)
         device_id = batch["dev_idx"].to(device)            # [B]
@@ -756,12 +805,13 @@ def evaluate(model, device, loader, criterion):
 
 
 def main():
+    h = _TRAINING_HPARAM_DEFAULTS
     parser = argparse.ArgumentParser(description="Train PV forecasting model")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=h["epochs"])
+    parser.add_argument("--lr", type=float, default=h["lr"])
+    parser.add_argument("--batch_size", type=int, default=h["batch_size"])
     parser.add_argument("--checkpoint_dir", type=str, default=None)
-    parser.add_argument("--save_every", type=int, default=5)
+    parser.add_argument("--save_every", type=int, default=h["save_every"])
     parser.add_argument(
         "--loader-test",
         action="store_true",
@@ -804,22 +854,42 @@ def main():
         help="With --loader-test: max batches per epoch (default: full epoch).",
     )
     parser.add_argument(
+        "--csv_interval_min",
+        type=int,
+        default=h["csv_interval_min"],
+        help="CSV row spacing in minutes (must divide pv_input/output intervals).",
+    )
+    parser.add_argument(
+        "--pv_input_interval_min",
+        type=int,
+        default=h["pv_input_interval_min"],
+        help="Minutes between consecutive PV input (X) samples.",
+    )
+    parser.add_argument(
+        "--pv_output_interval_min",
+        type=int,
+        default=h["pv_output_interval_min"],
+        help="Minutes between consecutive PV target (Y) samples.",
+    )
+    parser.add_argument("--pv_input_len", type=int, default=h["pv_input_len"], help="Input sequence length (X).")
+    parser.add_argument("--pv_output_len", type=int, default=h["pv_output_len"], help="Target sequence length (Y).")
+    parser.add_argument(
         "--test_anchor_stride_min",
         type=int,
-        default=DEFAULT_TEST_ANCHOR_STRIDE_MIN,
-        help="For split=test: minutes between consecutive eval anchors (multiple of CSV row interval, default 120).",
+        default=h["test_anchor_stride_min"],
+        help="For split=test: minutes between consecutive eval anchors (multiple of CSV row interval).",
     )
     parser.add_argument(
         "--skyimg_window_size",
         type=int,
-        default=30,
-        help="Number of sky images per history and per forecast sequence (default: 8).",
+        default=h["skyimg_window_size"],
+        help="Number of sky images per history and per forecast sequence.",
     )
     parser.add_argument(
         "--skyimg_time_resolution_min",
         type=int,
-        default=1,
-        help="Minutes between consecutive sky frames; default: same as PV X spacing (pv_input_interval_min, 5).",
+        default=h["skyimg_time_resolution_min"],
+        help="Minutes between consecutive sky frames (independent of PV input spacing).",
     )
     parser.add_argument(
         "--staimg_train_dir",
@@ -836,14 +906,38 @@ def main():
     parser.add_argument(
         "--staimg_window_size",
         type=int,
-        default=24,
-        help="Number of Himawari NPY frames per history and per forecast sequence (default: 8).",
+        default=h["staimg_window_size"],
+        help="Number of Himawari NPY frames per history and per forecast sequence.",
     )
     parser.add_argument(
         "--staimg_time_resolution_min",
         type=int,
-        default=10,
-        help="Minutes between consecutive staimg frames in UTC (default: 10).",
+        default=h["staimg_time_resolution_min"],
+        help="Minutes between consecutive staimg frames in UTC.",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=h["num_workers"],
+        help="DataLoader worker processes.",
+    )
+    parser.add_argument(
+        "--train_max_batches_per_epoch",
+        type=int,
+        default=h["train_max_batches_per_epoch"],
+        help="Stop each training epoch after this many batches (default from conf; null = no cap).",
+    )
+    parser.add_argument(
+        "--loader_test_batch_size",
+        type=int,
+        default=h["loader_test_batch_size"],
+        help="With --loader-test: batch size (default from conf).",
+    )
+    parser.add_argument(
+        "--loader_test_num_workers",
+        type=int,
+        default=h["loader_test_num_workers"],
+        help="With --loader-test: DataLoader num_workers (default from conf).",
     )
     args = parser.parse_args()
 
@@ -855,14 +949,20 @@ def main():
             skyimg_test_dir=args.skyimg_test_dir,
             staimg_train_dir=args.staimg_train_dir,
             staimg_test_dir=args.staimg_test_dir,
+            csv_interval_min=args.csv_interval_min,
+            pv_input_interval_min=args.pv_input_interval_min,
+            pv_input_len=args.pv_input_len,
+            pv_output_interval_min=args.pv_output_interval_min,
+            pv_output_len=args.pv_output_len,
             test_anchor_stride_min=args.test_anchor_stride_min,
             skyimg_window_size=args.skyimg_window_size,
             skyimg_time_resolution_min=args.skyimg_time_resolution_min,
             staimg_window_size=args.staimg_window_size,
             staimg_time_resolution_min=args.staimg_time_resolution_min,
-            batch_size=args.batch_size,
+            batch_size=args.loader_test_batch_size,
             epochs=args.loader_test_epochs,
             max_batches=args.loader_test_max_batches,
+            num_workers=args.loader_test_num_workers,
         )
         return
 
@@ -883,6 +983,11 @@ def main():
         skyimg_dir=args.skyimg_train_dir,
         staimg_dir=args.staimg_train_dir,
         split="train",
+        csv_interval_min=args.csv_interval_min,
+        pv_input_interval_min=args.pv_input_interval_min,
+        pv_input_len=args.pv_input_len,
+        pv_output_interval_min=args.pv_output_interval_min,
+        pv_output_len=args.pv_output_len,
         test_anchor_stride_min=args.test_anchor_stride_min,
         skyimg_window_size=args.skyimg_window_size,
         skyimg_time_resolution_min=args.skyimg_time_resolution_min,
@@ -894,6 +999,11 @@ def main():
         skyimg_dir=args.skyimg_test_dir,
         staimg_dir=args.staimg_test_dir,
         split="test",
+        csv_interval_min=args.csv_interval_min,
+        pv_input_interval_min=args.pv_input_interval_min,
+        pv_input_len=args.pv_input_len,
+        pv_output_interval_min=args.pv_output_interval_min,
+        pv_output_len=args.pv_output_len,
         test_anchor_stride_min=args.test_anchor_stride_min,
         skyimg_window_size=args.skyimg_window_size,
         skyimg_time_resolution_min=args.skyimg_time_resolution_min,
@@ -906,14 +1016,14 @@ def main():
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_batched,
-        num_workers=24,
+        num_workers=args.num_workers,
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_batched,
-        num_workers=24,
+        num_workers=args.num_workers,
     )
 
     checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else _PROJECT_ROOT / "checkpoints"
@@ -923,7 +1033,14 @@ def main():
     print(f"Initial test loss: {initial_test_loss:.6f}")
 
     for epoch in range(1, args.epochs + 1):
-        avg_loss = train_one_epoch(model, device, train_loader, criterion, optimizer)
+        avg_loss = train_one_epoch(
+            model,
+            device,
+            train_loader,
+            criterion,
+            optimizer,
+            max_batches=args.train_max_batches_per_epoch,
+        )
         test_loss = evaluate(model, device, test_loader, criterion)
         print(f"Epoch {epoch}/{args.epochs}  train_loss={avg_loss:.6f}  test_loss={test_loss:.6f}")
 
