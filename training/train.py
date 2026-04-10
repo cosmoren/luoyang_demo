@@ -560,15 +560,7 @@ class PVDataset(Dataset):
             "target_pv": target_pv,
             "target_mask": target_mask,
             "history_skyimg": history_skyimg,
-            "forecast_skyimg": forecast_skyimg,
             "history_staimg": history_staimg,
-            "forecast_staimg": forecast_staimg,
-            "x_last_collect_time": str(pd.Timestamp(t_x_end)),
-            "y_first_collect_time": str(pd.Timestamp(t_y0)),
-            "history_sky_ts": history_sky_ts,
-            "forecast_sky_ts": forecast_sky_ts,
-            "history_staimg_ts": history_staimg_ts,
-            "forecast_staimg_ts": forecast_staimg_ts,
         }
 
     def __getitem__(self, idx):
@@ -627,15 +619,7 @@ def collate_batched(batch):
         "target_pv": torch.stack([s["target_pv"] for s in batch]),
         "target_mask": torch.stack([s["target_mask"] for s in batch]),
         "history_skyimg": torch.stack([s["history_skyimg"] for s in batch]),
-        "forecast_skyimg": torch.stack([s["forecast_skyimg"] for s in batch]),
         "history_staimg": torch.stack([s["history_staimg"] for s in batch]),
-        "forecast_staimg": torch.stack([s["forecast_staimg"] for s in batch]),
-        "x_last_collect_time": tuple(s["x_last_collect_time"] for s in batch),
-        "y_first_collect_time": tuple(s["y_first_collect_time"] for s in batch),
-        "history_sky_ts": tuple(s["history_sky_ts"] for s in batch),
-        "forecast_sky_ts": tuple(s["forecast_sky_ts"] for s in batch),
-        "history_staimg_ts": tuple(s["history_staimg_ts"] for s in batch),
-        "forecast_staimg_ts": tuple(s["forecast_staimg_ts"] for s in batch),
     }
 
 
