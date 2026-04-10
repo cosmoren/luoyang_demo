@@ -208,16 +208,14 @@ class PVDataset(Dataset):
     fixed on a grid every ``test_anchor_stride_min`` minutes along the CSV row axis (no Y validity
     filter). All files with the same row count share the same ``num_test_windows``.
 
-    Sky images (under ``data_dir`` / ``sky_image_{train,test}_path``, ``YYYYMMDDHHMMSS_12.jpg``): history sequence
-    ends at the last X ``collectTime``; forecast sequence starts at the first Y ``collectTime``;
-    step size is ``skyimg_time_resolution_min`` (independent of PV CSV spacing).
-    Missing files → black ``(3, H, W)`` tensors resized to ``training.skyimg_spatial_size``.
+    Sky images (under ``data_dir`` / ``sky_image_{train,test}_path``, ``YYYYMMDDHHMMSS_12.jpg``): history
+    sequence ends at the last X ``collectTime``; step size is ``skyimg_time_resolution_min`` (independent
+    of PV CSV spacing). Missing files → black ``(3, H, W)`` tensors resized to ``training.skyimg_spatial_size``.
 
     Himawari NPY (``staimg``): names ``NC_H09_YYYYMMDD_HHMM_L2CLP010_FLDK.02401_02401.npy`` with
     ``YYYYMMDD_HHMM`` in UTC; ``collectTime`` is interpreted as Asia/Shanghai local, converted to UTC,
-    then floored to 10-minute boundaries for the key timestep. History/forecast windows step in UTC
-    (sizes from ``conf.yaml`` ``training``). Arrays are float32 HWC per ``training.staimg_npy_shape_hwc``;
-    missing files → zeros.
+    then floored to 10-minute boundaries. History sequence steps backward in UTC (sizes from ``conf.yaml``
+    ``training``). Arrays are float32 HWC per ``training.staimg_npy_shape_hwc``; missing files → zeros.
     """
 
     def __init__(
@@ -401,11 +399,6 @@ class PVDataset(Dataset):
             t_end - timedelta(minutes=(w - 1 - i) * self._skyimg_dt_min) for i in range(w)
         ]
 
-    def _forecast_sky_frame_times(self, t_start: pd.Timestamp) -> list[pd.Timestamp]:
-        t_start = self._sky_collect_ts_local(t_start)
-        w = self.skyimg_window_size
-        return [t_start + timedelta(minutes=i * self._skyimg_dt_min) for i in range(w)]
-
     def _stack_sky_frames(self, frame_times: list[pd.Timestamp]) -> torch.Tensor:
         return torch.stack(
             [self._load_sky_tensor(self._sky_jpg_path(t)) for t in frame_times], dim=0
@@ -454,14 +447,6 @@ class PVDataset(Dataset):
             self._staimg_floor_utc_10min(
                 t_end_utc - timedelta(minutes=(w - 1 - i) * self._staimg_dt_min)
             )
-            for i in range(w)
-        ]
-
-    def _forecast_staimg_frame_utc_times(self, t_start_raw) -> list[pd.Timestamp]:
-        t0_utc = self._staimg_utc_key_time(t_start_raw)
-        w = self.staimg_window_size
-        return [
-            self._staimg_floor_utc_10min(t0_utc + timedelta(minutes=i * self._staimg_dt_min))
             for i in range(w)
         ]
 
@@ -536,20 +521,10 @@ class PVDataset(Dataset):
         target_mask = torch.from_numpy((inv_y == VALID_STATE).astype(np.float32))
 
         t_x_end = sub_x["collectTime"].iloc[-1]
-        t_y0 = sub_y["collectTime"].iloc[0]
         history_frame_times = self._history_sky_frame_times(t_x_end)
-        forecast_frame_times = self._forecast_sky_frame_times(t_y0)
         history_skyimg = self._stack_sky_frames(history_frame_times)
-        forecast_skyimg = self._stack_sky_frames(forecast_frame_times)
-        history_sky_ts = [t.strftime("%Y%m%d%H%M%S") for t in history_frame_times]
-        forecast_sky_ts = [t.strftime("%Y%m%d%H%M%S") for t in forecast_frame_times]
-
         history_staimg_utc = self._history_staimg_frame_utc_times(t_x_end)
-        forecast_staimg_utc = self._forecast_staimg_frame_utc_times(t_y0)
         history_staimg = self._stack_staimg_frames(history_staimg_utc)
-        forecast_staimg = self._stack_staimg_frames(forecast_staimg_utc)
-        history_staimg_ts = [t.strftime("%Y%m%d%H%M") for t in history_staimg_utc]
-        forecast_staimg_ts = [t.strftime("%Y%m%d%H%M") for t in forecast_staimg_utc]
 
         return {
             "dev_idx": dev_idx,
