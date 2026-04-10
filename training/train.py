@@ -22,7 +22,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 from config_utils import get_resolved_paths
 from models.models import pv_forecasting_model
-from training.data_loader import (
+from datasets.data_loader import (
     INVERTER_STATE_COL,
     VALID_STATE,
     list_csv_files,
