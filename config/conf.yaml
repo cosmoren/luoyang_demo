@@ -57,8 +57,10 @@ training:
   # Sky / Himawari stacks
   skyimg_window_size: 30 # the newest frame has aligned time with the last PV output row
   skyimg_time_resolution_min: 1
+  skyimg_spatial_size: 224 # H=W after resize for model input
   staimg_window_size: 24 # the newest frame has aligned time with the last PV output row
   staimg_time_resolution_min: 10 # multiple of 10
+  staimg_npy_shape_hwc: [100, 100, 3] # expected np.load array layout (height, width, channels)
   # Optimization and training loop
   epochs: 50
   lr: 0.001

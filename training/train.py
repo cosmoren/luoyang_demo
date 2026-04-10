@@ -31,30 +31,30 @@ from training.data_loader import (
 from datetime import timedelta
 
 CONF_PATH = _PROJECT_ROOT / "config" / "conf.yaml"
-SKYIMG_SPATIAL_SIZE = 224
-STAIMG_NPY_SHAPE_HWC = (100, 100, 3)
 
-BASE_TRAINING_HPARAMS: dict = {
-    "csv_interval_min": 5,
-    "pv_input_interval_min": 5,
-    "pv_output_interval_min": 15,
-    "pv_input_len": 576,
-    "pv_output_len": 192,
-    "test_anchor_stride_min": 120,
-    "skyimg_window_size": 30,
-    "skyimg_time_resolution_min": 1,
-    "staimg_window_size": 24,
-    "staimg_time_resolution_min": 10,
-    "epochs": 50,
-    "lr": 1e-3,
-    "batch_size": 16,
-    "save_every": 5,
-    "num_workers": 24,
-    "train_max_batches_per_epoch": None,
-    "loader_test_batch_size": 4,
-    "loader_test_num_workers": 0,
-}
-ALLOWED_TRAINING_HPARAM_KEYS = frozenset(BASE_TRAINING_HPARAMS.keys())
+# Every key must appear under ``training:`` in conf.yaml (values may be null where allowed).
+TRAINING_HPARAM_KEYS = frozenset({
+    "csv_interval_min",
+    "pv_input_interval_min",
+    "pv_output_interval_min",
+    "pv_input_len",
+    "pv_output_len",
+    "test_anchor_stride_min",
+    "skyimg_window_size",
+    "skyimg_time_resolution_min",
+    "skyimg_spatial_size",
+    "staimg_window_size",
+    "staimg_time_resolution_min",
+    "staimg_npy_shape_hwc",
+    "epochs",
+    "lr",
+    "batch_size",
+    "save_every",
+    "num_workers",
+    "train_max_batches_per_epoch",
+    "loader_test_batch_size",
+    "loader_test_num_workers",
+})
 
 
 def load_config():
@@ -64,17 +64,36 @@ def load_config():
 
 
 def get_training_hparams_from_conf(conf: dict | None = None) -> dict:
-    """Merge ``conf['training']`` into :data:`BASE_TRAINING_HPARAMS` (unknown keys ignored)."""
+    """Load ``conf['training']``; every :data:`TRAINING_HPARAM_KEYS` entry must be set in YAML."""
     if conf is None:
         conf = load_config()
-    out = dict(BASE_TRAINING_HPARAMS)
     raw = conf.get("training")
-    if isinstance(raw, dict):
-        for k, v in raw.items():
-            if k in ALLOWED_TRAINING_HPARAM_KEYS:
-                out[k] = v
+    if not isinstance(raw, dict):
+        raise ValueError("conf.yaml must define a non-empty 'training:' mapping")
+    missing = sorted(TRAINING_HPARAM_KEYS - raw.keys())
+    if missing:
+        raise KeyError(
+            "conf training section missing required key(s): "
+            + ", ".join(missing)
+            + " (see TRAINING_HPARAM_KEYS in train.py)"
+        )
+    out = {k: raw[k] for k in TRAINING_HPARAM_KEYS}
     if isinstance(out["lr"], str):
         out["lr"] = float(out["lr"])
+
+    ss = out["skyimg_spatial_size"]
+    if not isinstance(ss, int) or isinstance(ss, bool) or ss < 1:
+        raise ValueError("training.skyimg_spatial_size must be a positive integer")
+    out["skyimg_spatial_size"] = int(ss)
+
+    shwc = out["staimg_npy_shape_hwc"]
+    if not isinstance(shwc, (list, tuple)) or len(shwc) != 3:
+        raise ValueError("training.staimg_npy_shape_hwc must be a length-3 sequence [H, W, C]")
+    t = tuple(int(x) for x in shwc)
+    if any(x < 1 for x in t):
+        raise ValueError("training.staimg_npy_shape_hwc entries must be positive")
+    out["staimg_npy_shape_hwc"] = t
+
     return out
 
 
@@ -194,12 +213,13 @@ class PVDataset(Dataset):
     Sky images (under ``data_dir`` / ``sky_image_{train,test}_path``, ``YYYYMMDDHHMMSS_12.jpg``): history sequence
     ends at the last X ``collectTime``; forecast sequence starts at the first Y ``collectTime``;
     step size is ``skyimg_time_resolution_min`` (independent of PV CSV spacing).
-    Missing files → black ``(3, H, W)`` tensors resized to ``SKYIMG_SPATIAL_SIZE``.
+    Missing files → black ``(3, H, W)`` tensors resized to ``training.skyimg_spatial_size``.
 
     Himawari NPY (``staimg``): names ``NC_H09_YYYYMMDD_HHMM_L2CLP010_FLDK.02401_02401.npy`` with
     ``YYYYMMDD_HHMM`` in UTC; ``collectTime`` is interpreted as Asia/Shanghai local, converted to UTC,
     then floored to 10-minute boundaries for the key timestep. History/forecast windows step in UTC
-    (sizes from ``conf.yaml`` ``training``). Arrays are float32 ``(100,100,3)`` HWC; missing files → zeros.
+    (sizes from ``conf.yaml`` ``training``). Arrays are float32 HWC per ``training.staimg_npy_shape_hwc``;
+    missing files → zeros.
     """
 
     def __init__(
@@ -217,8 +237,10 @@ class PVDataset(Dataset):
         test_anchor_stride_min: int = _TRAINING_HPARAM_DEFAULTS["test_anchor_stride_min"],
         skyimg_window_size: int = _TRAINING_HPARAM_DEFAULTS["skyimg_window_size"],
         skyimg_time_resolution_min: int = _TRAINING_HPARAM_DEFAULTS["skyimg_time_resolution_min"],
+        skyimg_spatial_size: int = _TRAINING_HPARAM_DEFAULTS["skyimg_spatial_size"],
         staimg_window_size: int = _TRAINING_HPARAM_DEFAULTS["staimg_window_size"],
         staimg_time_resolution_min: int = _TRAINING_HPARAM_DEFAULTS["staimg_time_resolution_min"],
+        staimg_npy_shape_hwc: tuple[int, int, int] = _TRAINING_HPARAM_DEFAULTS["staimg_npy_shape_hwc"],
     ):
         if split not in ("train", "test"):
             raise ValueError("split must be 'train' or 'test'")
@@ -242,6 +264,12 @@ class PVDataset(Dataset):
             raise ValueError("skyimg_time_resolution_min must be positive")
         self._skyimg_dt_min = skyimg_time_resolution_min
         self._skyimg_dir = Path(skyimg_dir).resolve()
+        if skyimg_spatial_size < 1:
+            raise ValueError("skyimg_spatial_size must be >= 1")
+        self._skyimg_spatial_size = int(skyimg_spatial_size)
+        if len(staimg_npy_shape_hwc) != 3 or any(x < 1 for x in staimg_npy_shape_hwc):
+            raise ValueError("staimg_npy_shape_hwc must be three positive ints (H, W, C)")
+        self._staimg_npy_shape_hwc = tuple(int(x) for x in staimg_npy_shape_hwc)
         if staimg_time_resolution_min <= 0:
             raise ValueError("staimg_time_resolution_min must be positive")
         self._staimg_dt_min = staimg_time_resolution_min
@@ -348,7 +376,8 @@ class PVDataset(Dataset):
         return self._skyimg_dir / f"{stem}.jpg"
 
     def _black_sky_tensor(self) -> torch.Tensor:
-        return torch.zeros((3, SKYIMG_SPATIAL_SIZE, SKYIMG_SPATIAL_SIZE), dtype=torch.float32)
+        s = self._skyimg_spatial_size
+        return torch.zeros((3, s, s), dtype=torch.float32)
 
     def _load_sky_tensor(self, path: Path) -> torch.Tensor:
         try:
@@ -357,9 +386,10 @@ class PVDataset(Dataset):
                     resample = Image.Resampling.LANCZOS
                 except AttributeError:
                     resample = Image.LANCZOS
+                s = self._skyimg_spatial_size
                 with Image.open(path) as im:
                     im = im.convert("RGB")
-                    im = im.resize((SKYIMG_SPATIAL_SIZE, SKYIMG_SPATIAL_SIZE), resample)
+                    im = im.resize((s, s), resample)
                     arr = np.asarray(im, dtype=np.float32) / 255.0
                 return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
         except Exception:
@@ -406,14 +436,14 @@ class PVDataset(Dataset):
         return self._staimg_dir / f"{stem}.npy"
 
     def _dummy_staimg_tensor(self) -> torch.Tensor:
-        h, w, c = STAIMG_NPY_SHAPE_HWC
+        h, w, c = self._staimg_npy_shape_hwc
         return torch.zeros((c, h, w), dtype=torch.float32)
 
     def _load_staimg_tensor(self, path: Path) -> torch.Tensor:
         try:
             if path.is_file():
                 arr = np.load(path, allow_pickle=False)
-                if arr.shape == STAIMG_NPY_SHAPE_HWC and arr.dtype == np.float32:
+                if arr.shape == self._staimg_npy_shape_hwc and arr.dtype == np.float32:
                     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
         except Exception:
             pass
@@ -627,8 +657,10 @@ def loader_test(
     test_anchor_stride_min: int = _TRAINING_HPARAM_DEFAULTS["test_anchor_stride_min"],
     skyimg_window_size: int = _TRAINING_HPARAM_DEFAULTS["skyimg_window_size"],
     skyimg_time_resolution_min: int = _TRAINING_HPARAM_DEFAULTS["skyimg_time_resolution_min"],
+    skyimg_spatial_size: int = _TRAINING_HPARAM_DEFAULTS["skyimg_spatial_size"],
     staimg_window_size: int = _TRAINING_HPARAM_DEFAULTS["staimg_window_size"],
     staimg_time_resolution_min: int = _TRAINING_HPARAM_DEFAULTS["staimg_time_resolution_min"],
+    staimg_npy_shape_hwc: tuple[int, int, int] = _TRAINING_HPARAM_DEFAULTS["staimg_npy_shape_hwc"],
     batch_size: int = _TRAINING_HPARAM_DEFAULTS["loader_test_batch_size"],
     epochs: int = 1,
     max_batches: int | None = None,
@@ -663,8 +695,10 @@ def loader_test(
         test_anchor_stride_min=test_anchor_stride_min,
         skyimg_window_size=skyimg_window_size,
         skyimg_time_resolution_min=skyimg_time_resolution_min,
+        skyimg_spatial_size=skyimg_spatial_size,
         staimg_window_size=staimg_window_size,
         staimg_time_resolution_min=staimg_time_resolution_min,
+        staimg_npy_shape_hwc=staimg_npy_shape_hwc,
     )
     train_loader = DataLoader(
         train_dataset,
@@ -690,8 +724,10 @@ def loader_test(
             test_anchor_stride_min=test_anchor_stride_min,
             skyimg_window_size=skyimg_window_size,
             skyimg_time_resolution_min=skyimg_time_resolution_min,
+            skyimg_spatial_size=skyimg_spatial_size,
             staimg_window_size=staimg_window_size,
             staimg_time_resolution_min=staimg_time_resolution_min,
+            staimg_npy_shape_hwc=staimg_npy_shape_hwc,
         )
         test_loader = DataLoader(
             test_dataset,
@@ -892,6 +928,12 @@ def main():
         help="Minutes between consecutive sky frames (independent of PV input spacing).",
     )
     parser.add_argument(
+        "--skyimg_spatial_size",
+        type=int,
+        default=h["skyimg_spatial_size"],
+        help="Sky JPEG resize side length (square, pixels).",
+    )
+    parser.add_argument(
         "--staimg_train_dir",
         type=str,
         default=_TRAINING_PATH_DEFAULTS["staimg_train_dir"],
@@ -914,6 +956,14 @@ def main():
         type=int,
         default=h["staimg_time_resolution_min"],
         help="Minutes between consecutive staimg frames in UTC.",
+    )
+    parser.add_argument(
+        "--staimg_npy_shape_hwc",
+        type=int,
+        nargs=3,
+        default=list(h["staimg_npy_shape_hwc"]),
+        metavar=("H", "W", "C"),
+        help="Expected Himawari NPY array shape H W C (default from conf).",
     )
     parser.add_argument(
         "--num_workers",
@@ -940,6 +990,7 @@ def main():
         help="With --loader-test: DataLoader num_workers (default from conf).",
     )
     args = parser.parse_args()
+    staimg_hwc = tuple(args.staimg_npy_shape_hwc)
 
     if args.loader_test:
         loader_test(
@@ -957,8 +1008,10 @@ def main():
             test_anchor_stride_min=args.test_anchor_stride_min,
             skyimg_window_size=args.skyimg_window_size,
             skyimg_time_resolution_min=args.skyimg_time_resolution_min,
+            skyimg_spatial_size=args.skyimg_spatial_size,
             staimg_window_size=args.staimg_window_size,
             staimg_time_resolution_min=args.staimg_time_resolution_min,
+            staimg_npy_shape_hwc=staimg_hwc,
             batch_size=args.loader_test_batch_size,
             epochs=args.loader_test_epochs,
             max_batches=args.loader_test_max_batches,
@@ -991,8 +1044,10 @@ def main():
         test_anchor_stride_min=args.test_anchor_stride_min,
         skyimg_window_size=args.skyimg_window_size,
         skyimg_time_resolution_min=args.skyimg_time_resolution_min,
+        skyimg_spatial_size=args.skyimg_spatial_size,
         staimg_window_size=args.staimg_window_size,
         staimg_time_resolution_min=args.staimg_time_resolution_min,
+        staimg_npy_shape_hwc=staimg_hwc,
     )
     test_dataset = PVDataset(
         pv_dir=args.pv_test_dir,
@@ -1007,8 +1062,10 @@ def main():
         test_anchor_stride_min=args.test_anchor_stride_min,
         skyimg_window_size=args.skyimg_window_size,
         skyimg_time_resolution_min=args.skyimg_time_resolution_min,
+        skyimg_spatial_size=args.skyimg_spatial_size,
         staimg_window_size=args.staimg_window_size,
         staimg_time_resolution_min=args.staimg_time_resolution_min,
+        staimg_npy_shape_hwc=staimg_hwc,
     )
 
     train_loader = DataLoader(
