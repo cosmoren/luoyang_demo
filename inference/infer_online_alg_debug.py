@@ -13,7 +13,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 from config_utils import get_resolved_paths
 from preprocessing.himawari_infer import create_himawari_tensor
-from preprocessing.pv_infer import create_pv_dataframe
+from preprocessing.pv_infer import get_pv_data_ending_at
 from models.models import pv_forecasting_model
 import torch
 
@@ -25,6 +25,11 @@ TRIGGER_MINUTE = 55
 VALID_LAST_HOUR = 9
 VALID_LAST_MINUTE = 0
 FORECAST_CSV_DIR = Path(__file__).resolve().parent / "daily_forecast_csv"
+
+# Debug: history ends at this UTC instant; only ``YYYYMMDD_HHMM.csv`` files on the 5‑minute grid
+# up to and including this time are loaded (no scan for newer files in the folder).
+DEBUG_HISTORY_LAST_UTC = datetime(2026, 4, 12, 1, 0, tzinfo=timezone.utc)
+DEBUG_HISTORY_SPAN_MINUTES = 5
 
 
 def sleep_until_shanghai_0855_if_before() -> None:
@@ -192,9 +197,26 @@ class infer_online_alg:    # ckpt = torch.load(checkpoint_path, map_location=sel
         self.model.eval()
     
     def inference(self):
-        # Read the PV history data
-        timestamps, paths, pv_dict = create_pv_dataframe(path=self.pv_path, num=576)
-        timestamps = [t.replace(tzinfo=timezone.utc) if t.tzinfo is None else t for t in timestamps]
+        # PV: load only per-slot CSVs for the grid ending at DEBUG_HISTORY_LAST_UTC (no "latest file" scan).
+        timestamps, paths, pv_dict = get_pv_data_ending_at(
+            Path(self.pv_path),
+            DEBUG_HISTORY_LAST_UTC,
+            num=576,
+            time_span_minutes=DEBUG_HISTORY_SPAN_MINUTES,
+        )
+        if not timestamps:
+            raise RuntimeError(
+                "PV download path missing or empty; cannot run debug inference."
+            )
+        timestamps = [
+            t.replace(tzinfo=timezone.utc) if t.tzinfo is None else t.astimezone(timezone.utc)
+            for t in timestamps
+        ]
+        n_files = sum(1 for p in paths if p is not None)
+        print(
+            f"Debug PV: {n_files}/{len(paths)} history slots have CSV files "
+            f"(grid ends UTC {timestamps[-1]})"
+        )
         pv_solar_features = compute_solar_features(timestamps, self.latitude, self.longitude)
         pv_solar_features_array = []
         for pv_solar_feature in pv_solar_features:
@@ -273,25 +295,11 @@ class infer_online_alg:    # ckpt = torch.load(checkpoint_path, map_location=sel
 if __name__ == "__main__":
     checkpoint_path = _PROJECT_ROOT / "checkpoints" / "pv_forecast_epoch_10.pt"
     inference_online = infer_online_alg(checkpoint_path=str(checkpoint_path))
-
-    while True:
-        sleep_until_shanghai_0855_if_before()
-
-        while True:
-            pv_pred_dict = inference_online.inference()
-            sample_ts = next(iter(pv_pred_dict.values()))["timestamps"]
-            action = classify_last_history_shanghai(sample_ts)
-            if action == "save":
-                out_path = save_total_forecast_csv(pv_pred_dict, FORECAST_CSV_DIR)
-                print(f"Saved aggregated forecast: {out_path}")
-                break
-            if action == "skip_day":
-                print(
-                    "Last history is after 09:00 (Asia/Shanghai); "
-                    "skipping CSV and waiting for next day."
-                )
-                break
-
-            time.sleep(POLL_INTERVAL_SEC)
-
-        sleep_until_tomorrow_shanghai_0855()
+    pv_pred_dict = inference_online.inference()
+    sample = next(iter(pv_pred_dict.values()))
+    ts = sample["timestamps"]
+    print("Debug: last timestamps[-1] (UTC):", ts[-1])
+    print("pv_pred shape:", sample["pv_pred"].shape)
+    print("len(forecast_timestamps_utc):", len(sample["forecast_timestamps_utc"]))
+    out_path = save_total_forecast_csv(pv_pred_dict, FORECAST_CSV_DIR)
+    print(f"Saved aggregated forecast (dtime + predictions, sum over stations): {out_path}")
