@@ -17,7 +17,9 @@ TRAINING_HPARAM_KEYS = frozenset({
     "pv_output_interval_min",
     "pv_input_len",
     "pv_output_len",
+    "pv_train_time_fraction",
     "test_anchor_stride_min",
+    "test_collect_time_match_tolerance_min",
     "skyimg_window_size",
     "skyimg_time_resolution_min",
     "skyimg_spatial_size",
@@ -71,14 +73,33 @@ def get_training_hparams_from_conf(conf: dict | None = None) -> dict:
         raise ValueError("training.satimg_npy_shape_hwc entries must be positive")
     out["satimg_npy_shape_hwc"] = t
 
+    tf = out["pv_train_time_fraction"]
+    if isinstance(tf, str):
+        tf = float(tf)
+    if not isinstance(tf, (int, float)) or isinstance(tf, bool):
+        raise ValueError("training.pv_train_time_fraction must be a number in (0, 1)")
+    tf = float(tf)
+    if not (0.0 < tf < 1.0):
+        raise ValueError("training.pv_train_time_fraction must be strictly between 0 and 1")
+    out["pv_train_time_fraction"] = tf
+
+    tol = out["test_collect_time_match_tolerance_min"]
+    if isinstance(tol, str):
+        tol = int(float(tol))
+    if not isinstance(tol, int) or isinstance(tol, bool) or tol < 0:
+        raise ValueError("training.test_collect_time_match_tolerance_min must be a non-negative int (minutes)")
+    out["test_collect_time_match_tolerance_min"] = int(tol)
+
     return out
 
 
 def get_training_paths_from_conf(conf: dict | None = None, project_root: Path | None = None) -> dict[str, str]:
     """
-    Resolve PV CSV, sky image, and Himawari NPY dirs from ``conf.yaml`` ``paths``:
-    ``pv_train_path`` / ``pv_test_path``, ``sky_image_train_path`` / ``sky_image_test_path``,
-    and ``sat_*`` as direct children of ``data_dir``.
+    Resolve PV CSV, sky JPEG, and Himawari NPY dirs under ``paths.data_dir``.
+
+    Required ``paths`` keys (relative to ``data_dir``; train and eval use the same roots):
+
+    ``pv_path``, ``sky_image_path``, ``sat_path``.
     """
     if conf is None:
         conf = load_config()
@@ -95,18 +116,15 @@ def get_training_paths_from_conf(conf: dict | None = None, project_root: Path | 
             raise KeyError(f"conf paths.{key} is required")
         return str(v)
 
-    pv_train = (data_dir / _req("pv_train_path")).resolve()
-    pv_test = (data_dir / _req("pv_test_path")).resolve()
-    sky_train = (data_dir / _req("sky_image_train_path")).resolve()
-    sky_test = (data_dir / _req("sky_image_test_path")).resolve()
-    sat_train = (data_dir / _req("sat_train_path")).resolve()
-    sat_test = (data_dir / _req("sat_test_path")).resolve()
+    pv_dir = (data_dir / _req("pv_path")).resolve()
+    sky_dir = (data_dir / _req("sky_image_path")).resolve()
+    sat_dir = (data_dir / _req("sat_path")).resolve()
 
     return {
-        "pv_train_dir": str(pv_train),
-        "pv_test_dir": str(pv_test),
-        "skyimg_train_dir": str(sky_train),
-        "skyimg_test_dir": str(sky_test),
-        "satimg_train_dir": str(sat_train),
-        "satimg_test_dir": str(sat_test),
+        "pv_train_dir": str(pv_dir),
+        "pv_test_dir": str(pv_dir),
+        "skyimg_train_dir": str(sky_dir),
+        "skyimg_test_dir": str(sky_dir),
+        "satimg_train_dir": str(sat_dir),
+        "satimg_test_dir": str(sat_dir),
     }

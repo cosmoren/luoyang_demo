@@ -42,14 +42,22 @@ _TRAINING_PATH_DEFAULTS, _TRAINING_HPARAM_DEFAULTS = _load_training_defaults()
 
 class PVDataset(Dataset):
     """
-    Train: ``__len__`` = number of CSVs; ``__getitem__`` picks a **random** anchor where Y has at
+    **Chronological split (per CSV, same for all files sharing the reference row count):** row indices
+    ``[0, split_idx)`` are the train segment, ``[split_idx, n)`` the test segment, with
+    ``split_idx = int(n * pv_train_time_fraction)``. An anchor is used for **train** only if the full
+    X+Y window lies in the train segment (last Y row ``< split_idx``); for **test** only if the full
+    window lies in the test segment (first X row ``>= split_idx``). Sky/sat are still loaded by
+    timestamp for each sample.
+
+    Train: ``__len__`` = number of CSVs; ``__getitem__`` picks a **random** train-segment anchor where Y has at
     least one ``inverter_state == VALID_STATE``.
 
-    Test (``split="test"``): ``__len__`` = ``len(sample_files) * num_test_windows``; anchors are
-    fixed on a grid every ``test_anchor_stride_min`` minutes along the CSV row axis (no Y validity
-    filter). All files with the same row count share the same ``num_test_windows``.
+    Test (``split="test"``): ``__len__`` = ``len(sample_files) * num_test_windows``; test-segment anchors are
+    subsampled every ``test_anchor_stride_min`` along the CSV row axis (no Y validity filter). For each test
+    window, the **reference** last-X ``collectTime`` is stored; each inverter CSV resolves the row index that
+    matches that time (within ``test_collect_time_match_tolerance_min``) so all devices share the same wall times.
 
-    Sky images (under ``data_dir`` / ``sky_image_{train,test}_path``, ``YYYYMMDDHHMMSS_12.jpg``): history sequence
+    Sky images (under ``data_dir`` / ``paths.sky_image_path``, ``YYYYMMDDHHMMSS_12.jpg``): history sequence
     ends at the last X ``collectTime``; forecast sequence starts at the first Y ``collectTime``;
     step size is ``skyimg_time_resolution_min`` (independent of PV CSV spacing).
     Missing files → black ``(3, H, W)`` tensors resized to ``training.skyimg_spatial_size``.
@@ -73,7 +81,11 @@ class PVDataset(Dataset):
         pv_input_len: int = _TRAINING_HPARAM_DEFAULTS["pv_input_len"],
         pv_output_interval_min: int = _TRAINING_HPARAM_DEFAULTS["pv_output_interval_min"],
         pv_output_len: int = _TRAINING_HPARAM_DEFAULTS["pv_output_len"],
+        pv_train_time_fraction: float = _TRAINING_HPARAM_DEFAULTS["pv_train_time_fraction"],
         test_anchor_stride_min: int = _TRAINING_HPARAM_DEFAULTS["test_anchor_stride_min"],
+        test_collect_time_match_tolerance_min: int = _TRAINING_HPARAM_DEFAULTS[
+            "test_collect_time_match_tolerance_min"
+        ],
         skyimg_window_size: int = _TRAINING_HPARAM_DEFAULTS["skyimg_window_size"],
         skyimg_time_resolution_min: int = _TRAINING_HPARAM_DEFAULTS["skyimg_time_resolution_min"],
         skyimg_spatial_size: int = _TRAINING_HPARAM_DEFAULTS["skyimg_spatial_size"],
@@ -99,6 +111,10 @@ class PVDataset(Dataset):
         self.pv_input_len = pv_input_len
         self.pv_output_len = pv_output_len
         self.pv_output_interval_min = pv_output_interval_min
+        tf = float(pv_train_time_fraction)
+        if not (0.0 < tf < 1.0):
+            raise ValueError("pv_train_time_fraction must be strictly between 0 and 1")
+        self._pv_train_time_fraction = tf
         if skyimg_time_resolution_min <= 0:
             raise ValueError("skyimg_time_resolution_min must be positive")
         self._skyimg_dt_min = skyimg_time_resolution_min
@@ -119,6 +135,11 @@ class PVDataset(Dataset):
                 f"(got {test_anchor_stride_min}, csv_interval_min={csv_interval_min})"
             )
         self._test_anchor_stride_rows = test_anchor_stride_min // csv_interval_min
+        tol_m = int(test_collect_time_match_tolerance_min)
+        if tol_m < 0:
+            raise ValueError("test_collect_time_match_tolerance_min must be >= 0")
+        self._test_collect_time_match_tolerance_min = tol_m
+        self._test_collect_tolerance_ns = tol_m * 60 * 1_000_000_000
 
         with open(CONF_PATH) as f:
             conf = yaml.safe_load(f)
@@ -132,7 +153,7 @@ class PVDataset(Dataset):
         pv_device_df = pd.read_excel(pv_device_path)
         self.devDn_list = pv_device_df["devDn"].dropna().unique().tolist()
 
-        self.sample_files = list_csv_files(0, 625, data_dir=pv_dir)
+        self.sample_files = list_csv_files(data_dir=pv_dir)
         if not self.sample_files:
             raise FileNotFoundError(f"No CSV files in {pv_dir!r}")
 
@@ -154,19 +175,52 @@ class PVDataset(Dataset):
         self._csv_row_count = n
         self._y_idx_per_anchor = anchors[:, None] + y_off[None, :]
         self._x_idx_per_anchor = anchors[:, None] + x_tail
+        self._x_tail_1d = (-(lx - 1) * sx + np.arange(lx, dtype=np.intp) * sx).astype(np.intp, copy=False)
+        self._y_off_1d = (sy + np.arange(ly, dtype=np.intp) * sy).astype(np.intp, copy=False)
+
+        split_idx = int(n * self._pv_train_time_fraction)
+        if split_idx <= 0 or split_idx >= n:
+            raise ValueError(
+                f"pv_train_time_fraction={self._pv_train_time_fraction} gives split_idx={split_idx} for n={n}; "
+                "need 0 < split_idx < n"
+            )
+        min_row = anchors - (lx - 1) * sx
+        max_row = anchors + ly * sy
+        self._train_anchor_mask = max_row < split_idx
+        self._test_anchor_mask = min_row >= split_idx
+        if self.split == "train" and not bool(self._train_anchor_mask.any()):
+            raise RuntimeError(
+                f"split=train: no anchor fits entirely in the first {split_idx} rows "
+                f"(pv_train_time_fraction={self._pv_train_time_fraction}); shorten windows or adjust fraction"
+            )
+        if self.split == "test" and not bool(self._test_anchor_mask.any()):
+            raise RuntimeError(
+                f"split=test: no anchor fits entirely from row {split_idx} onward; "
+                "adjust pv_train_time_fraction or window lengths"
+            )
 
         n_anchors = len(anchors)
-        self._test_r_indices = np.arange(
-            0, n_anchors, self._test_anchor_stride_rows, dtype=np.intp
-        )
+        test_anchor_positions = np.nonzero(self._test_anchor_mask)[0]
+        stride = self._test_anchor_stride_rows
+        self._test_r_indices = test_anchor_positions[::stride].astype(np.intp, copy=False)
         self._num_test_windows = int(self._test_r_indices.size)
         if self.split == "test" and self._num_test_windows == 0:
-            raise RuntimeError("split=test: stride leaves no anchor indices (increase data or reduce stride)")
+            raise RuntimeError(
+                "split=test: no test anchors after time split and stride "
+                "(reduce test_anchor_stride_min or widen the test segment)"
+            )
+
+        if self.split == "test":
+            last_x_rows = anchors[self._test_r_indices]
+            ct_ref = pd.to_datetime(ref_df["collectTime"], errors="coerce")
+            if ct_ref.isna().any():
+                raise ValueError(f"reference CSV {self.sample_files[0].name}: NaT in collectTime")
+            self._test_last_x_time_ref = [pd.Timestamp(ct_ref.iloc[int(row)]) for row in last_x_rows]
+        else:
+            self._test_last_x_time_ref = None
 
         valid_files: list[Path] = []
         for i, p in enumerate(self.sample_files):
-            if i>5:
-                break
             print(f"Processing file {i+1} of {len(self.sample_files)}: {p.name}")
             df = ref_df if i == 0 else load_csv(p)
             if len(df) != n:
@@ -178,7 +232,8 @@ class PVDataset(Dataset):
                     pd.to_numeric(df[INVERTER_STATE_COL], errors="coerce").fillna(0).astype(int).values
                     == VALID_STATE
                 )
-                if inv[self._y_idx_per_anchor].any(axis=1).any():
+                ok = inv[self._y_idx_per_anchor].any(axis=1) & self._train_anchor_mask
+                if ok.any():
                     valid_files.append(p)
             else:
                 valid_files.append(p)
@@ -202,6 +257,48 @@ class PVDataset(Dataset):
         if self.split == "train":
             return len(self.sample_files)
         return len(self.sample_files) * self._num_test_windows
+
+    def _row_index_for_collect_time_match(
+        self,
+        collect_time: pd.Series,
+        target_ts: pd.Timestamp,
+        csv_name: str,
+    ) -> int:
+        """Map ``collect_time`` row to index whose timestamp is nearest ``target_ts`` within tolerance (ns)."""
+        ct = pd.to_datetime(collect_time, errors="coerce")
+        if bool(ct.isna().any()):
+            raise ValueError(f"{csv_name}: NaT in collectTime")
+        if not bool(ct.is_monotonic_increasing):
+            raise ValueError(f"{csv_name}: collectTime must be sorted non-decreasing for test alignment")
+        times_ns = ct.to_numpy(dtype="datetime64[ns]").astype(np.int64)
+        tgt = pd.Timestamp(target_ts)
+        if tgt.tzinfo is not None:
+            tgt = tgt.tz_convert("UTC").tz_localize(None)
+        tgt_ns = np.datetime64(tgt.to_datetime64(), "ns").astype(np.int64)
+
+        pos = int(np.searchsorted(times_ns, tgt_ns, side="left"))
+        candidates: list[int] = []
+        if pos > 0:
+            candidates.append(pos - 1)
+        if pos < len(times_ns):
+            candidates.append(pos)
+        if not candidates:
+            raise RuntimeError(f"{csv_name}: empty collectTime series")
+
+        best_j = candidates[0]
+        best_d = abs(int(times_ns[best_j] - tgt_ns))
+        for j in candidates[1:]:
+            d = abs(int(times_ns[j] - tgt_ns))
+            if d < best_d:
+                best_d = d
+                best_j = j
+
+        if best_d > self._test_collect_tolerance_ns:
+            raise ValueError(
+                f"{csv_name}: no collectTime within {self._test_collect_time_match_tolerance_min} min of "
+                f"{target_ts!r} (nearest row {best_j}, delta_ns={best_d})"
+            )
+        return int(best_j)
 
     @staticmethod
     def _to_utc_timestamps(values, *, naive_tz: str) -> list[pd.Timestamp]:
@@ -351,9 +448,26 @@ class PVDataset(Dataset):
             dim=0,
         )
 
-    def _build_sample(self, df: pd.DataFrame, dev_idx: torch.Tensor, r: int) -> dict:
-        x_idx = self._x_idx_per_anchor[r]
-        y_idx_1d = self._y_idx_per_anchor[r]
+    def _build_sample(
+        self,
+        df: pd.DataFrame,
+        dev_idx: torch.Tensor,
+        r: int,
+        *,
+        anchor_last_row: int | None = None,
+    ) -> dict:
+        if anchor_last_row is not None:
+            j = int(anchor_last_row)
+            x_idx = j + self._x_tail_1d
+            y_idx_1d = j + self._y_off_1d
+            if int(x_idx[0]) < 0 or int(y_idx_1d[-1]) >= len(df):
+                raise ValueError(
+                    f"anchor_last_row={j} out of bounds for len(df)={len(df)} "
+                    f"(x_idx range [{int(x_idx[0])}, {int(x_idx[-1])}], y_idx range [{int(y_idx_1d[0])}, {int(y_idx_1d[-1])}])"
+                )
+        else:
+            x_idx = self._x_idx_per_anchor[r]
+            y_idx_1d = self._y_idx_per_anchor[r]
         sub_x = df.iloc[x_idx]
         sub_y = df.iloc[y_idx_1d]
 
@@ -452,7 +566,7 @@ class PVDataset(Dataset):
                 pd.to_numeric(df[INVERTER_STATE_COL], errors="coerce").fillna(0).astype(int).values
                 == VALID_STATE
             )
-            valid_mask = inv[self._y_idx_per_anchor].any(axis=1)
+            valid_mask = inv[self._y_idx_per_anchor].any(axis=1) & self._train_anchor_mask
             valid_rows = np.nonzero(valid_mask)[0]
             if valid_rows.size == 0:
                 raise RuntimeError(
@@ -462,7 +576,11 @@ class PVDataset(Dataset):
             r = int(np.random.choice(valid_rows))
         else:
             assert r_fixed is not None
-            r = r_fixed
+            assert self._test_last_x_time_ref is not None
+            k = idx % self._num_test_windows
+            T_ref = self._test_last_x_time_ref[k]
+            j = self._row_index_for_collect_time_match(df["collectTime"], T_ref, sample_path.name)
+            return self._build_sample(df, dev_idx, r_fixed, anchor_last_row=j)
 
         return self._build_sample(df, dev_idx, r)
 
@@ -510,7 +628,11 @@ def loader_test(
     pv_input_len: int = _TRAINING_HPARAM_DEFAULTS["pv_input_len"],
     pv_output_interval_min: int = _TRAINING_HPARAM_DEFAULTS["pv_output_interval_min"],
     pv_output_len: int = _TRAINING_HPARAM_DEFAULTS["pv_output_len"],
+    pv_train_time_fraction: float = _TRAINING_HPARAM_DEFAULTS["pv_train_time_fraction"],
     test_anchor_stride_min: int = _TRAINING_HPARAM_DEFAULTS["test_anchor_stride_min"],
+    test_collect_time_match_tolerance_min: int = _TRAINING_HPARAM_DEFAULTS[
+        "test_collect_time_match_tolerance_min"
+    ],
     skyimg_window_size: int = _TRAINING_HPARAM_DEFAULTS["skyimg_window_size"],
     skyimg_time_resolution_min: int = _TRAINING_HPARAM_DEFAULTS["skyimg_time_resolution_min"],
     skyimg_spatial_size: int = _TRAINING_HPARAM_DEFAULTS["skyimg_spatial_size"],
@@ -523,8 +645,8 @@ def loader_test(
     num_workers: int = _TRAINING_HPARAM_DEFAULTS["loader_test_num_workers"],
 ) -> dict:
     """
-    :class:`PVDataset` / ``DataLoader`` for ``train_data_dir`` and, if it differs from
-    ``test_data_dir`` after resolving paths, a second loader for the test folder.
+    Build train and test :class:`PVDataset` (time split via ``pv_train_time_fraction``) and run a few batches.
+    PV/sky/sat dirs may be the same; train vs test differ by ``split=`` and segment masks.
     """
     if epochs < 1:
         raise ValueError("epochs must be >= 1")
@@ -548,7 +670,9 @@ def loader_test(
         pv_input_len=pv_input_len,
         pv_output_interval_min=pv_output_interval_min,
         pv_output_len=pv_output_len,
+        pv_train_time_fraction=pv_train_time_fraction,
         test_anchor_stride_min=test_anchor_stride_min,
+        test_collect_time_match_tolerance_min=test_collect_time_match_tolerance_min,
         skyimg_window_size=skyimg_window_size,
         skyimg_time_resolution_min=skyimg_time_resolution_min,
         skyimg_spatial_size=skyimg_spatial_size,
@@ -564,43 +688,40 @@ def loader_test(
         num_workers=num_workers,
     )
 
-    test_dataset: PVDataset | None = None
-    test_loader: DataLoader | None = None
-    if pv_test_dir != pv_train_dir:
-        test_dataset = PVDataset(
-            pv_dir=pv_test_dir,
-            skyimg_dir=skyimg_test_dir,
-            satimg_dir=satimg_test_dir,
-            split="test",
-            csv_interval_min=csv_interval_min,
-            pv_input_interval_min=pv_input_interval_min,
-            pv_input_len=pv_input_len,
-            pv_output_interval_min=pv_output_interval_min,
-            pv_output_len=pv_output_len,
-            test_anchor_stride_min=test_anchor_stride_min,
-            skyimg_window_size=skyimg_window_size,
-            skyimg_time_resolution_min=skyimg_time_resolution_min,
-            skyimg_spatial_size=skyimg_spatial_size,
-            satimg_window_size=satimg_window_size,
-            satimg_time_resolution_min=satimg_time_resolution_min,
-            satimg_npy_shape_hwc=satimg_npy_shape_hwc,
-        )
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=collate_batched,
-            num_workers=num_workers,
-        )
+    test_dataset = PVDataset(
+        pv_dir=pv_test_dir,
+        skyimg_dir=skyimg_test_dir,
+        satimg_dir=satimg_test_dir,
+        split="test",
+        csv_interval_min=csv_interval_min,
+        pv_input_interval_min=pv_input_interval_min,
+        pv_input_len=pv_input_len,
+        pv_output_interval_min=pv_output_interval_min,
+        pv_output_len=pv_output_len,
+        pv_train_time_fraction=pv_train_time_fraction,
+        test_anchor_stride_min=test_anchor_stride_min,
+        test_collect_time_match_tolerance_min=test_collect_time_match_tolerance_min,
+        skyimg_window_size=skyimg_window_size,
+        skyimg_time_resolution_min=skyimg_time_resolution_min,
+        skyimg_spatial_size=skyimg_spatial_size,
+        satimg_window_size=satimg_window_size,
+        satimg_time_resolution_min=satimg_time_resolution_min,
+        satimg_npy_shape_hwc=satimg_npy_shape_hwc,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_batched,
+        num_workers=num_workers,
+    )
 
     print(f"loader_test: train_data_dir={pv_train_dir!r}")
     print(f"  train_dataset: {len(train_dataset)} files  batches/epoch={len(train_loader)}  epochs={epochs}")
     if max_batches is not None:
         print(f"  max_batches/epoch={max_batches}")
-    if test_loader is not None:
-        assert test_dataset is not None
-        print(f"loader_test: test_data_dir={pv_test_dir!r}")
-        print(f"  test_dataset:  {len(test_dataset)} files  batches/epoch={len(test_loader)}")
+    print(f"loader_test: test_data_dir={pv_test_dir!r}")
+    print(f"  test_dataset:  {len(test_dataset)} files  batches/epoch={len(test_loader)}")
 
     def _run_split(name: str, loader: DataLoader) -> None:
         for epoch in range(epochs):
@@ -619,14 +740,11 @@ def loader_test(
                 print(", ".join(parts))
 
     _run_split("train", train_loader)
-    if test_loader is not None:
-        _run_split("test", test_loader)
+    _run_split("test", test_loader)
 
-    out: dict = {
+    return {
         "train_dataset": train_dataset,
         "train_loader": train_loader,
+        "test_dataset": test_dataset,
+        "test_loader": test_loader,
     }
-    if test_dataset is not None and test_loader is not None:
-        out["test_dataset"] = test_dataset
-        out["test_loader"] = test_loader
-    return out

@@ -6,7 +6,7 @@ site:
   longitude: 112.43
 
 paths:
-  data_dir: "/home/hw1/workspace/"
+  data_dir: "/home/hw1/data/luoyang_dataset"
   config_dir: config
   nwp_config: config/NWP.yaml
   pv_download: pv
@@ -23,16 +23,10 @@ paths:
   # wylc: skyimg_download / sky_image_wylc_subpath; pred: skyimg_pred / same (optional sky_image_wylc_pred_subpath)
   sky_image_wylc_subpath: wylc
 
-  # The following is for training and testing
-  # train/test sky image dirs (directly under data_dir, e.g. /data/data/asi_16613_train)
-  sky_image_train_path: asi_16613_train
-  sky_image_test_path: asi_16613_test
-  # sky_image_wylc_pred_subpath: ...  # optional; only needed for custom layouts
-  pv_train_path: luoyang_data_626
-  pv_test_path: luoyang_data_626
-  # sta image training/testing
-  sat_train_path: himawari_cropped_train
-  sat_test_path: himawari_cropped_test
+  # Training / eval data (single folder each under data_dir; train and test use the same roots)
+  sky_image_path: asi_16613
+  pv_path: luoyang_data_626
+  sat_path: himawari_cropped
 
 nwp:
   solar_subdir: solar
@@ -53,7 +47,11 @@ training:
   pv_input_len: 576
   pv_output_interval_min: 15 # multiple of 5 or csv_interval_min
   pv_output_len: 192
-  test_anchor_stride_min: 12000
+  # Chronological split per CSV: first N rows = train, rest = test; N = int(n_rows * fraction)
+  pv_train_time_fraction: 0.7
+  test_anchor_stride_min: 240 # 12000
+  # split=test: match reference last-X collectTime in each CSV within this many minutes (0 = exact)
+  test_collect_time_match_tolerance_min: 0
   # Sky / Himawari stacks
   skyimg_window_size: 30 # the newest frame has aligned time with the last PV output row
   skyimg_time_resolution_min: 1

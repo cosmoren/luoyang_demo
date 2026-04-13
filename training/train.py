@@ -37,10 +37,10 @@ def train_one_epoch(model, device, loader, criterion, optimizer, max_batches: in
         if max_batches is not None and batch_idx >= max_batches:
             break
         B = batch["dev_idx"].size(0)
-        device_id = batch["dev_idx"].to(device)            # [B]
-        pv = batch["pv"].to(device)                        # [B, C, T_in]
-        mask = batch["pv_mask"].to(device)                 # [B, C, T_in]
-        pv_timefeats = batch["pv_timefeats"].to(device)   # [B, T_in, C_tf]
+        device_id = batch["dev_idx"].to(device)                      # [B]
+        pv = batch["pv"].to(device)                                  # [B, C, T_in]
+        mask = batch["pv_mask"].to(device)                           # [B, C, T_in]
+        pv_timefeats = batch["pv_timefeats"].to(device)              # [B, T_in, C_tf]
         forecast_timefeats = batch["forecast_timefeats"].to(device)  # [B, T_out, C_tf]
         target_pv = batch["target_pv"].to(device)
         target_mask = batch["target_mask"].to(device)
@@ -150,10 +150,22 @@ def main():
     parser.add_argument("--pv_input_len", type=int, default=h["pv_input_len"], help="Input sequence length (X).")
     parser.add_argument("--pv_output_len", type=int, default=h["pv_output_len"], help="Target sequence length (Y).")
     parser.add_argument(
+        "--pv_train_time_fraction",
+        type=float,
+        default=h["pv_train_time_fraction"],
+        help="Per CSV: first int(n*fraction) rows are train segment, rest test; anchors must fit entirely in segment.",
+    )
+    parser.add_argument(
         "--test_anchor_stride_min",
         type=int,
         default=h["test_anchor_stride_min"],
         help="For split=test: minutes between consecutive eval anchors (multiple of CSV row interval).",
+    )
+    parser.add_argument(
+        "--test_collect_time_match_tolerance_min",
+        type=int,
+        default=h["test_collect_time_match_tolerance_min"],
+        help="For split=test: max minutes between ref last-X collectTime and matched row in each CSV (0=exact).",
     )
     parser.add_argument(
         "--skyimg_window_size",
@@ -245,7 +257,9 @@ def main():
             pv_input_len=args.pv_input_len,
             pv_output_interval_min=args.pv_output_interval_min,
             pv_output_len=args.pv_output_len,
+            pv_train_time_fraction=args.pv_train_time_fraction,
             test_anchor_stride_min=args.test_anchor_stride_min,
+            test_collect_time_match_tolerance_min=args.test_collect_time_match_tolerance_min,
             skyimg_window_size=args.skyimg_window_size,
             skyimg_time_resolution_min=args.skyimg_time_resolution_min,
             skyimg_spatial_size=args.skyimg_spatial_size,
@@ -280,7 +294,9 @@ def main():
         pv_input_len=args.pv_input_len,
         pv_output_interval_min=args.pv_output_interval_min,
         pv_output_len=args.pv_output_len,
+        pv_train_time_fraction=args.pv_train_time_fraction,
         test_anchor_stride_min=args.test_anchor_stride_min,
+        test_collect_time_match_tolerance_min=args.test_collect_time_match_tolerance_min,
         skyimg_window_size=args.skyimg_window_size,
         skyimg_time_resolution_min=args.skyimg_time_resolution_min,
         skyimg_spatial_size=args.skyimg_spatial_size,
@@ -298,7 +314,9 @@ def main():
         pv_input_len=args.pv_input_len,
         pv_output_interval_min=args.pv_output_interval_min,
         pv_output_len=args.pv_output_len,
+        pv_train_time_fraction=args.pv_train_time_fraction,
         test_anchor_stride_min=args.test_anchor_stride_min,
+        test_collect_time_match_tolerance_min=args.test_collect_time_match_tolerance_min,
         skyimg_window_size=args.skyimg_window_size,
         skyimg_time_resolution_min=args.skyimg_time_resolution_min,
         skyimg_spatial_size=args.skyimg_spatial_size,

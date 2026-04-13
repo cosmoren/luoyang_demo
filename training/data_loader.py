@@ -12,8 +12,6 @@ import pandas as pd
 INVERTER_STATE_COL = "inverter_state"
 VALID_STATE = 512
 
-_MAX_TRAINING_CSV_INDEX = 625  # inclusive upper bound for end_idx (626 files → indices 0..625)
-
 
 def load_csv(csv_path: Path | str) -> pd.DataFrame:
     """Load a single device CSV; ensure collectTime is parsed and sorted."""
@@ -26,28 +24,30 @@ def load_csv(csv_path: Path | str) -> pd.DataFrame:
 
 def list_csv_files(
     start_idx: int = 0,
-    end_idx: int = 625,
+    end_idx: int | None = None,
     data_dir: Path | str | None = None,
 ) -> list[Path]:
     """
-    Sorted ``*.csv`` paths under ``data_dir`` for inclusive index range ``start_idx`` … ``end_idx``.
+    Sorted ``*.csv`` paths under ``data_dir``.
 
-    ``end_idx`` is inclusive (last file index). E.g. ``start_idx=0``, ``end_idx=625`` selects all
-    626 files. ``end_idx`` must not exceed ``_MAX_TRAINING_CSV_INDEX`` (625).
+    - Default ``end_idx=None``: return all files from ``start_idx`` through the last file (any count).
+    - If ``end_idx`` is an int, it is the **inclusive** last index in the sorted list (``start_idx`` … ``end_idx``).
     """
     data_dir = Path(data_dir)
     if not data_dir.is_dir():
         raise FileNotFoundError(f"Data dir not found: {data_dir}")
     all_csvs: list[Path] = sorted(data_dir.glob("*.csv"))
     n = len(all_csvs)
-    if start_idx < 0 or end_idx < start_idx:
-        raise ValueError("require 0 <= start_idx <= end_idx")
-    if end_idx > _MAX_TRAINING_CSV_INDEX:
-        raise ValueError(
-            f"end_idx ({end_idx}) must be <= {_MAX_TRAINING_CSV_INDEX} (inclusive max index)"
-        )
+    if n == 0:
+        return []
+    if start_idx < 0:
+        raise ValueError("start_idx must be >= 0")
     if start_idx >= n:
         raise ValueError(f"start_idx ({start_idx}) out of range (n={n})")
+    if end_idx is None:
+        return all_csvs[start_idx:]
+    if end_idx < start_idx:
+        raise ValueError("require start_idx <= end_idx")
     if end_idx >= n:
         raise ValueError(
             f"end_idx ({end_idx}) out of range (n={n}); valid inclusive indices are 0..{n - 1}"
