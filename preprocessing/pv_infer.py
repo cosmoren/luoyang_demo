@@ -1,5 +1,5 @@
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, List, Dict, Any
 
 import numpy as np
@@ -43,6 +43,42 @@ def get_latest_pv_data(path: Path, num: int, time_span_minutes: int = 5) -> Tupl
 
     pv_dict = read_pv_csvs_to_dict(paths)
 
+    return timestamps, paths, pv_dict
+
+
+def get_pv_data_ending_at(
+    path: Path,
+    end_dt: datetime,
+    num: int,
+    time_span_minutes: int = 5,
+) -> Tuple[List[datetime], List[Optional[Path]], Dict[str, Dict[str, np.ndarray]]]:
+    """
+    Build the PV history grid ending at end_dt without scanning for the newest file in the folder.
+    Each slot maps to ``{YYYYMMDD_HHMM}.csv`` under ``path``. Only those files are read; any CSV
+    with a later time is ignored.
+
+    If ``end_dt`` is timezone-aware, it is converted to UTC before building filenames (naive UTC
+    wall time). If naive, it is interpreted as UTC wall time for consistency with online inference.
+
+    Missing files for a slot yield None in paths and zeros in pv_dict for that index.
+    """
+    path = Path(path)
+    if not path.is_dir():
+        return [], [], {}
+
+    if end_dt.tzinfo is not None:
+        end_naive = end_dt.astimezone(timezone.utc).replace(tzinfo=None)
+    else:
+        end_naive = end_dt
+
+    span = timedelta(minutes=time_span_minutes)
+    timestamps = [end_naive - (num - 1 - i) * span for i in range(num)]
+    paths: List[Optional[Path]] = []
+    for t in timestamps:
+        fpath = path / (t.strftime("%Y%m%d_%H%M") + ".csv")
+        paths.append(fpath if fpath.is_file() else None)
+
+    pv_dict = read_pv_csvs_to_dict(paths)
     return timestamps, paths, pv_dict
 
 
