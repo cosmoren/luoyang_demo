@@ -2,8 +2,8 @@
 
 site:
   name: Luoyang
-  latitude: 34.65
-  longitude: 112.43
+  latitude: 34.69984
+  longitude: 112.28440
 
 paths:
   data_dir: "/home/hw1/data/luoyang_dataset"
@@ -27,6 +27,7 @@ paths:
   sky_image_path: asi_16613
   pv_path: luoyang_data_626
   sat_path: himawari_cropped
+  nwp_path: NWP
 
 nwp:
   solar_subdir: solar
@@ -49,7 +50,7 @@ training:
   pv_output_len: 192
   # Chronological split per CSV: first N rows = train, rest = test; N = int(n_rows * fraction)
   pv_train_time_fraction: 0.7
-  test_anchor_stride_min: 240 # 12000
+  test_anchor_stride_min: 12000 # 12000
   # split=test: match reference last-X collectTime in each CSV within this many minutes (0 = exact)
   test_collect_time_match_tolerance_min: 0
   # Sky / Himawari stacks
@@ -61,12 +62,9 @@ training:
   satimg_npy_shape_hwc: [100, 100, 3] # expected np.load array layout (height, width, channels)
   # Optimization and training loop
   epochs: 50
-  lr: 0.001
+  lr: 5e-4
   batch_size: 16
   save_every: 5
   num_workers: 24
   # null = run every batch in an epoch
   train_max_batches_per_epoch: null
-  # Used with --loader-test only
-  loader_test_batch_size: 16
-  loader_test_num_workers: 0

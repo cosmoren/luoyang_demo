@@ -32,8 +32,6 @@ TRAINING_HPARAM_KEYS = frozenset({
     "save_every",
     "num_workers",
     "train_max_batches_per_epoch",
-    "loader_test_batch_size",
-    "loader_test_num_workers",
 })
 
 
@@ -97,9 +95,10 @@ def get_training_paths_from_conf(conf: dict | None = None, project_root: Path | 
     """
     Resolve PV CSV, sky JPEG, and Himawari NPY dirs under ``paths.data_dir``.
 
-    Required ``paths`` keys (relative to ``data_dir``; train and eval use the same roots):
+    Required ``paths`` keys (relative to ``data_dir``):
 
-    ``pv_path``, ``sky_image_path``, ``sat_path``.
+    ``pv_path``, ``sky_image_path``, ``sat_path``. Train/test time split uses the same directories;
+    returned keys are ``pv_dir``, ``skyimg_dir``, ``satimg_dir``.
     """
     if conf is None:
         conf = load_config()
@@ -121,10 +120,7 @@ def get_training_paths_from_conf(conf: dict | None = None, project_root: Path | 
     sat_dir = (data_dir / _req("sat_path")).resolve()
 
     return {
-        "pv_train_dir": str(pv_dir),
-        "pv_test_dir": str(pv_dir),
-        "skyimg_train_dir": str(sky_dir),
-        "skyimg_test_dir": str(sky_dir),
-        "satimg_train_dir": str(sat_dir),
-        "satimg_test_dir": str(sat_dir),
+        "pv_dir": str(pv_dir),
+        "skyimg_dir": str(sky_dir),
+        "satimg_dir": str(sat_dir),
     }

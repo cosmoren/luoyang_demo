@@ -19,7 +19,6 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 from config_utils import get_resolved_paths
 from dataloader.luoyang import PVDataset, collate_batched
 from models.models import pv_forecasting_model
-from training.pv_loader_test import run_pv_loader_test
 from training.training_conf import (
     get_training_hparams_from_conf,
     get_training_paths_from_conf,
@@ -89,45 +88,16 @@ def main():
     parser.add_argument("--checkpoint_dir", type=str, default=None)
     parser.add_argument("--save_every", type=int, default=h["save_every"])
     parser.add_argument(
-        "--loader-test",
-        action="store_true",
-        help="Only build train/test loaders and print a few batches; skip training.",
-    )
-    parser.add_argument(
-        "--pv_train_dir",
+        "--pv-dir",
         type=str,
-        default=path_defaults["pv_train_dir"],
-        help=f"Training CSV directory (default from conf: {path_defaults['pv_train_dir']!r}).",
+        default=path_defaults["pv_dir"],
+        help=f"PV CSV directory (default: {path_defaults['pv_dir']!r}).",
     )
     parser.add_argument(
-        "--pv_test_dir",
+        "--skyimg-dir",
         type=str,
-        default=path_defaults["pv_test_dir"],
-        help=f"Eval/test CSV directory (default from conf: {path_defaults['pv_test_dir']!r}).",
-    )
-    parser.add_argument(
-        "--skyimg_train_dir",
-        type=str,
-        default=path_defaults["skyimg_train_dir"],
-        help=f"Training skyimg directory (default from conf: {path_defaults['skyimg_train_dir']!r}).",
-    )
-    parser.add_argument(
-        "--skyimg_test_dir",
-        type=str,
-        default=path_defaults["skyimg_test_dir"],
-        help=f"Eval/test skyimg directory (default from conf: {path_defaults['skyimg_test_dir']!r}).",
-    )
-    parser.add_argument(
-        "--loader-test-epochs",
-        type=int,
-        default=1,
-        help="With --loader-test: number of full DataLoader passes (epochs).",
-    )
-    parser.add_argument(
-        "--loader-test-max-batches",
-        type=int,
-        default=None,
-        help="With --loader-test: max batches per epoch (default: full epoch).",
+        default=path_defaults["skyimg_dir"],
+        help=f"Sky JPEG root (default: {path_defaults['skyimg_dir']!r}).",
     )
     parser.add_argument(
         "--csv_interval_min",
@@ -186,16 +156,10 @@ def main():
         help="Sky JPEG resize side length (square, pixels).",
     )
     parser.add_argument(
-        "--satimg_train_dir",
+        "--satimg-dir",
         type=str,
-        default=path_defaults["satimg_train_dir"],
-        help=f"Himawari NPY train dir (default from conf: {path_defaults['satimg_train_dir']!r}).",
-    )
-    parser.add_argument(
-        "--satimg_test_dir",
-        type=str,
-        default=path_defaults["satimg_test_dir"],
-        help=f"Himawari NPY test dir (default from conf: {path_defaults['satimg_test_dir']!r}).",
+        default=path_defaults["satimg_dir"],
+        help=f"Himawari NPY root (default: {path_defaults['satimg_dir']!r}).",
     )
     parser.add_argument(
         "--satimg_window_size",
@@ -229,49 +193,8 @@ def main():
         default=h["train_max_batches_per_epoch"],
         help="Stop each training epoch after this many batches (default from conf; null = no cap).",
     )
-    parser.add_argument(
-        "--loader_test_batch_size",
-        type=int,
-        default=h["loader_test_batch_size"],
-        help="With --loader-test: batch size (default from conf).",
-    )
-    parser.add_argument(
-        "--loader_test_num_workers",
-        type=int,
-        default=h["loader_test_num_workers"],
-        help="With --loader-test: DataLoader num_workers (default from conf).",
-    )
     args = parser.parse_args()
     satimg_hwc = tuple(args.satimg_npy_shape_hwc)
-
-    if args.loader_test:
-        run_pv_loader_test(
-            pv_train_dir=args.pv_train_dir,
-            pv_test_dir=args.pv_test_dir,
-            skyimg_train_dir=args.skyimg_train_dir,
-            skyimg_test_dir=args.skyimg_test_dir,
-            satimg_train_dir=args.satimg_train_dir,
-            satimg_test_dir=args.satimg_test_dir,
-            csv_interval_min=args.csv_interval_min,
-            pv_input_interval_min=args.pv_input_interval_min,
-            pv_input_len=args.pv_input_len,
-            pv_output_interval_min=args.pv_output_interval_min,
-            pv_output_len=args.pv_output_len,
-            pv_train_time_fraction=args.pv_train_time_fraction,
-            test_anchor_stride_min=args.test_anchor_stride_min,
-            test_collect_time_match_tolerance_min=args.test_collect_time_match_tolerance_min,
-            skyimg_window_size=args.skyimg_window_size,
-            skyimg_time_resolution_min=args.skyimg_time_resolution_min,
-            skyimg_spatial_size=args.skyimg_spatial_size,
-            satimg_window_size=args.satimg_window_size,
-            satimg_time_resolution_min=args.satimg_time_resolution_min,
-            satimg_npy_shape_hwc=satimg_hwc,
-            batch_size=args.loader_test_batch_size,
-            epochs=args.loader_test_epochs,
-            max_batches=args.loader_test_max_batches,
-            num_workers=args.loader_test_num_workers,
-        )
-        return
 
     resolved_paths = get_resolved_paths(conf, _PROJECT_ROOT)
     pv_device_path = resolved_paths["pv_device_path"]
@@ -285,9 +208,9 @@ def main():
     criterion = nn.MSELoss()
 
     train_dataset = PVDataset(
-        pv_dir=args.pv_train_dir,
-        skyimg_dir=args.skyimg_train_dir,
-        satimg_dir=args.satimg_train_dir,
+        pv_dir=args.pv_dir,
+        skyimg_dir=args.skyimg_dir,
+        satimg_dir=args.satimg_dir,
         split="train",
         csv_interval_min=args.csv_interval_min,
         pv_input_interval_min=args.pv_input_interval_min,
@@ -305,9 +228,9 @@ def main():
         satimg_npy_shape_hwc=satimg_hwc,
     )
     test_dataset = PVDataset(
-        pv_dir=args.pv_test_dir,
-        skyimg_dir=args.skyimg_test_dir,
-        satimg_dir=args.satimg_test_dir,
+        pv_dir=args.pv_dir,
+        skyimg_dir=args.skyimg_dir,
+        satimg_dir=args.satimg_dir,
         split="test",
         csv_interval_min=args.csv_interval_min,
         pv_input_interval_min=args.pv_input_interval_min,

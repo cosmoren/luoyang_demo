@@ -10,7 +10,7 @@ import torch
 import yaml
 from PIL import Image
 from pvlib import solarposition
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 from modules.solar_encoder import compute_solar_features, solar_features_encoder, delta_time_encoder
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -18,12 +18,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from config_utils import get_resolved_paths
-from training.training_conf import (
-    CONF_PATH,
-    get_training_hparams_from_conf,
-    get_training_paths_from_conf,
-    load_config,
-)
+from training.training_conf import CONF_PATH, get_training_hparams_from_conf, load_config
 from training.data_loader import (
     INVERTER_STATE_COL,
     VALID_STATE,
@@ -32,12 +27,96 @@ from training.data_loader import (
 )
 
 
-def _load_training_defaults() -> tuple[dict[str, str], dict]:
+def _load_training_defaults() -> dict:
     conf = load_config()
-    return get_training_paths_from_conf(conf, _PROJECT_ROOT), get_training_hparams_from_conf(conf)
+    return get_training_hparams_from_conf(conf)
 
 
-_TRAINING_PATH_DEFAULTS, _TRAINING_HPARAM_DEFAULTS = _load_training_defaults()
+_TRAINING_HPARAM_DEFAULTS = _load_training_defaults()
+
+# ``nwp_interp`` columns: ssrd (solar) then wind fields, in this order.
+_NWP_INTERP_STACK_COLS = ("ssrd", "msl", "t2m", "u10", "v10", "u100", "v100")
+_NWP_WIND_INTERP_COLS = _NWP_INTERP_STACK_COLS[1:]
+
+
+def _sanitize_nwp_interp(nwp_interp: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Replace non-finite values in ``nwp_interp`` (shape ``[T, 7]``) with 0.
+
+    Returns ``(nwp_clean, nwp_mask)`` where ``nwp_mask`` has shape ``[T, 1]``, dtype float32:
+    ``1.0`` if that timestep had any nan/inf (hence replacement), else ``0.0``.
+    """
+    x = np.asarray(nwp_interp, dtype=np.float64)
+    bad = ~np.isfinite(x)
+    x_clean = np.where(bad, 0.0, x).astype(np.float32, copy=False)
+    row_bad = bad.any(axis=1).astype(np.float32).reshape(-1, 1)
+    return x_clean, row_bad
+
+
+def _linear_interp_nwp_column(
+    block: pd.DataFrame,
+    forecast_timestamps_utc: list,
+    value_col: str,
+) -> np.ndarray:
+    """Linearly interpolate ``value_col`` vs ``forecast_time`` in ``block`` onto ``forecast_timestamps_utc`` (UTC)."""
+    n = len(forecast_timestamps_utc)
+    if block.empty or "forecast_time" not in block.columns or value_col not in block.columns:
+        return np.full(n, np.nan, dtype=np.float64)
+    ft = pd.to_datetime(block["forecast_time"], utc=True)
+    y = pd.to_numeric(block[value_col], errors="coerce")
+    tab = pd.DataFrame({"ft": ft, "y": y}).dropna(subset=["y"])
+    if tab.empty:
+        return np.full(n, np.nan, dtype=np.float64)
+    tab = tab.sort_values("ft").drop_duplicates(subset=["ft"], keep="last")
+    xp = pd.DatetimeIndex(tab["ft"]).asi8.astype(np.float64)
+    fp = tab["y"].to_numpy(dtype=np.float64)
+    xq = pd.DatetimeIndex(pd.to_datetime(forecast_timestamps_utc, utc=True)).asi8.astype(np.float64)
+    return np.interp(xq, xp, fp)
+
+
+def interpolate_nwp_features(nwp_solar_df, nwp_wind_df, forecast_timestamps_utc, dhour=12):
+    """
+    Use ``forecast_timestamps_utc[0]`` minus ``dhour`` to get ``t_ref_utc``, then ``prev_noon_utc`` (last UTC
+    noon before ``t_ref_utc``). Slice solar/wind rows with ``start_time == prev_noon_utc``. Linearly
+    interpolate ``ssrd`` from the solar block and ``msl``, ``t2m``, ``u10``, ``v10``, ``u100``, ``v100`` from
+    the wind block along ``forecast_time`` (UTC) onto every ``forecast_timestamps_utc`` (``np.nan`` if no data).
+    Those series are stacked as ``nwp_interp`` with shape ``[n, 7]`` (then nan/inf → 0 with ``_sanitize_nwp_interp``).
+    """
+    if nwp_solar_df is None or nwp_wind_df is None:
+        return None
+    if not forecast_timestamps_utc:
+        return None
+
+    delta = pd.Timedelta(hours=float(dhour))
+    t_ref = pd.Timestamp(forecast_timestamps_utc[0]) - delta
+    if t_ref.tzinfo is None:
+        t_ref_utc = t_ref.tz_localize("UTC")
+    else:
+        t_ref_utc = t_ref.tz_convert("UTC")
+
+    midnight_utc = t_ref_utc.normalize()
+    noon_same_day = midnight_utc + pd.Timedelta(hours=12)
+    if noon_same_day < t_ref_utc:
+        prev_noon_utc = noon_same_day
+    else:
+        prev_noon_utc = noon_same_day - pd.Timedelta(days=1)
+
+    solar_st = pd.to_datetime(nwp_solar_df["start_time"], utc=True)
+    nwp_solar_block = nwp_solar_df.loc[solar_st == prev_noon_utc].copy()
+    wind_st = pd.to_datetime(nwp_wind_df["start_time"], utc=True)
+    nwp_wind_block = nwp_wind_df.loc[wind_st == prev_noon_utc].copy()
+
+    ssrd_interp = _linear_interp_nwp_column(nwp_solar_block, forecast_timestamps_utc, "ssrd")
+    wind_interp = {
+        col: _linear_interp_nwp_column(nwp_wind_block, forecast_timestamps_utc, col)
+        for col in _NWP_WIND_INTERP_COLS
+    }
+
+    nwp_interp = np.column_stack([ssrd_interp] + [wind_interp[c] for c in _NWP_WIND_INTERP_COLS])
+    nwp_interp_clean, nwp_mask = _sanitize_nwp_interp(nwp_interp)
+    nwp_interp_wmask = np.concatenate([nwp_interp_clean, nwp_mask], axis=1) # [T_out, 8]  (ssrd, msl, t2m, u10, v10, u100, v100, mask) mask is 1 if any nan/inf, 0 otherwise
+
+    return nwp_interp_wmask
 
 
 class PVDataset(Dataset):
@@ -67,6 +146,10 @@ class PVDataset(Dataset):
     then floored to 10-minute boundaries for the key timestep. History/forecast windows step in UTC
     (sizes from ``conf.yaml`` ``training``). Arrays are float32 HWC per ``training.satimg_npy_shape_hwc``;
     missing files → zeros.
+
+    If ``conf paths.nwp_path`` is set (relative to ``paths.data_dir`` unless absolute) and ``solar.csv`` /
+    ``wind.csv`` exist and load successfully, they populate ``nwp_solar_df`` and ``nwp_wind_df``; otherwise
+    (missing key, missing ``data_dir``, missing files, or read error) both stay ``None`` without raising.
     """
 
     def __init__(
@@ -144,6 +227,25 @@ class PVDataset(Dataset):
         with open(CONF_PATH) as f:
             conf = yaml.safe_load(f)
         paths = get_resolved_paths(conf, _PROJECT_ROOT)
+        paths_cfg = conf.get("paths", {}) or {}
+        nwp_raw = paths_cfg.get("nwp_path")
+        self.nwp_solar_df = None
+        self.nwp_wind_df = None
+        if nwp_raw is not None and str(nwp_raw).strip() != "":
+            data_dir = paths.get("data_dir")
+            if data_dir is not None:
+                try:
+                    nwp_p = Path(nwp_raw)
+                    nwp_dir = nwp_p.resolve() if nwp_p.is_absolute() else (data_dir / nwp_p).resolve()
+                    solar_csv = nwp_dir / "solar.csv"
+                    wind_csv = nwp_dir / "wind.csv"
+                    if solar_csv.is_file() and wind_csv.is_file():
+                        self.nwp_solar_df = pd.read_csv(solar_csv)
+                        self.nwp_wind_df = pd.read_csv(wind_csv)
+                except Exception:
+                    self.nwp_solar_df = None
+                    self.nwp_wind_df = None
+
         pv_device_path = paths["pv_device_path"]
 
         site = conf.get("site", {})
@@ -493,7 +595,14 @@ class PVDataset(Dataset):
         forecast_timefeats = solar_features_encoder(forecast_solar_features)
         forecast_dtimefeats = delta_time_encoder(forecast_timestamps_utc, time0_utc)
         forecast_timefeats = torch.cat([forecast_timefeats, forecast_dtimefeats.unsqueeze(1)], dim=1)
-        
+
+        # Interpolate NWP features on forecast_timestamps_utc → [T_out, 7] (ssrd + wind scalars)
+        nwp_out = interpolate_nwp_features(self.nwp_solar_df, self.nwp_wind_df, forecast_timestamps_utc)
+        if nwp_out is None:
+            nwp_tensor = None
+        else:
+            nwp_tensor = torch.from_numpy(np.asarray(nwp_out, dtype=np.float32))
+
         inv_y = pd.to_numeric(sub_y[INVERTER_STATE_COL], errors="coerce").fillna(0).astype(np.int32).values
         pow_y = pd.to_numeric(sub_y["active_power"], errors="coerce").fillna(0).values.astype(np.float32)
         target_pv = torch.from_numpy((pow_y / 50.0).astype(np.float32))
@@ -529,8 +638,7 @@ class PVDataset(Dataset):
             "sat_timefeats": sat_timefeats,
             "skimg_tensor": skimg_tensor,
             "skimg_timefeats": skimg_timefeats,
-            "nwp_tensor": None,         # TODO: add nwp features
-            "nwp_timefeats": None,      # TODO: add nwp features
+            "nwp_tensor": nwp_tensor,
             "target_pv": target_pv,
             "target_mask": target_mask,
         }
@@ -604,7 +712,7 @@ def collate_batched(batch):
         "target_pv": _stack("target_pv"),
         "target_mask": _stack("target_mask"),
     }
-    for key in ("skimg_tensor", "skimg_timefeats", "nwp_tensor", "nwp_timefeats"):
+    for key in ("skimg_tensor", "skimg_timefeats", "nwp_tensor"):
         vals = [s[key] for s in batch]
         if vals[0] is None:
             if not all(v is None for v in vals):
@@ -614,137 +722,3 @@ def collate_batched(batch):
             out[key] = torch.stack(vals)
     return out
 
-
-def loader_test(
-    *,
-    pv_train_dir: str = _TRAINING_PATH_DEFAULTS["pv_train_dir"],
-    pv_test_dir: str = _TRAINING_PATH_DEFAULTS["pv_test_dir"],
-    skyimg_train_dir: str = _TRAINING_PATH_DEFAULTS["skyimg_train_dir"],
-    skyimg_test_dir: str = _TRAINING_PATH_DEFAULTS["skyimg_test_dir"],
-    satimg_train_dir: str = _TRAINING_PATH_DEFAULTS["satimg_train_dir"],
-    satimg_test_dir: str = _TRAINING_PATH_DEFAULTS["satimg_test_dir"],
-    csv_interval_min: int = _TRAINING_HPARAM_DEFAULTS["csv_interval_min"],
-    pv_input_interval_min: int = _TRAINING_HPARAM_DEFAULTS["pv_input_interval_min"],
-    pv_input_len: int = _TRAINING_HPARAM_DEFAULTS["pv_input_len"],
-    pv_output_interval_min: int = _TRAINING_HPARAM_DEFAULTS["pv_output_interval_min"],
-    pv_output_len: int = _TRAINING_HPARAM_DEFAULTS["pv_output_len"],
-    pv_train_time_fraction: float = _TRAINING_HPARAM_DEFAULTS["pv_train_time_fraction"],
-    test_anchor_stride_min: int = _TRAINING_HPARAM_DEFAULTS["test_anchor_stride_min"],
-    test_collect_time_match_tolerance_min: int = _TRAINING_HPARAM_DEFAULTS[
-        "test_collect_time_match_tolerance_min"
-    ],
-    skyimg_window_size: int = _TRAINING_HPARAM_DEFAULTS["skyimg_window_size"],
-    skyimg_time_resolution_min: int = _TRAINING_HPARAM_DEFAULTS["skyimg_time_resolution_min"],
-    skyimg_spatial_size: int = _TRAINING_HPARAM_DEFAULTS["skyimg_spatial_size"],
-    satimg_window_size: int = _TRAINING_HPARAM_DEFAULTS["satimg_window_size"],
-    satimg_time_resolution_min: int = _TRAINING_HPARAM_DEFAULTS["satimg_time_resolution_min"],
-    satimg_npy_shape_hwc: tuple[int, int, int] = _TRAINING_HPARAM_DEFAULTS["satimg_npy_shape_hwc"],
-    batch_size: int = _TRAINING_HPARAM_DEFAULTS["loader_test_batch_size"],
-    epochs: int = 1,
-    max_batches: int | None = None,
-    num_workers: int = _TRAINING_HPARAM_DEFAULTS["loader_test_num_workers"],
-) -> dict:
-    """
-    Build train and test :class:`PVDataset` (time split via ``pv_train_time_fraction``) and run a few batches.
-    PV/sky/sat dirs may be the same; train vs test differ by ``split=`` and segment masks.
-    """
-    if epochs < 1:
-        raise ValueError("epochs must be >= 1")
-    if max_batches is not None and max_batches < 1:
-        raise ValueError("max_batches must be >= 1 when set")
-
-    pv_train_dir = str(Path(pv_train_dir).resolve())
-    pv_test_dir = str(Path(pv_test_dir).resolve())
-    skyimg_train_dir = str(Path(skyimg_train_dir).resolve())
-    skyimg_test_dir = str(Path(skyimg_test_dir).resolve())
-    satimg_train_dir = str(Path(satimg_train_dir).resolve())
-    satimg_test_dir = str(Path(satimg_test_dir).resolve())
-
-    train_dataset = PVDataset(
-        pv_dir=pv_train_dir,
-        skyimg_dir=skyimg_train_dir,
-        satimg_dir=satimg_train_dir,
-        split="train",
-        csv_interval_min=csv_interval_min,
-        pv_input_interval_min=pv_input_interval_min,
-        pv_input_len=pv_input_len,
-        pv_output_interval_min=pv_output_interval_min,
-        pv_output_len=pv_output_len,
-        pv_train_time_fraction=pv_train_time_fraction,
-        test_anchor_stride_min=test_anchor_stride_min,
-        test_collect_time_match_tolerance_min=test_collect_time_match_tolerance_min,
-        skyimg_window_size=skyimg_window_size,
-        skyimg_time_resolution_min=skyimg_time_resolution_min,
-        skyimg_spatial_size=skyimg_spatial_size,
-        satimg_window_size=satimg_window_size,
-        satimg_time_resolution_min=satimg_time_resolution_min,
-        satimg_npy_shape_hwc=satimg_npy_shape_hwc,
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=collate_batched,
-        num_workers=num_workers,
-    )
-
-    test_dataset = PVDataset(
-        pv_dir=pv_test_dir,
-        skyimg_dir=skyimg_test_dir,
-        satimg_dir=satimg_test_dir,
-        split="test",
-        csv_interval_min=csv_interval_min,
-        pv_input_interval_min=pv_input_interval_min,
-        pv_input_len=pv_input_len,
-        pv_output_interval_min=pv_output_interval_min,
-        pv_output_len=pv_output_len,
-        pv_train_time_fraction=pv_train_time_fraction,
-        test_anchor_stride_min=test_anchor_stride_min,
-        test_collect_time_match_tolerance_min=test_collect_time_match_tolerance_min,
-        skyimg_window_size=skyimg_window_size,
-        skyimg_time_resolution_min=skyimg_time_resolution_min,
-        skyimg_spatial_size=skyimg_spatial_size,
-        satimg_window_size=satimg_window_size,
-        satimg_time_resolution_min=satimg_time_resolution_min,
-        satimg_npy_shape_hwc=satimg_npy_shape_hwc,
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=collate_batched,
-        num_workers=num_workers,
-    )
-
-    print(f"loader_test: train_data_dir={pv_train_dir!r}")
-    print(f"  train_dataset: {len(train_dataset)} files  batches/epoch={len(train_loader)}  epochs={epochs}")
-    if max_batches is not None:
-        print(f"  max_batches/epoch={max_batches}")
-    print(f"loader_test: test_data_dir={pv_test_dir!r}")
-    print(f"  test_dataset:  {len(test_dataset)} files  batches/epoch={len(test_loader)}")
-
-    def _run_split(name: str, loader: DataLoader) -> None:
-        for epoch in range(epochs):
-            for batch_idx, batch in enumerate(loader):
-                if max_batches is not None and batch_idx >= max_batches:
-                    break
-                print(
-                    f"  [{name}] epoch {epoch + 1}/{epochs} batch {batch_idx}: ",
-                    end="",
-                )
-                tensor_keys = [k for k in batch if torch.is_tensor(batch[k])]
-                parts = [f"{k} {tuple(batch[k].shape)} {batch[k].dtype}" for k in tensor_keys]
-                none_keys = [k for k in batch if batch[k] is None]
-                if none_keys:
-                    parts.append(f"(None: {', '.join(none_keys)})")
-                print(", ".join(parts))
-
-    _run_split("train", train_loader)
-    _run_split("test", test_loader)
-
-    return {
-        "train_dataset": train_dataset,
-        "train_loader": train_loader,
-        "test_dataset": test_dataset,
-        "test_loader": test_loader,
-    }
