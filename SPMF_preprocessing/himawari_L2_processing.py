@@ -74,8 +74,8 @@ def iter_netcdf_files(root: Path) -> list[Path]:
 
 
 def main() -> None:
-    default_in = Path("/home/hw1/data/himawari2025L2cloud_raw")
-    default_out = Path("/home/hw1/data/himawari2025L2cloud_npy")
+    default_in = Path("/media/kyber/f166835a-9fa7-4966-844b-7eb1285d3654/himawari2025L2cloud_raw")
+    default_out = Path("/media/kyber/f166835a-9fa7-4966-844b-7eb1285d3654/himawari2025L2cloud_npy")
     lat0, lon0 = _load_site_lat_lon()
 
     parser = argparse.ArgumentParser(description="Crop L2 cloud NC to site ROI and write .npy")
