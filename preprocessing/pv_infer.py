@@ -1,5 +1,5 @@
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, List, Dict, Any
 
 import numpy as np
@@ -15,23 +15,63 @@ def parse_time_from_csv_name(fname: str) -> Optional[datetime]:
         return None
 
 
-def get_latest_pv_data(path: Path, num: int, time_span_minutes: int = 5) -> Tuple[List[datetime], List[Optional[Path]]]:
+def _naive_end_for_csv_names(end_at: datetime) -> datetime:
+    """Strip tz for ``strftime``; aware times are converted to UTC first."""
+    if end_at.tzinfo is not None:
+        end_at = end_at.astimezone(timezone.utc)
+    return end_at.replace(tzinfo=None, second=0, microsecond=0)
+
+
+def get_pv_data_ending_at(
+    path: Path,
+    end_at: datetime,
+    num: int,
+    time_span_minutes: int = 5,
+) -> Tuple[List[datetime], List[Optional[Path]], Dict[str, Dict[str, np.ndarray]]]:
+    """
+    Build ``num`` slots stepping backward by ``time_span_minutes``; the **last** slot equals
+    ``end_at`` (no scan of the folder for the newest CSV). Only tries paths
+    ``<dir>/YYYYMMDD_HHMM.csv`` on that grid; missing files yield ``None`` in ``paths``.
+
+    Filename times are **naive** ``%Y%m%d_%H%M``. If ``end_at`` is timezone-aware, it is
+    converted to UTC before stripping tz (match debug / UTC-named files); if naive, it is used
+    as-is (after normalizing seconds/microseconds to 0).
+    """
+    path = Path(path)
+    if not path.is_dir() or num <= 0:
+        return [], [], {}
+
+    end_naive = _naive_end_for_csv_names(end_at)
+    span = timedelta(minutes=time_span_minutes)
+    timestamps = [end_naive - (num - 1 - i) * span for i in range(num)]
+    paths: List[Optional[Path]] = []
+    for t in timestamps:
+        fpath = path / (t.strftime("%Y%m%d_%H%M") + ".csv")
+        paths.append(fpath if fpath.is_file() else None)
+
+    pv_dict = read_pv_csvs_to_dict(paths)
+    return timestamps, paths, pv_dict
+
+
+def get_latest_pv_data(
+    path: Path, num: int, time_span_minutes: int = 5
+) -> Tuple[List[datetime], List[Optional[Path]], Dict[str, Dict[str, np.ndarray]]]:
     """
     Scan path for CSV files named YYYYMMDD_HHMM.csv to find the latest time.
     Generate num timestamps at time_span_minutes (default 5) intervals, with the last one = latest_dt.
-    Return (timestamps, paths). If a file for a slot does not exist, the corresponding path is None.
-    If no latest file is found, return ([], []).
+    Return (timestamps, paths, pv_dict). If a file for a slot does not exist, the corresponding path is None.
+    If no latest file is found, return ([], [], {}).
     """
     path = Path(path)
     if not path.is_dir():
-        return [], []
+        return [], [], {}
     latest_dt = None
     for f in path.glob("*.csv"):
         dt = parse_time_from_csv_name(f.name)
         if dt is not None and (latest_dt is None or dt > latest_dt):
             latest_dt = dt
     if latest_dt is None:
-        return [], []
+        return [], [], {}
 
     # num timestamps: latest_dt - (num-1)*span, ..., latest_dt - span, latest_dt
     span = timedelta(minutes=time_span_minutes)

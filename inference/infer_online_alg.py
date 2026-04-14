@@ -40,22 +40,23 @@ def sleep_until_shanghai_0855_if_before() -> None:
 
 def sleep_until_tomorrow_shanghai_0855() -> None:
     """After saving CSV or skipping the day, wait until 08:55 on the next calendar day (Shanghai)."""
+    now0 = datetime.now(SHANGHAI_TZ)
+    day_after = now0.date() + timedelta(days=1)
+    target = datetime(
+        day_after.year,
+        day_after.month,
+        day_after.day,
+        TRIGGER_HOUR,
+        TRIGGER_MINUTE,
+        0,
+        tzinfo=SHANGHAI_TZ,
+    )
     while True:
         now = datetime.now(SHANGHAI_TZ)
-        tomorrow = now.date() + timedelta(days=1)
-        target = datetime(
-            tomorrow.year,
-            tomorrow.month,
-            tomorrow.day,
-            TRIGGER_HOUR,
-            TRIGGER_MINUTE,
-            0,
-            tzinfo=SHANGHAI_TZ,
-        )
         sec = (target - now).total_seconds()
         if sec <= 1.0:
             return
-        time.sleep(min(POLL_INTERVAL_SEC, sec))
+        time.sleep(min(POLL_INTERVAL_SEC, max(0.0, sec)))
 
 
 def classify_last_history_shanghai(timestamps: list) -> str:
