@@ -1,32 +1,21 @@
 #!/usr/bin/env python3
 """
-Resize sky-camera images (``.jpg`` / ``.jpeg`` / ``.png``) and normalize filenames from timestamps.
+Resize sky-camera images (``.jpg`` / ``.jpeg`` / ``.png``) and rename by timestamp:
+**Pacific local time in filenames → UTC** stems.
 
-Source layouts (under --src, default /data/skyimg):
+Uses one IANA zone (default ``America/Los_Angeles``). PST vs PDT is **not** read from the name;
+the zone database applies the correct offset for each instant.
 
-  A) One extra group level + device folder (e.g. ASI):
-       <src>/asi/asi_16613/YYYYMMDD/*.{jpg,jpeg,png}
+Same directory layout as ``rename_utc.py`` (see that script). Input patterns match
+``YYYYMMDDHHMMSS`` / ASI ``*_12`` / ``ori…`` / date-folder + ``HHMMSS``, etc.
 
-  B) Date folders directly under the group (e.g. WYLC):
-       <src>/wylc/YYYYMMDD/*.{jpg,jpeg,png}
+Output: ``YYYYMMDDHHMMSS.jpg`` in **UTC** wall clock (+ optional ``--suffix``), resized to ``--size``
+(inputs are converted to RGB and saved as JPEG).
 
-Input filenames encode time in **Asia/Shanghai (UTC+8)** wall clock (14-digit
-``YYYYMMDDHHMMSS`` and related patterns).
+If ``--src`` has subfolders like ``train/`` and ``test/`` with images only inside (no ASI-style
+nesting), each becomes its own job: ``<dst>/train/``, ``<dst>/test/``, etc.
 
-Output filenames under ``skyimg_train`` use **UTC** wall clock by default:
-``YYYYMMDDHHMMSS`` is the same instant expressed in UTC (``--filename-tz utc``,
-the default). Use ``--filename-tz asia`` only if you want the output digits to
-stay in UTC+8 (not recommended for UTC-aligned training data).
-
-Output mirrors the same relative layout under --dst (default /data/skyimg_train),
-with no date subfolders — only resized JPEG outputs:
-
-       <dst>/asi/asi_16613/*.jpg
-       <dst>/wylc/*.jpg
-
-ASI-style names ``YYYYMMDDHHMMSS_11.*`` / ``_12.*``: only ``_12`` inputs are kept;
-``_11`` files are ignored. Output stem is ``YYYYMMDDHHMMSS`` only (no ``_11``/``_12``),
-unless you set ``--suffix``. PNG inputs are converted to RGB and saved as JPEG.
+If ``--src`` is a single flat folder of images, one job goes to ``<dst>/<basename(src)>/``.
 """
 
 from __future__ import annotations
@@ -44,7 +33,6 @@ try:
 except ImportError as e:
     raise SystemExit("pip install Pillow") from e
 
-SH = ZoneInfo("Asia/Shanghai")
 UTC = ZoneInfo("UTC")
 
 RE_ASI = re.compile(r"^(\d{14})_(11|12)$", re.IGNORECASE)
@@ -55,13 +43,12 @@ INPUT_SUFFIXES = frozenset({".jpg", ".jpeg", ".png"})
 
 
 def is_asi_camera_11_stem(stem: str) -> bool:
-    """True for ASI second-camera slot _11 (skip these files)."""
     m = RE_ASI.match(stem)
     return m is not None and m.group(2).lower() == "11"
 
 
 def parse_stem(stem: str, ddir: str | None) -> datetime | None:
-    """Return naive datetime = Asia/Shanghai wall time from filename (not UTC)."""
+    """Naive datetime = Pacific **local civil** time from filename (not UTC)."""
     m = RE_ASI.match(stem)
     if m:
         return datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
@@ -82,15 +69,14 @@ def parse_stem(stem: str, ddir: str | None) -> datetime | None:
     return None
 
 
-def to_stem(dt: datetime, tz: str, suf: str) -> str:
-    """``dt`` is naive Asia/Shanghai; for tz=='utc' write UTC wall clock in stem."""
-    loc = dt.replace(tzinfo=SH)
-    w = loc.astimezone(UTC).replace(tzinfo=None) if tz == "utc" else dt
-    return w.strftime("%Y%m%d%H%M%S") + suf
+def pacific_naive_to_utc_stem(dt_naive: datetime, tz: ZoneInfo, suf: str) -> str:
+    """Interpret naive ``dt`` as local time in ``tz`` (DST from zone rules); return UTC stem + suf."""
+    dt_local = dt_naive.replace(tzinfo=tz)
+    dt_utc = dt_local.astimezone(UTC).replace(tzinfo=None)
+    return dt_utc.strftime("%Y%m%d%H%M%S") + suf
 
 
 def image_list(site_root: Path) -> list[tuple[Path, str | None]]:
-    """Paths under site_root; date_folder = first path part if YYYYMMDD."""
     out: list[tuple[Path, str | None]] = []
     for p in site_root.rglob("*"):
         if not p.is_file():
@@ -121,12 +107,6 @@ def _has_image_under(root: Path) -> bool:
 
 
 def iter_site_jobs(src: Path) -> list[tuple[Path, tuple[str, ...]]]:
-    """
-    Each job: (site_root, dst_rel_parts).
-    dst_rel_parts is e.g. ('asi', 'asi_16613') or ('wylc',) or ('train',) for split folders.
-    Top-level folders that only hold images (e.g. train/, test/) become separate jobs under dst.
-    If the tree matches no pattern but contains images, one job uses ``(src, (basename,))``.
-    """
     jobs: list[tuple[Path, tuple[str, ...]]] = []
     groups = sorted(p for p in src.iterdir() if p.is_dir())
     for group in groups:
@@ -139,6 +119,7 @@ def iter_site_jobs(src: Path) -> list[tuple[Path, tuple[str, ...]]]:
                 continue
             jobs.append((leaf, (group.name, leaf.name)))
             added_leaf = True
+        # e.g. train/ or test/ with images at this level only (no device leaf dirs)
         if not added_leaf and _has_image_under(group):
             jobs.append((group, (group.name,)))
     if not jobs and _has_image_under(src):
@@ -166,7 +147,7 @@ def run_site(
     site_root: Path,
     dst_dir: Path,
     size: int,
-    ftz: str,
+    tz: ZoneInfo,
     suf: str,
     dry: bool,
 ) -> tuple[int, int, int]:
@@ -182,7 +163,12 @@ def run_site(
             print(f"  skip: {path}")
             sk += 1
             continue
-        ns = to_stem(dt, ftz, suf)
+        try:
+            ns = pacific_naive_to_utc_stem(dt, tz, suf)
+        except Exception as e:
+            print(f"  skip (time zone / DST): {path} ({e})")
+            sk += 1
+            continue
         on = ns + ".jpg"
         b, n = ns, 1
         while on in seen:
@@ -214,25 +200,21 @@ def main() -> None:
     ap.add_argument(
         "--src",
         type=Path,
-        default=Path("/data/skyimg"),
-        help="Root with group folders (asi, wylc, …).",
+        default=Path("/data/skippd/skippd_images/"),
+        help="Root with group folders (same layout as rename_utc.py).",
     )
     ap.add_argument(
         "--dst",
         type=Path,
-        default=Path("/data/skyimg_train"),
+        default=Path("/data/skippd/skippd_images_utc/"),
         help="Output root; mirrors <group>/<leaf>/ under src.",
     )
     ap.add_argument("--size", type=int, default=224, help="Square side length after resize.")
     ap.add_argument(
-        "--filename-tz",
-        choices=("utc", "asia"),
-        default="utc",
-        help=(
-            "Output stem timezone (default utc): "
-            "utc = convert UTC+8 filename time to UTC; "
-            "asia = keep UTC+8 digits in output name."
-        ),
+        "--zone",
+        type=str,
+        default="America/Los_Angeles",
+        help="IANA tz for filename times (PST/PDT from rules). E.g. America/Vancouver.",
     )
     ap.add_argument(
         "--suffix",
@@ -248,6 +230,10 @@ def main() -> None:
     )
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
+    try:
+        la_tz = ZoneInfo(a.zone)
+    except Exception as e:
+        raise SystemExit(f"bad --zone {a.zone!r}: {e}") from e
 
     src = a.src.expanduser().resolve()
     dst = a.dst.expanduser().resolve()
@@ -259,23 +245,14 @@ def main() -> None:
     if not jobs:
         raise SystemExit("no site jobs (check --src and --sites)")
 
-    print(
-        f"src={src}\ndst={dst}\nsize={a.size} "
-        f"filename_tz={a.filename_tz} suffix={a.suffix!r}\n"
-    )
+    print(f"src={src}\ndst={dst}\nsize={a.size} zone={a.zone!r} suffix={a.suffix!r}\n")
+
     total_ok = total_skip = total_11 = 0
     for site_root, rel_parts in jobs:
         label = "/".join(rel_parts)
         dst_dir = dst.joinpath(*rel_parts)
         print(f"Job {label} ({site_root}) -> {dst_dir}")
-        o, k, n11 = run_site(
-            site_root,
-            dst_dir,
-            a.size,
-            a.filename_tz,
-            a.suffix,
-            a.dry_run,
-        )
+        o, k, n11 = run_site(site_root, dst_dir, a.size, la_tz, a.suffix, a.dry_run)
         print(f"  ok {o} skip {k}")
         total_ok += o
         total_skip += k
