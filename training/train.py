@@ -132,6 +132,12 @@ def main():
         help="For split=test: minutes between consecutive eval anchors (multiple of CSV row interval).",
     )
     parser.add_argument(
+        "--val_anchor_stride_min",
+        type=int,
+        default=h["val_anchor_stride_min"],
+        help="For split=val: minutes between consecutive val anchors (multiple of CSV row interval).",
+    )
+    parser.add_argument(
         "--test_collect_time_match_tolerance_min",
         type=int,
         default=h["test_collect_time_match_tolerance_min"],
@@ -219,6 +225,7 @@ def main():
         pv_output_len=args.pv_output_len,
         pv_train_time_fraction=args.pv_train_time_fraction,
         test_anchor_stride_min=args.test_anchor_stride_min,
+        val_anchor_stride_min=args.val_anchor_stride_min,
         test_collect_time_match_tolerance_min=args.test_collect_time_match_tolerance_min,
         skyimg_window_size=args.skyimg_window_size,
         skyimg_time_resolution_min=args.skyimg_time_resolution_min,
@@ -239,6 +246,7 @@ def main():
         pv_output_len=args.pv_output_len,
         pv_train_time_fraction=args.pv_train_time_fraction,
         test_anchor_stride_min=args.test_anchor_stride_min,
+        val_anchor_stride_min=args.val_anchor_stride_min,
         test_collect_time_match_tolerance_min=args.test_collect_time_match_tolerance_min,
         skyimg_window_size=args.skyimg_window_size,
         skyimg_time_resolution_min=args.skyimg_time_resolution_min,

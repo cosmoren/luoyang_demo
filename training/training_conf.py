@@ -19,6 +19,7 @@ TRAINING_HPARAM_KEYS = frozenset({
     "pv_output_len",
     "pv_train_time_fraction",
     "test_anchor_stride_min",
+    "val_anchor_stride_min",
     "test_collect_time_match_tolerance_min",
     "skyimg_window_size",
     "skyimg_time_resolution_min",

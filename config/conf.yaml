@@ -50,7 +50,9 @@ training:
   pv_output_len: 192
   # Chronological split per CSV: first N rows = train, rest = test; N = int(n_rows * fraction)
   pv_train_time_fraction: 0.7
-  test_anchor_stride_min: 12000 # 12000
+  test_anchor_stride_min: 6000 # 12000
+  # split=val: 10% row band is shorter than test; use a smaller stride (minutes) than test for enough val windows
+  val_anchor_stride_min: 1800
   # split=test: match reference last-X collectTime in each CSV within this many minutes (0 = exact)
   test_collect_time_match_tolerance_min: 0
   # Sky / Himawari stacks

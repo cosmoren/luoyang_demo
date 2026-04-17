@@ -58,7 +58,7 @@ def forward_vit(model: nn.Module, d: dict) -> torch.Tensor:
         sat_timefeats=d["sat_timefeats"],                # [B, T=24, C=9]
         skimg_tensor=d["skimg_tensor"],                  # [B, T=30, C=3, H=224, W=224]
         skimg_timefeats=d["skimg_timefeats"],            # [B, T=30, C=9]
-        nwp_tensor=d["nwp_tensor"],                     # [B, T_out, 7] or None
+        nwp_tensor=d["nwp_tensor"],                      # [B, T_out, 7] or None
     )
 
 
@@ -81,8 +81,8 @@ def train_one_epoch(
         B = d["device_id"].size(0)
         optimizer.zero_grad()
         pv_pred = forward_vit(model, d)
-        # loss = criterion(pv_pred * d["target_mask"], d["target_pv"] * d["target_mask"])
-        loss = criterion(pv_pred, d["target_pv"])
+        loss = criterion(pv_pred * d["target_mask"], d["target_pv"] * d["target_mask"])
+        # loss = criterion(pv_pred, d["target_pv"])
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
@@ -91,7 +91,9 @@ def train_one_epoch(
     return total_loss / max(n, 1)
 
 
-def evaluate(model: nn.Module, device: torch.device, loader: DataLoader, criterion: nn.Module) -> float:
+def evaluate(
+    model: nn.Module, device: torch.device, loader: DataLoader, criterion: nn.Module
+) -> tuple[float, float]:
     model.eval()
     total_loss = 0.0
     n = 0
@@ -102,19 +104,26 @@ def evaluate(model: nn.Module, device: torch.device, loader: DataLoader, criteri
             d = _batch_to_device(batch, device)
             B = d["device_id"].size(0)
             pv_pred = forward_vit(model, d)
-            # loss = criterion(pv_pred * d["target_mask"], d["target_pv"] * d["target_mask"])
-            loss = criterion(pv_pred, d["target_pv"])
+            loss = criterion(pv_pred * d["target_mask"], d["target_pv"] * d["target_mask"])
+            # loss = criterion(pv_pred, d["target_pv"])
             total_loss += loss.item()
             n += B
             # save these values and used them to compute the MAE and RMSE of the total station
             for i in range(pv_pred.shape[0]):
-                kk = int(d["device_id"][i].item())
+                kk = int(d["device_id"][i].item()) # the inverter ID
+                # forecast_timefeats[:, 3] == cos_zenith (see solar_features_encoder column order)
+                cos_zenith = d["forecast_timefeats"][i][:, 3].detach().cpu().float().numpy()
+                night = cos_zenith < 0
+                pred_np = pv_pred[i].detach().cpu().float().numpy().copy()
+                tgt_np = d["target_pv"][i].detach().cpu().float().numpy().copy()
+                pred_np[night] = 0.0
+                # tgt_np[night] = 0.0
+                discrete_pred = pred_np.tolist()
+                discrete_target = tgt_np.tolist()
                 if kk not in pred_dict:
                     pred_dict[kk] = []
                     target_dict[kk] = []
-                discrete_pred = pv_pred[i].detach().cpu().float().tolist()
                 pred_dict[kk].append(discrete_pred)
-                discrete_target = d["target_pv"][i].detach().cpu().float().tolist()
                 target_dict[kk].append(discrete_target)
         
         total_pred = None
@@ -137,7 +146,7 @@ def evaluate(model: nn.Module, device: torch.device, loader: DataLoader, criteri
         print(f"t0 - t0+48h, 15min interval, 192 points. Capacity: {capacity}(KW)")
         print(f"MAE: {mae:.6f}, RMSE: {rmse:.6f}, ACC(MAE): {1.0 - mae/capacity:.6f}, ACC(RMSE): {1.0 - rmse/capacity:.6f}")
     
-    return total_loss / max(n, 1)
+    return total_loss / max(n, 1), rmse
 
 
 def _build_lr_scheduler(
@@ -244,6 +253,12 @@ def _build_parser(path_defaults: dict, h: dict) -> argparse.ArgumentParser:
         help="For split=test: minutes between consecutive eval anchors (multiple of CSV row interval).",
     )
     parser.add_argument(
+        "--val_anchor_stride_min",
+        type=int,
+        default=h["val_anchor_stride_min"],
+        help="For split=val: minutes between consecutive val anchors (multiple of CSV row interval; val band is short, often smaller than test).",
+    )
+    parser.add_argument(
         "--test_collect_time_match_tolerance_min",
         type=int,
         default=h["test_collect_time_match_tolerance_min"],
@@ -321,6 +336,7 @@ def _dataset_kwargs(args: argparse.Namespace, satimg_hwc: tuple[int, int, int], 
         pv_output_len=args.pv_output_len,
         pv_train_time_fraction=args.pv_train_time_fraction,
         test_anchor_stride_min=args.test_anchor_stride_min,
+        val_anchor_stride_min=args.val_anchor_stride_min,
         test_collect_time_match_tolerance_min=args.test_collect_time_match_tolerance_min,
         skyimg_window_size=args.skyimg_window_size,
         skyimg_time_resolution_min=args.skyimg_time_resolution_min,
@@ -364,12 +380,22 @@ def main() -> None:
     criterion = nn.MSELoss()
 
     train_dataset = PVDataset(**_dataset_kwargs(args, satimg_hwc, "train"))
+    val_dataset = PVDataset(**_dataset_kwargs(args, satimg_hwc, "val"))
     test_dataset = PVDataset(**_dataset_kwargs(args, satimg_hwc, "test"))
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
+        collate_fn=collate_batched,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
         collate_fn=collate_batched,
         num_workers=args.num_workers,
         pin_memory=True,
@@ -387,10 +413,12 @@ def main() -> None:
 
     checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else _PROJECT_ROOT / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    best_ckpt_path = checkpoint_dir / "pv_forecast_vit_best.pt"
 
-    initial_test_loss = evaluate(model, device, test_loader, criterion)
+    initial_test_loss, _ = evaluate(model, device, test_loader, criterion)
     print(f"Initial test loss: {initial_test_loss:.6f}")
 
+    rmse_min = 1e8
     for epoch in range(1, args.epochs + 1):
         cur_lr = optimizer.param_groups[0]["lr"]
         avg_loss = train_one_epoch(
@@ -401,10 +429,10 @@ def main() -> None:
             optimizer,
             max_batches=args.train_max_batches_per_epoch,
         )
-        test_loss = evaluate(model, device, test_loader, criterion)
+        val_loss, val_rmse = evaluate(model, device, val_loader, criterion)
         print(
             f"Epoch {epoch}/{args.epochs}  lr={cur_lr:.2e}  "
-            f"train_loss={avg_loss:.6f}  test_loss={test_loss:.6f}"
+            f"train_loss={avg_loss:.6f}  val_loss={val_loss:.6f}"
         )
         scheduler.step()
 
@@ -422,6 +450,20 @@ def main() -> None:
                 path,
             )
             print(f"  saved {path}")
+        
+        if val_rmse < rmse_min:
+            rmse_min = val_rmse
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "loss": avg_loss,
+                    "dev_dn_list": dev_dn_list,
+                },
+                best_ckpt_path,
+            )
 
     final_path = checkpoint_dir / "pv_forecast_vit_final.pt"
     torch.save(
@@ -435,6 +477,17 @@ def main() -> None:
         final_path,
     )
     print(f"Saved final checkpoint to {final_path}")
+
+    if best_ckpt_path.is_file():
+        ckpt = torch.load(best_ckpt_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        test_loss_best, test_rmse_best = evaluate(model, device, test_loader, criterion)
+        print(
+            f"Test set with best val-RMSE checkpoint ({best_ckpt_path.name}, epoch={ckpt.get('epoch', '?')}): "
+            f"loss={test_loss_best:.6f}, RMSE={test_rmse_best:.6f}"
+        )
+    else:
+        print(f"No {best_ckpt_path.name} on disk; skip test evaluation with best checkpoint.")
 
 
 if __name__ == "__main__":

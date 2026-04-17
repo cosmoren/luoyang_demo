@@ -163,19 +163,24 @@ def interpolate_nwp_features(nwp_solar_df, nwp_wind_df, forecast_timestamps_utc,
 class PVDataset(Dataset):
     """
     **Chronological split (per CSV, same for all files sharing the reference row count):** row indices
-    ``[0, split_idx)`` are the train segment, ``[split_idx, n)`` the test segment, with
-    ``split_idx = int(n * pv_train_time_fraction)``. An anchor is used for **train** only if the full
-    X+Y window lies in the train segment (last Y row ``< split_idx``); for **test** only if the full
-    window lies in the test segment (first X row ``>= split_idx``). Sky/sat are still loaded by
-    timestamp for each sample.
+    are partitioned in fixed proportions: first **60%** train, next **10%** validation, last **30%** test.
+    Let ``split_train_end = int(n * 0.6)`` and ``split_val_end = int(n * 0.7)``. An anchor is used for
+    **train** only if the full X+Y window lies in ``[0, split_train_end)`` (last Y row ``< split_train_end``);
+    for **val** only if the window lies in ``[split_train_end, split_val_end)``;
+    for **test** only if the window lies in ``[split_val_end, n)``.
+    Sky/sat are still loaded by timestamp for each sample.
+
+    The ``pv_train_time_fraction`` constructor argument is kept for call-site compatibility but **not** used
+    for these boundaries (splits are fixed at 60% / 10% / 30%).
 
     Train: ``__len__`` = number of CSVs; ``__getitem__`` picks a **random** train-segment anchor where Y has at
     least one ``inverter_state == VALID_STATE``.
 
-    Test (``split="test"``): ``__len__`` = ``len(sample_files) * num_test_windows``; test-segment anchors are
-    subsampled every ``test_anchor_stride_min`` along the CSV row axis (no Y validity filter). For each test
-    window, the **reference** last-X ``collectTime`` is stored; each inverter CSV resolves the row index that
-    matches that time (within ``test_collect_time_match_tolerance_min``) so all devices share the same wall times.
+    Val (``split="val"``): anchors in the val row band are taken every ``val_anchor_stride_min`` (CSV row axis,
+    no Y validity filter). Test (``split="test"``): same idea with ``test_anchor_stride_min``.
+    ``__len__`` = ``len(sample_files) * num_{val|test}_windows``. For each window, the **reference** last-X
+    ``collectTime`` from the first CSV is stored; each inverter CSV resolves the row index that matches that
+    time (within ``test_collect_time_match_tolerance_min``) so all devices share the same wall times.
 
     Sky images (under ``data_dir`` / ``paths.sky_image_path``, ``YYYYMMDDHHMMSS_12.jpg``): history sequence
     ends at the last X ``collectTime``; forecast sequence starts at the first Y ``collectTime``;
@@ -207,6 +212,7 @@ class PVDataset(Dataset):
         pv_output_len: int = _TRAINING_HPARAM_DEFAULTS["pv_output_len"],
         pv_train_time_fraction: float = _TRAINING_HPARAM_DEFAULTS["pv_train_time_fraction"],
         test_anchor_stride_min: int = _TRAINING_HPARAM_DEFAULTS["test_anchor_stride_min"],
+        val_anchor_stride_min: int = _TRAINING_HPARAM_DEFAULTS["val_anchor_stride_min"],
         test_collect_time_match_tolerance_min: int = _TRAINING_HPARAM_DEFAULTS[
             "test_collect_time_match_tolerance_min"
         ],
@@ -217,8 +223,8 @@ class PVDataset(Dataset):
         satimg_time_resolution_min: int = _TRAINING_HPARAM_DEFAULTS["satimg_time_resolution_min"],
         satimg_npy_shape_hwc: tuple[int, int, int] = _TRAINING_HPARAM_DEFAULTS["satimg_npy_shape_hwc"],
     ):
-        if split not in ("train", "test"):
-            raise ValueError("split must be 'train' or 'test'")
+        if split not in ("train", "val", "test"):
+            raise ValueError("split must be 'train', 'val', or 'test'")
         self.split = split
         if skyimg_window_size < 1:
             raise ValueError("skyimg_window_size must be >= 1")
@@ -259,6 +265,12 @@ class PVDataset(Dataset):
                 f"(got {test_anchor_stride_min}, csv_interval_min={csv_interval_min})"
             )
         self._test_anchor_stride_rows = test_anchor_stride_min // csv_interval_min
+        if val_anchor_stride_min <= 0 or val_anchor_stride_min % csv_interval_min:
+            raise ValueError(
+                "val_anchor_stride_min must be a positive multiple of csv_interval_min "
+                f"(got {val_anchor_stride_min}, csv_interval_min={csv_interval_min})"
+            )
+        self._val_anchor_stride_rows = val_anchor_stride_min // csv_interval_min
         tol_m = int(test_collect_time_match_tolerance_min)
         if tol_m < 0:
             raise ValueError("test_collect_time_match_tolerance_min must be >= 0")
@@ -321,31 +333,47 @@ class PVDataset(Dataset):
         self._x_tail_1d = (-(lx - 1) * sx + np.arange(lx, dtype=np.intp) * sx).astype(np.intp, copy=False)
         self._y_off_1d = (sy + np.arange(ly, dtype=np.intp) * sy).astype(np.intp, copy=False)
 
-        split_idx = int(n * self._pv_train_time_fraction)
-        if split_idx <= 0 or split_idx >= n:
+        split_train_end = int(n * 0.6)
+        split_val_end = int(n * 0.7)
+        if not (0 < split_train_end < split_val_end < n):
             raise ValueError(
-                f"pv_train_time_fraction={self._pv_train_time_fraction} gives split_idx={split_idx} for n={n}; "
-                "need 0 < split_idx < n"
+                f"fixed 60%/10%/30% row split invalid for n={n}: "
+                f"split_train_end={split_train_end}, split_val_end={split_val_end}"
             )
         min_row = anchors - (lx - 1) * sx
         max_row = anchors + ly * sy
-        self._train_anchor_mask = max_row < split_idx
-        self._test_anchor_mask = min_row >= split_idx
+        self._train_anchor_mask = max_row < split_train_end
+        self._val_anchor_mask = (min_row >= split_train_end) & (max_row < split_val_end)
+        self._test_anchor_mask = min_row >= split_val_end
         if self.split == "train" and not bool(self._train_anchor_mask.any()):
             raise RuntimeError(
-                f"split=train: no anchor fits entirely in the first {split_idx} rows "
-                f"(pv_train_time_fraction={self._pv_train_time_fraction}); shorten windows or adjust fraction"
+                f"split=train: no anchor fits entirely in the first {split_train_end} rows (60% of n={n}); "
+                "shorten windows or check data length"
+            )
+        if self.split == "val" and not bool(self._val_anchor_mask.any()):
+            raise RuntimeError(
+                f"split=val: no anchor fits entirely in rows [{split_train_end}, {split_val_end}) "
+                f"(10% val band); adjust window lengths or stride"
             )
         if self.split == "test" and not bool(self._test_anchor_mask.any()):
             raise RuntimeError(
-                f"split=test: no anchor fits entirely from row {split_idx} onward; "
-                "adjust pv_train_time_fraction or window lengths"
+                f"split=test: no anchor fits entirely from row {split_val_end} onward (last 30%); "
+                "adjust window lengths"
             )
 
-        n_anchors = len(anchors)
+        val_stride = self._val_anchor_stride_rows
+        val_anchor_positions = np.nonzero(self._val_anchor_mask)[0]
+        self._val_r_indices = val_anchor_positions[::val_stride].astype(np.intp, copy=False)
+        self._num_val_windows = int(self._val_r_indices.size)
+        if self.split == "val" and self._num_val_windows == 0:
+            raise RuntimeError(
+                "split=val: no val anchors after stride subsampling "
+                "(reduce val_anchor_stride_min or widen the val segment)"
+            )
+
+        test_stride = self._test_anchor_stride_rows
         test_anchor_positions = np.nonzero(self._test_anchor_mask)[0]
-        stride = self._test_anchor_stride_rows
-        self._test_r_indices = test_anchor_positions[::stride].astype(np.intp, copy=False)
+        self._test_r_indices = test_anchor_positions[::test_stride].astype(np.intp, copy=False)
         self._num_test_windows = int(self._test_r_indices.size)
         if self.split == "test" and self._num_test_windows == 0:
             raise RuntimeError(
@@ -353,13 +381,26 @@ class PVDataset(Dataset):
                 "(reduce test_anchor_stride_min or widen the test segment)"
             )
 
-        if self.split == "test":
-            last_x_rows = anchors[self._test_r_indices]
+        if self.split in ("val", "test"):
             ct_ref = pd.to_datetime(ref_df["collectTime"], errors="coerce")
             if ct_ref.isna().any():
                 raise ValueError(f"reference CSV {self.sample_files[0].name}: NaT in collectTime")
-            self._test_last_x_time_ref = [pd.Timestamp(ct_ref.iloc[int(row)]) for row in last_x_rows]
+            if self.split == "val":
+                last_x_rows_val = anchors[self._val_r_indices]
+                self._val_last_x_time_ref = [
+                    pd.Timestamp(ct_ref.iloc[int(row)]) for row in last_x_rows_val
+                ]
+            else:
+                self._val_last_x_time_ref = None
+            if self.split == "test":
+                last_x_rows = anchors[self._test_r_indices]
+                self._test_last_x_time_ref = [
+                    pd.Timestamp(ct_ref.iloc[int(row)]) for row in last_x_rows
+                ]
+            else:
+                self._test_last_x_time_ref = None
         else:
+            self._val_last_x_time_ref = None
             self._test_last_x_time_ref = None
 
         valid_files: list[Path] = []
@@ -382,9 +423,12 @@ class PVDataset(Dataset):
                 valid_files.append(p)
 
         self.sample_files = valid_files
-        _tw = (
-            f", test_windows_per_file={self._num_test_windows}" if self.split == "test" else ""
-        )
+        if self.split == "val":
+            _tw = f", val_windows_per_file={self._num_val_windows}"
+        elif self.split == "test":
+            _tw = f", test_windows_per_file={self._num_test_windows}"
+        else:
+            _tw = ""
         print(f"Valid files: {len(self.sample_files)} ({self.split}{_tw})")
         if not self.sample_files:
             raise RuntimeError(
@@ -399,6 +443,8 @@ class PVDataset(Dataset):
     def __len__(self):
         if self.split == "train":
             return len(self.sample_files)
+        if self.split == "val":
+            return len(self.sample_files) * self._num_val_windows
         return len(self.sample_files) * self._num_test_windows
 
     def _row_index_for_collect_time_match(
@@ -649,6 +695,7 @@ class PVDataset(Dataset):
         target_pv = torch.from_numpy((pow_y / 50.0).astype(np.float32))
         target_mask = torch.from_numpy((inv_y == VALID_STATE).astype(np.float32))
 
+        '''
         t_x_end = sub_x["collectTime"].iloc[-1]
         sat_timestamps_utc = self._to_utc_timestamps(
             self._history_satimg_frame_utc_times(t_x_end), naive_tz="UTC"
@@ -668,6 +715,11 @@ class PVDataset(Dataset):
         skimg_dtimefeats = delta_time_encoder(skimg_timestamps_utc, time0_utc)
         skimg_timefeats = torch.cat([skimg_timefeats, skimg_dtimefeats.unsqueeze(1)], dim=1)
         skimg_tensor = self._stack_sky_frames(skimg_timestamps_utc)
+        '''
+        sat_tensor = None
+        skimg_tensor = None
+        sat_timefeats = None
+        skimg_timefeats = None
 
         return {
             "dev_idx": dev_idx,
@@ -689,6 +741,10 @@ class PVDataset(Dataset):
         if self.split == "train":
             sample_path = self.sample_files[idx]
             r_fixed: int | None = None
+        elif self.split == "val":
+            nw = self._num_val_windows
+            sample_path = self.sample_files[idx // nw]
+            r_fixed = int(self._val_r_indices[idx % nw])
         else:
             nw = self._num_test_windows
             sample_path = self.sample_files[idx // nw]
@@ -725,9 +781,16 @@ class PVDataset(Dataset):
             r = int(np.random.choice(valid_rows))
         else:
             assert r_fixed is not None
-            assert self._test_last_x_time_ref is not None
-            k = idx % self._num_test_windows
-            T_ref = self._test_last_x_time_ref[k]
+            if self.split == "val":
+                assert self._val_last_x_time_ref is not None
+                nw = self._num_val_windows
+                time_ref_list = self._val_last_x_time_ref
+            else:
+                assert self._test_last_x_time_ref is not None
+                nw = self._num_test_windows
+                time_ref_list = self._test_last_x_time_ref
+            k = idx % nw
+            T_ref = time_ref_list[k]
             j = self._row_index_for_collect_time_match(df["collectTime"], T_ref, sample_path.name)
             return self._build_sample(df, dev_idx, r_fixed, anchor_last_row=j)
 
@@ -748,12 +811,11 @@ def collate_batched(batch):
         "pv_mask": _stack("pv_mask"),
         "pv_timefeats": _stack("pv_timefeats"),
         "forecast_timefeats": _stack("forecast_timefeats"),
-        "sat_tensor": _stack("sat_tensor"),
-        "sat_timefeats": _stack("sat_timefeats"),
+        "nwp_tensor": _stack("nwp_tensor"),
         "target_pv": _stack("target_pv"),
         "target_mask": _stack("target_mask"),
     }
-    for key in ("skimg_tensor", "skimg_timefeats", "nwp_tensor"):
+    for key in ("sat_tensor", "sat_timefeats", "skimg_tensor", "skimg_timefeats"):
         vals = [s[key] for s in batch]
         if vals[0] is None:
             if not all(v is None for v in vals):
