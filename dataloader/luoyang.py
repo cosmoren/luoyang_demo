@@ -25,7 +25,6 @@ from training.training_conf import CONF_PATH, get_training_hparams_from_conf, lo
 INVERTER_STATE_COL = "inverter_state"
 VALID_STATE = 512
 
-
 def load_csv(csv_path: Path | str) -> pd.DataFrame:
     """Load a single device CSV; ensure collectTime is parsed and sorted."""
     df = pd.read_csv(csv_path)
@@ -404,6 +403,7 @@ class PVDataset(Dataset):
             self._test_last_x_time_ref = None
 
         valid_files: list[Path] = []
+        self._csv_cache: dict[str, pd.DataFrame] = {}
         for i, p in enumerate(self.sample_files):
             print(f"Processing file {i+1} of {len(self.sample_files)}: {p.name}")
             df = ref_df if i == 0 else load_csv(p)
@@ -411,6 +411,7 @@ class PVDataset(Dataset):
                 continue
             if INVERTER_STATE_COL not in df.columns:
                 continue
+            cache_key = p.resolve().as_posix()
             if self.split == "train":
                 inv = (
                     pd.to_numeric(df[INVERTER_STATE_COL], errors="coerce").fillna(0).astype(int).values
@@ -419,8 +420,10 @@ class PVDataset(Dataset):
                 ok = inv[self._y_idx_per_anchor].any(axis=1) & self._train_anchor_mask
                 if ok.any():
                     valid_files.append(p)
+                    self._csv_cache[cache_key] = df
             else:
                 valid_files.append(p)
+                self._csv_cache[cache_key] = df
 
         self.sample_files = valid_files
         if self.split == "val":
@@ -756,7 +759,14 @@ class PVDataset(Dataset):
         except ValueError as e:
             raise ValueError(f"devDn {devDn!r} from {sample_path.name} not in pv_device list") from e
 
-        df = load_csv(sample_path)
+        cache_key = sample_path.resolve().as_posix()
+        try:
+            df = self._csv_cache[cache_key]
+        except KeyError as e:
+            raise RuntimeError(
+                f"CSV not in in-memory cache for {sample_path.name!r} (key={cache_key!r}); "
+                "this path must be in PVDataset.sample_files from __init__"
+            ) from e
         if INVERTER_STATE_COL not in df.columns:
             raise ValueError(f"missing {INVERTER_STATE_COL} in {sample_path}")
 

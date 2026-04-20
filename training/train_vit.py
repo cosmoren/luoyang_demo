@@ -22,7 +22,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 from config_utils import get_resolved_paths
 from dataloader.luoyang import PVDataset, collate_batched
-from models.models import pv_forecasting_model_vit_nwp
+from models.models import pv_forecasting_model_vit_nwp_short
 from training.training_conf import (
     get_training_hparams_from_conf,
     get_training_paths_from_conf,
@@ -363,7 +363,7 @@ def main() -> None:
     dev_dn_list = pv_device_df["devDn"].dropna().unique().tolist()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = pv_forecasting_model_vit_nwp(dev_dn_list=dev_dn_list).to(device)
+    model = pv_forecasting_model_vit_nwp_short(dev_dn_list=dev_dn_list).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -486,7 +486,7 @@ def main() -> None:
             f"Test set with best val-RMSE checkpoint ({best_ckpt_path.name}, epoch={ckpt.get('epoch', '?')}): "
             f"loss={test_loss_best:.6f}, RMSE={test_rmse_best:.6f}, MAE={test_mae_best:.6f}"
         )
-        metrics_log = checkpoint_dir / "pv_forecast_ssrd_msl_t2m_huber.txt"
+        metrics_log = checkpoint_dir / "pv_forecast_ssrd_t2m_short.txt"
         with open(metrics_log, "a", encoding="utf-8") as mf:
             mf.write(
                 f"{test_loss_best:.8f}\t{test_rmse_best:.8f}\t{test_mae_best:.8f}\n"

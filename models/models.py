@@ -428,6 +428,82 @@ class pv_forecasting_model_vit_nwp(nn.Module):
 
 
 # Using PV history and NWP to forecast PV, solar features and NWP features are used as query
+class pv_forecasting_model_vit_nwp_short(nn.Module):
+    def __init__(self, use_batchnorm: bool = True, dropout: float = 0.0, dev_dn_list: Optional[list] = None):
+        super().__init__()
+
+        self.use_batchnorm = use_batchnorm
+        self.dropout = dropout
+
+        self.inverter_embedding = nn.Embedding(num_embeddings=1000, embedding_dim=16)
+        self.TCN = TemporalCNN1d(in_channels=11, out_channels=64, use_batchnorm=use_batchnorm, dropout=dropout)
+
+        self.time_mlp = nn.Sequential(
+            nn.Linear(9, 64),
+            nn.GELU(),
+            nn.Linear(64, 64),
+        )
+        self.corase_idx = [18, 54, 90, 126, 162, 198, 234, 270, 295, 308, 322, 335, 349, 362, 376, 389,
+                           403, 416, 430, 443, 457, 470, 484, 497, 505, 508, 511, 514, 517, 520, 523, 526,
+                           529, 532, 535, 538, 541, 544, 547, 550, 553, 556, 559, 562, 565, 568, 571, 574]
+        self.learnable_pv_queries = nn.Parameter(torch.randn(1, 48, 64))
+        self.cross_attention_pv_compression = CrossAttention(query_dim=64, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
+        
+        self.query_mlp = MLP(in_dim=12, hidden_dims=(64, 64), out_dim=64, dropout=0.0)
+        self.cross_attention_pv = CrossAttention(query_dim=64, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
+        # self.cross_attention_sat = CrossAttention(query_dim=9, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
+        # self.cross_attention_skimg = CrossAttention(query_dim=9, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
+        # self.sat_downdim = MLP(in_dim=768, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
+        # self.skimg_downdim = MLP(in_dim=768, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
+        # self.timefeats_encoder = MLP(in_dim=9, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
+        self.pv_feats_head = MLP(in_dim=80, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
+        self.fc = FC(in_dim=64, out_dim=1)
+
+    def forward(self, device_id: torch.Tensor, pv: torch.Tensor, 
+                pv_mask: Optional[torch.Tensor] = None, 
+                pv_timefeats: Optional[torch.Tensor] = None,
+                forecast_timefeats: Optional[torch.Tensor] = None,
+                sat_tensor: Optional[torch.Tensor] = None,
+                sat_timefeats: Optional[torch.Tensor] = None,
+                skimg_tensor: Optional[torch.Tensor] = None,
+                skimg_timefeats: Optional[torch.Tensor] = None,
+                nwp_tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
+        
+        # PV history features
+        pv_masked = pv * pv_mask.to(pv.dtype)
+        pv_history = torch.cat([pv_masked, pv_mask, pv_timefeats.permute(0, 2, 1)], dim=1)  # [B, C=11, T]
+        pv_hist_mem = self.TCN(pv_history, pv_mask)     # [B, C_out, T]()
+        KV_hist_mem = pv_hist_mem.permute(0, 2, 1)   # [B, T, C_out]
+
+        # PV time features compression
+        pv_timefeats_corase = pv_timefeats[:, self.corase_idx, :]
+        pv_timefeats_corase = self.time_mlp(pv_timefeats_corase)
+        learnable_pv_queries = self.learnable_pv_queries.repeat(pv_timefeats_corase.shape[0], 1, 1)
+        corase_queries = learnable_pv_queries + pv_timefeats_corase
+        KV_hist_mem_compressed = self.cross_attention_pv_compression(query=corase_queries, key=KV_hist_mem, value=KV_hist_mem) # [B,48,D=64] 48 pv tokens
+        # KV_hist_mem_compressed = KV_hist_mem_compressed + pv_timefeats_corase
+        
+        # Forecast features
+        ssrd_normalized = (nwp_tensor[:,:,0]/1000 - 0.5)*2
+        # msl_normalized = (nwp_tensor[:,:,1]-101325)/1000
+        t2m_normalized = (nwp_tensor[:,:,2]-288.15)/10
+        forecast_ssrd_timefeats = torch.cat([forecast_timefeats, ssrd_normalized.unsqueeze(2), t2m_normalized.unsqueeze(2), nwp_tensor[:,:,-1].unsqueeze(2)], dim=2)
+        forecast_query = self.query_mlp(forecast_ssrd_timefeats)
+        forecast_pv_features = self.cross_attention_pv(query=forecast_query, key=KV_hist_mem_compressed, value=KV_hist_mem_compressed)   #[B,T,D]
+
+        # Inverter features (embeddings)
+        inverter_features = self.inverter_embedding(device_id).unsqueeze(1).repeat(1, forecast_pv_features.shape[1], 1)
+
+        # Fuse and predict
+        fused = torch.cat([forecast_pv_features, inverter_features], dim=2)   # [B=1,T=192,C=80]
+        pv_feats = self.pv_feats_head(fused)
+        pv = self.fc(pv_feats)
+
+        return pv.squeeze(-1)
+
+
+
+# Using PV history and NWP to forecast PV, solar features and NWP features are used as query
 class pv_forecasting_model_vit_imgs(nn.Module):
     """
     Like ``pv_forecasting_model_vit_nwp`` but satellite frames go through
