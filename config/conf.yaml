@@ -63,7 +63,7 @@ training:
   satimg_time_resolution_min: 10 # multiple of 10
   satimg_npy_shape_hwc: [100, 100, 3] # expected np.load array layout (height, width, channels)
   # Optimization and training loop
-  epochs: 50
+  epochs: 20
   lr: 5e-4
   batch_size: 16
   save_every: 5

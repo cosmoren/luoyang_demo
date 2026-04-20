@@ -93,7 +93,7 @@ def train_one_epoch(
 
 def evaluate(
     model: nn.Module, device: torch.device, loader: DataLoader, criterion: nn.Module
-) -> tuple[float, float]:
+) -> tuple[float, float, float]:
     model.eval()
     total_loss = 0.0
     n = 0
@@ -146,7 +146,7 @@ def evaluate(
         print(f"t0 - t0+48h, 15min interval, 192 points. Capacity: {capacity}(KW)")
         print(f"MAE: {mae:.6f}, RMSE: {rmse:.6f}, ACC(MAE): {1.0 - mae/capacity:.6f}, ACC(RMSE): {1.0 - rmse/capacity:.6f}")
     
-    return total_loss / max(n, 1), rmse
+    return total_loss / max(n, 1), rmse, mae
 
 
 def _build_lr_scheduler(
@@ -377,7 +377,7 @@ def main() -> None:
         warmup_epochs=args.warmup_epochs,
         lr_min=args.lr_min,
     )
-    criterion = nn.MSELoss()
+    criterion = nn.HuberLoss(delta=1.0)  # nn.MSELoss()
 
     train_dataset = PVDataset(**_dataset_kwargs(args, satimg_hwc, "train"))
     val_dataset = PVDataset(**_dataset_kwargs(args, satimg_hwc, "val"))
@@ -415,7 +415,7 @@ def main() -> None:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_ckpt_path = checkpoint_dir / "pv_forecast_vit_best.pt"
 
-    initial_test_loss, _ = evaluate(model, device, test_loader, criterion)
+    initial_test_loss, _, _ = evaluate(model, device, test_loader, criterion)
     print(f"Initial test loss: {initial_test_loss:.6f}")
 
     rmse_min = 1e8
@@ -429,7 +429,7 @@ def main() -> None:
             optimizer,
             max_batches=args.train_max_batches_per_epoch,
         )
-        val_loss, val_rmse = evaluate(model, device, val_loader, criterion)
+        val_loss, val_rmse, _ = evaluate(model, device, val_loader, criterion)
         print(
             f"Epoch {epoch}/{args.epochs}  lr={cur_lr:.2e}  "
             f"train_loss={avg_loss:.6f}  val_loss={val_loss:.6f}"
@@ -481,13 +481,21 @@ def main() -> None:
     if best_ckpt_path.is_file():
         ckpt = torch.load(best_ckpt_path, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"])
-        test_loss_best, test_rmse_best = evaluate(model, device, test_loader, criterion)
+        test_loss_best, test_rmse_best, test_mae_best = evaluate(model, device, test_loader, criterion)
         print(
             f"Test set with best val-RMSE checkpoint ({best_ckpt_path.name}, epoch={ckpt.get('epoch', '?')}): "
-            f"loss={test_loss_best:.6f}, RMSE={test_rmse_best:.6f}"
+            f"loss={test_loss_best:.6f}, RMSE={test_rmse_best:.6f}, MAE={test_mae_best:.6f}"
         )
+        metrics_log = checkpoint_dir / "pv_forecast_ssrd_msl_t2m_huber.txt"
+        with open(metrics_log, "a", encoding="utf-8") as mf:
+            mf.write(
+                f"{test_loss_best:.8f}\t{test_rmse_best:.8f}\t{test_mae_best:.8f}\n"
+            )
+        print(f"Appended best-test metrics to {metrics_log}")
     else:
         print(f"No {best_ckpt_path.name} on disk; skip test evaluation with best checkpoint.")
+
+
 
 
 if __name__ == "__main__":

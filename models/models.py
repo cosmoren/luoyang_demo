@@ -359,7 +359,7 @@ class pv_forecasting_model_vit_nwp(nn.Module):
 
         self.inverter_embedding = nn.Embedding(num_embeddings=1000, embedding_dim=16)
         self.TCN = TemporalCNN1d(in_channels=11, out_channels=64, use_batchnorm=use_batchnorm, dropout=dropout)
-        self.query_mlp = MLP(in_dim=12, hidden_dims=(64, 64), out_dim=64, dropout=0.0)
+        self.query_mlp = MLP(in_dim=13, hidden_dims=(64, 64), out_dim=64, dropout=0.0)
         self.cross_attention_pv = CrossAttention(query_dim=64, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
         # self.cross_attention_sat = CrossAttention(query_dim=9, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
         # self.cross_attention_skimg = CrossAttention(query_dim=9, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
@@ -388,7 +388,7 @@ class pv_forecasting_model_vit_nwp(nn.Module):
         ssrd_normalized = (nwp_tensor[:,:,0]/1000 - 0.5)*2
         msl_normalized = (nwp_tensor[:,:,1]-101325)/1000
         t2m_normalized = (nwp_tensor[:,:,2]-288.15)/10
-        forecast_ssrd_timefeats = torch.cat([forecast_timefeats, ssrd_normalized.unsqueeze(2), t2m_normalized.unsqueeze(2), nwp_tensor[:,:,-1].unsqueeze(2)], dim=2)
+        forecast_ssrd_timefeats = torch.cat([forecast_timefeats, ssrd_normalized.unsqueeze(2), msl_normalized.unsqueeze(2), t2m_normalized.unsqueeze(2), nwp_tensor[:,:,-1].unsqueeze(2)], dim=2)
         forecast_query = self.query_mlp(forecast_ssrd_timefeats)
         forecast_pv_features = self.cross_attention_pv(query=forecast_query, key=KV_hist_mem, value=KV_hist_mem)   #[B,T,D]
 
