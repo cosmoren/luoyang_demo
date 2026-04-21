@@ -486,7 +486,7 @@ def main() -> None:
             f"Test set with best val-RMSE checkpoint ({best_ckpt_path.name}, epoch={ckpt.get('epoch', '?')}): "
             f"loss={test_loss_best:.6f}, RMSE={test_rmse_best:.6f}, MAE={test_mae_best:.6f}"
         )
-        metrics_log = checkpoint_dir / "pv_forecast_ssrd_t2m_short.txt"
+        metrics_log = checkpoint_dir / "pv_forecast_ssrd_t2m_short_add03timestamp_again.txt"
         with open(metrics_log, "a", encoding="utf-8") as mf:
             mf.write(
                 f"{test_loss_best:.8f}\t{test_rmse_best:.8f}\t{test_mae_best:.8f}\n"

@@ -481,7 +481,7 @@ class pv_forecasting_model_vit_nwp_short(nn.Module):
         learnable_pv_queries = self.learnable_pv_queries.repeat(pv_timefeats_corase.shape[0], 1, 1)
         corase_queries = learnable_pv_queries + pv_timefeats_corase
         KV_hist_mem_compressed = self.cross_attention_pv_compression(query=corase_queries, key=KV_hist_mem, value=KV_hist_mem) # [B,48,D=64] 48 pv tokens
-        # KV_hist_mem_compressed = KV_hist_mem_compressed + pv_timefeats_corase
+        KV_hist_mem_compressed = KV_hist_mem_compressed + 0.3*pv_timefeats_corase
         
         # Forecast features
         ssrd_normalized = (nwp_tensor[:,:,0]/1000 - 0.5)*2
