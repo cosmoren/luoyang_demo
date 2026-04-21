@@ -468,8 +468,9 @@ class PVDataset(Dataset):
         return ts.replace(second=0, microsecond=0, nanosecond=0)
 
     def _sky_jpg_path(self, ts: pd.Timestamp) -> Path:
-        stem = ts.strftime("%Y%m%d%H%M%S") + "_12"
+        stem = ts.strftime("%Y%m%d%H%M%S")
         return self._skyimg_dir / f"{stem}.jpg"
+        
 
     def _black_sky_tensor(self) -> torch.Tensor:
         s = self._skyimg_spatial_size
@@ -504,20 +505,20 @@ class PVDataset(Dataset):
         w = self.skyimg_window_size
         return [t_start + timedelta(minutes=i * self._skyimg_dt_min) for i in range(w)]
 
-    def _utc_to_sky_local_filename_ts(self, ts_utc: pd.Timestamp) -> pd.Timestamp:
-        """UTC instant → Asia/Shanghai wall time (second floored) for sky JPEG naming."""
-        return (
-            pd.Timestamp(ts_utc)
-            .tz_convert("Asia/Shanghai")
-            .replace(tzinfo=None)
-            .replace(second=0, microsecond=0, nanosecond=0)
-        )
+    # def _utc_to_sky_local_filename_ts(self, ts_utc: pd.Timestamp) -> pd.Timestamp:
+    #     """UTC instant → Asia/Shanghai wall time (second floored) for sky JPEG naming."""
+    #     return (
+    #         pd.Timestamp(ts_utc)
+    #         .tz_convert("Asia/Shanghai")
+    #         .replace(tzinfo=None)
+    #         .replace(second=0, microsecond=0, nanosecond=0)
+    #     )
 
     def _stack_sky_frames(self, frame_times_utc: list[pd.Timestamp]) -> torch.Tensor:
         """``frame_times_utc``: UTC-aware timestamps (same convention as ``forecast_timestamps_utc``)."""
         return torch.stack(
             [
-                self._load_sky_tensor(self._sky_jpg_path(self._utc_to_sky_local_filename_ts(t)))
+                self._load_sky_tensor(self._sky_jpg_path(pd.Timestamp(t).tz_convert("UTC").tz_localize(None)))
                 for t in frame_times_utc
             ],
             dim=0,
@@ -537,13 +538,18 @@ class PVDataset(Dataset):
         loc = local_naive.tz_localize("Asia/Shanghai", ambiguous=True)
         u = loc.tz_convert("UTC").tz_localize(None)
         return self._satimg_floor_utc_10min(u)
-
+    
     def _satimg_npy_path(self, t_utc_naive: pd.Timestamp) -> Path:
         u = self._satimg_floor_utc_10min(t_utc_naive)
-        stem = (
-            f"NC_H09_{u.strftime('%Y%m%d')}_{u.strftime('%H%M')}_L2CLP010_FLDK.02401_02401"
-        )
+        stem = u.strftime("%Y%m%d%H%M%S")
         return self._satimg_dir / f"{stem}.npy"
+
+    # def _satimg_npy_path(self, t_utc_naive: pd.Timestamp) -> Path:
+    #     u = self._satimg_floor_utc_10min(t_utc_naive)
+    #     stem = (
+    #         f"NC_H09_{u.strftime('%Y%m%d')}_{u.strftime('%H%M')}_L2CLP010_FLDK.02401_02401"
+    #     )
+    #     return self._satimg_dir / f"{stem}.npy"
 
     def _dummy_satimg_tensor(self) -> torch.Tensor:
         h, w, c = self._satimg_npy_shape_hwc
@@ -732,6 +738,246 @@ class PVDataset(Dataset):
             return self._build_sample(df, dev_idx, r_fixed, anchor_last_row=j)
 
         return self._build_sample(df, dev_idx, r)
+
+
+def _fmt_first_ellipsis_last(seq, *, head: int = 2, tail: int = 2) -> str:
+    """Format ``first head``, ``...``, ``last tail`` plus ``n=`` (for long debug lines)."""
+    n = len(seq)
+    if n == 0:
+        return "n=0"
+    if n <= head + tail:
+        body = ", ".join(str(seq[i]) for i in range(n))
+        return f"{body}, n={n}"
+    first = ", ".join(str(seq[i]) for i in range(head))
+    last = ", ".join(str(seq[i]) for i in range(n - tail, n))
+    return f"{first}, ..., {last}, n={n}"
+
+
+def _fmt_found_count(found: int, total: int, noun: str) -> str:
+    """Human-readable ``found/total`` for debug, e.g. ``1/1 file found`` or ``45/50 files found``."""
+    if total == 0:
+        return f"0 {noun}"
+    if total == 1:
+        return f"{found}/1 {noun} found"
+    return f"{found}/{total} {noun} found"
+
+
+def _count_sat_npy_ok(ds: "PVDataset", paths: list[Path]) -> int:
+    """Count ``.npy`` paths that ``_load_satimg_tensor`` would accept (shape + float32)."""
+    hwc = ds._satimg_npy_shape_hwc
+    ok = 0
+    for p in paths:
+        if not p.is_file():
+            continue
+        try:
+            arr = np.load(p, allow_pickle=False)
+            if arr.shape == hwc and arr.dtype == np.float32:
+                ok += 1
+        except Exception:
+            pass
+    return ok
+
+
+def what_to_fetch(
+    ds: "PVDataset",
+    df: pd.DataFrame,
+    r: int,
+    *,
+    anchor_last_row: int | None = None,
+) -> None:
+    """
+    Print exactly what sample creation will try to fetch (no policy checks).
+    """
+    if anchor_last_row is not None:
+        j = int(anchor_last_row)
+        x_idx = j + ds._x_tail_1d
+        y_idx_1d = j + ds._y_off_1d
+        if int(x_idx[0]) < 0 or int(y_idx_1d[-1]) >= len(df):
+            raise ValueError(
+                f"anchor_last_row={j} out of bounds for len(df)={len(df)} "
+                f"(x_idx range [{int(x_idx[0])}, {int(x_idx[-1])}], y_idx range [{int(y_idx_1d[0])}, {int(y_idx_1d[-1])}])"
+            )
+    else:
+        x_idx = ds._x_idx_per_anchor[r]
+        y_idx_1d = ds._y_idx_per_anchor[r]
+
+    sub_x = df.iloc[x_idx]
+    sub_y = df.iloc[y_idx_1d]
+
+    print("")
+    print("what to fetch:")
+    print("--------------------------------")
+
+    # PV input/output timestamps from the exact fetched CSV rows.
+    pv_times_raw = pd.to_datetime(sub_x["collectTime"], errors="coerce")
+    out_times_raw = pd.to_datetime(sub_y["collectTime"], errors="coerce")
+    n_in = len(pv_times_raw)
+    n_out = len(out_times_raw)
+
+    # Chronological along input window: earliest -> latest.
+    pv_in_list = [pv_times_raw.iloc[i] for i in range(n_in)]
+    print("PV_input: " + _fmt_first_ellipsis_last(pv_in_list))
+
+    out_list = [out_times_raw.iloc[i] for i in range(n_out)]
+    print("PV_output: " + _fmt_first_ellipsis_last(out_list))
+
+    t_x_end = sub_x["collectTime"].iloc[-1]
+
+    # Sky files exactly as _build_sample pathing uses them.
+    skimg_timestamps_utc = ds._to_utc_timestamps(
+        ds._history_sky_frame_times(t_x_end), naive_tz="Asia/Shanghai"
+    )
+    sky_paths = [
+        ds._sky_jpg_path(pd.Timestamp(t).tz_convert("UTC").tz_localize(None)) for t in skimg_timestamps_utc
+    ]
+    sky_names = [p.name for p in sky_paths]
+    print("Sky: " + _fmt_first_ellipsis_last(sky_names))
+
+    # Satellite files exactly as _build_sample pathing uses them.
+    sat_timestamps_utc = ds._to_utc_timestamps(
+        ds._history_satimg_frame_utc_times(t_x_end), naive_tz="UTC"
+    )
+    sat_paths = [
+        ds._satimg_npy_path(pd.Timestamp(t).tz_convert("UTC").tz_localize(None))
+        for t in sat_timestamps_utc
+    ]
+    sat_names = [p.name for p in sat_paths]
+    print("Satellite: " + _fmt_first_ellipsis_last(sat_names))
+
+    # NWP query times exactly as _build_sample computes them.
+    pv_times_utc = ds._to_utc_timestamps(list(sub_x["collectTime"]), naive_tz="Asia/Shanghai")
+    time0_utc = pv_times_utc[-1]
+    forecast_times = [
+        time0_utc + pd.Timedelta(minutes=ds.pv_output_interval_min * (i + 1))
+        for i in range(ds.pv_output_len)
+    ]
+    print("NWP: " + _fmt_first_ellipsis_last(forecast_times))
+
+
+def data_fetched(
+    ds: "PVDataset",
+    sample_path: Path | str,
+    df: pd.DataFrame,
+    r: int,
+    *,
+    anchor_last_row: int | None = None,
+) -> None:
+    """
+    Print one line per modality/output for the actual fetched sample content.
+    """
+    sample_path = Path(sample_path)
+
+    if anchor_last_row is not None:
+        j = int(anchor_last_row)
+        x_idx = j + ds._x_tail_1d
+        y_idx_1d = j + ds._y_off_1d
+        if int(x_idx[0]) < 0 or int(y_idx_1d[-1]) >= len(df):
+            raise ValueError(
+                f"anchor_last_row={j} out of bounds for len(df)={len(df)} "
+                f"(x_idx range [{int(x_idx[0])}, {int(x_idx[-1])}], y_idx range [{int(y_idx_1d[0])}, {int(y_idx_1d[-1])}])"
+            )
+    else:
+        x_idx = ds._x_idx_per_anchor[r]
+        y_idx_1d = ds._y_idx_per_anchor[r]
+
+    sub_x = df.iloc[x_idx]
+    sub_y = df.iloc[y_idx_1d]
+
+
+    print("")
+    print("data fetched:")
+    print("--------------------------------")
+
+    # --- PV input (active_power / 50, chronological: earliest -> latest) ---
+    pow_x = pd.to_numeric(sub_x["active_power"], errors="coerce").fillna(0).astype(np.float64)
+    pv_scaled_in = [f"{float(pow_x.iloc[i]) / 50.0:.6f}" for i in range(len(pow_x))]
+    pv_csv = sample_path.resolve()
+    pv_found = 1 if sample_path.is_file() else 0
+    print(
+        f"PV: file={pv_csv}  "
+        + _fmt_found_count(pv_found, 1, "file")
+        + "  "
+        + _fmt_first_ellipsis_last(pv_scaled_in)
+    )
+
+    # --- Sky (resolved paths, oldest frame -> newest) ---
+    t_x_end = sub_x["collectTime"].iloc[-1]
+    skimg_timestamps_utc = ds._to_utc_timestamps(
+        ds._history_sky_frame_times(t_x_end), naive_tz="Asia/Shanghai"
+    )
+    sky_paths = [
+        ds._sky_jpg_path(pd.Timestamp(t).tz_convert("UTC").tz_localize(None)) for t in skimg_timestamps_utc
+    ]
+    sky_resolved = [str(p.resolve()) for p in sky_paths]
+    sky_ok = sum(1 for p in sky_paths if p.is_file())
+    print(
+        "Sky: "
+        + _fmt_found_count(sky_ok, len(sky_paths), "files")
+        + "  "
+        + _fmt_first_ellipsis_last(sky_resolved)
+    )
+
+    # --- Satellite (resolved paths, oldest -> newest) ---
+    sat_timestamps_utc = ds._to_utc_timestamps(
+        ds._history_satimg_frame_utc_times(t_x_end), naive_tz="UTC"
+    )
+    sat_paths = [
+        ds._satimg_npy_path(pd.Timestamp(t).tz_convert("UTC").tz_localize(None))
+        for t in sat_timestamps_utc
+    ]
+    sat_resolved = [str(p.resolve()) for p in sat_paths]
+    sat_ok = _count_sat_npy_ok(ds, sat_paths)
+    print(
+        "Satellite: "
+        + _fmt_found_count(sat_ok, len(sat_paths), "files")
+        + " (on disk, shape/dtype match)  "
+        + _fmt_first_ellipsis_last(sat_resolved)
+    )
+
+    # --- NWP (solar.csv + wind.csv; ssrd + t2m per forecast step) ---
+    pv_times = ds._to_utc_timestamps(list(sub_x["collectTime"]), naive_tz="Asia/Shanghai")
+    time0_utc = pv_times[-1]
+    forecast_times = [
+        time0_utc + pd.Timedelta(minutes=ds.pv_output_interval_min * (i + 1))
+        for i in range(ds.pv_output_len)
+    ]
+    nf = len(forecast_times)
+    nwp_src = "solar.csv+wind.csv (not loaded)" if ds.nwp_solar_df is None or ds.nwp_wind_df is None else "solar.csv+wind.csv"
+    nwp_tables_ok = int(ds.nwp_solar_df is not None) + int(ds.nwp_wind_df is not None)
+    nwp_arr = interpolate_nwp_features(ds.nwp_solar_df, ds.nwp_wind_df, forecast_times)
+    if nwp_arr is None:
+        nwp_parts = ["(n/a, n/a)"] * nf
+        nwp_steps_ok = 0
+    else:
+        nwp_parts = [
+            f"({float(nwp_arr[i, 0]):.6f}, {float(nwp_arr[i, 2]):.6f})" for i in range(nwp_arr.shape[0])
+        ]
+        nwp_steps_ok = sum(
+            1
+            for i in range(nwp_arr.shape[0])
+            if np.isfinite(nwp_arr[i, 0]) and np.isfinite(nwp_arr[i, 2])
+        )
+    print(
+        "NWP: file="
+        + nwp_src
+        + "  "
+        + _fmt_found_count(nwp_tables_ok, 2, "tables")
+        + "  "
+        + _fmt_found_count(nwp_steps_ok, nf, "steps")
+        + " (finite ssrd+t2m)  "
+        + "(ssrd, t2m) per step: "
+        + _fmt_first_ellipsis_last(nwp_parts)
+    )
+
+    # --- Output PV targets (active_power / 50, first horizon step -> last) ---
+    pow_y = pd.to_numeric(sub_y["active_power"], errors="coerce").fillna(0).astype(np.float64)
+    pv_scaled_out = [f"{float(pow_y.iloc[i]) / 50.0:.6f}" for i in range(len(pow_y))]
+    print(
+        f"Output: file={pv_csv}  "
+        + _fmt_found_count(pv_found, 1, "file")
+        + "  "
+        + _fmt_first_ellipsis_last(pv_scaled_out)
+    )
 
 
 def collate_batched(batch):

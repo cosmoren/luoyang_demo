@@ -21,13 +21,22 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from config_utils import get_resolved_paths
-from dataloader.luoyang import PVDataset, collate_batched
+from dataloader.luoyang import PVDataset, collate_batched, load_csv, INVERTER_STATE_COL, VALID_STATE, what_to_fetch, data_fetched
 from models.models import pv_forecasting_model_vit_nwp
 from training.training_conf import (
     get_training_hparams_from_conf,
     get_training_paths_from_conf,
     load_config,
 )
+
+# --- Debug: ``what_to_fetch`` / ``data_fetched`` (optional early exit in ``main``) ---
+# Set ``_RUN_DEBUG_FETCH_INSPECT`` True to print one sample then exit (before training loop).
+# If ``_DEBUG_FETCH_USE_RANDOM_FILE_AND_ROW`` is False, set the CSV path and the ``collectTime`` of the
+# **last PV input row** for that window (must match a row in the file exactly and be a valid train anchor).
+_RUN_DEBUG_FETCH_INSPECT = True
+_DEBUG_FETCH_USE_RANDOM_FILE_AND_ROW = False
+_DEBUG_FETCH_CSV_PATH: Path | str = "/home/kyber/projects/digital energy/dataset/processed/luoayng_data_626/NE_333621155.csv"
+_DEBUG_FETCH_LAST_INPUT_COLLECT_TIME: str = "2025-01-05 10:00:00"
 
 
 def _batch_to_device(batch: dict, device: torch.device) -> dict:
@@ -384,6 +393,79 @@ def main() -> None:
         pin_memory=True,
         persistent_workers=True,
     )
+
+    # Debug: inspect one sample before training loop
+    if _RUN_DEBUG_FETCH_INSPECT:
+        if _DEBUG_FETCH_USE_RANDOM_FILE_AND_ROW:
+            rng = np.random.default_rng()
+            fi = int(rng.integers(0, len(train_dataset.sample_files)))
+            sample_path = train_dataset.sample_files[fi]
+            df = load_csv(sample_path)
+            inv = (
+                pd.to_numeric(df[INVERTER_STATE_COL], errors="coerce").fillna(0).astype(int).values
+                == VALID_STATE
+            )
+            valid_mask = inv[train_dataset._y_idx_per_anchor].any(axis=1) & train_dataset._train_anchor_mask
+            valid_rows = np.nonzero(valid_mask)[0]
+            r = int(rng.choice(valid_rows))
+            what_to_fetch(train_dataset, df, r)
+            data_fetched(train_dataset, sample_path, df, r)
+        else:
+            if not str(_DEBUG_FETCH_CSV_PATH).strip():
+                raise ValueError(
+                    "_DEBUG_FETCH_CSV_PATH must be set when _DEBUG_FETCH_USE_RANDOM_FILE_AND_ROW is False"
+                )
+            want = Path(_DEBUG_FETCH_CSV_PATH).expanduser()
+            resolved_files = {p.resolve(): p for p in train_dataset.sample_files}
+            key = want.resolve()
+            if key not in resolved_files:
+                names = {p.name: p for p in train_dataset.sample_files}
+                if want.name in names:
+                    sample_path = names[want.name]
+                else:
+                    raise ValueError(
+                        f"_DEBUG_FETCH_CSV_PATH={want!r} is not in train_dataset.sample_files "
+                        f"(try a full path or exact CSV basename from pv_dir)"
+                    )
+            else:
+                sample_path = resolved_files[key]
+            df = load_csv(sample_path)
+            inv = (
+                pd.to_numeric(df[INVERTER_STATE_COL], errors="coerce").fillna(0).astype(int).values
+                == VALID_STATE
+            )
+            valid_mask = inv[train_dataset._y_idx_per_anchor].any(axis=1) & train_dataset._train_anchor_mask
+            valid_rows = np.nonzero(valid_mask)[0]
+            ct = pd.to_datetime(df["collectTime"], errors="coerce")
+            desired = pd.Timestamp(_DEBUG_FETCH_LAST_INPUT_COLLECT_TIME)
+            matches = np.flatnonzero((ct == desired).to_numpy())
+            if matches.size != 1:
+                raise ValueError(
+                    f"expected exactly one row with collectTime={desired!r}, found {matches.size} in {sample_path.name}"
+                )
+            j = int(matches[0])
+            last_x_for_valid = train_dataset._x_idx_per_anchor[valid_rows, -1]
+            valid_last_set = set(last_x_for_valid.tolist())
+            if j not in valid_last_set:
+                order = np.argsort(np.abs(last_x_for_valid.astype(np.int64) - j))
+                hint_lines = []
+                for k in order[:10]:
+                    jj = int(last_x_for_valid[int(k)])
+                    hint_lines.append(f"  row={jj}  collectTime={ct.iloc[jj]}")
+                j_best = int(last_x_for_valid[int(order[0])])
+                hint = "\n".join(hint_lines)
+                raise ValueError(
+                    f"collectTime row index j={j} is not the last PV input row of any valid train anchor "
+                    f"for {sample_path.name} (train split + inverter mask). "
+                    "Training only uses windows whose last input row is one of these anchor end rows.\n"
+                    "Nearest valid last-input rows (copy a collectTime into _DEBUG_FETCH_LAST_INPUT_COLLECT_TIME):\n"
+                    f"{hint}\n"
+                    f"Closest valid row index: {j_best} (Δ {abs(j_best - j)} rows from your j={j})."
+                )
+            what_to_fetch(train_dataset, df, 0, anchor_last_row=j)
+            data_fetched(train_dataset, sample_path, df, 0, anchor_last_row=j)
+        return
+
 
     checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else _PROJECT_ROOT / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
