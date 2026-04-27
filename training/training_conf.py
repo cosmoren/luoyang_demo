@@ -1,4 +1,4 @@
-"""Load ``config/conf.yaml`` training section and resolved PV / sky / sat paths for CLI defaults."""
+"""Load ``config/conf.yaml`` training section and resolved data paths for CLI defaults."""
 
 from __future__ import annotations
 
@@ -34,6 +34,15 @@ TRAINING_HPARAM_KEYS = frozenset({
     "train_max_batches_per_epoch",
 })
 
+# Folsom (irradiance + sky + NWP): no satellite branch — training YAML omits ``satimg_*`` keys.
+FOLSOM_TRAINING_HPARAM_KEYS = TRAINING_HPARAM_KEYS - frozenset(
+    {"satimg_window_size", "satimg_time_resolution_min", "satimg_npy_shape_hwc"}
+)
+
+
+def _dataset_profile_is_folsom(conf: dict) -> bool:
+    return str(conf.get("dataset_profile", "")).strip().lower() == "folsom"
+
 
 def load_config() -> dict:
     with open(CONF_PATH) as f:
@@ -41,20 +50,23 @@ def load_config() -> dict:
 
 
 def get_training_hparams_from_conf(conf: dict | None = None) -> dict:
-    """Load ``conf['training']``; every :data:`TRAINING_HPARAM_KEYS` entry must be set in YAML."""
+    """Load ``conf['training']``; required keys depend on ``dataset_profile`` (Folsom omits ``satimg_*``)."""
     if conf is None:
         conf = load_config()
     raw = conf.get("training")
     if not isinstance(raw, dict):
         raise ValueError("conf.yaml must define a non-empty 'training:' mapping")
-    missing = sorted(TRAINING_HPARAM_KEYS - raw.keys())
+    is_folsom = _dataset_profile_is_folsom(conf)
+    keys = FOLSOM_TRAINING_HPARAM_KEYS if is_folsom else TRAINING_HPARAM_KEYS
+    missing = sorted(keys - raw.keys())
     if missing:
+        ref = "FOLSOM_TRAINING_HPARAM_KEYS" if is_folsom else "TRAINING_HPARAM_KEYS"
         raise KeyError(
             "conf training section missing required key(s): "
             + ", ".join(missing)
-            + " (see TRAINING_HPARAM_KEYS in training/training_conf.py)"
+            + f" (see {ref} in training/training_conf.py)"
         )
-    out = {k: raw[k] for k in TRAINING_HPARAM_KEYS}
+    out = {k: raw[k] for k in keys}
     if isinstance(out["lr"], str):
         out["lr"] = float(out["lr"])
 
@@ -63,13 +75,14 @@ def get_training_hparams_from_conf(conf: dict | None = None) -> dict:
         raise ValueError("training.skyimg_spatial_size must be a positive integer")
     out["skyimg_spatial_size"] = int(ss)
 
-    shwc = out["satimg_npy_shape_hwc"]
-    if not isinstance(shwc, (list, tuple)) or len(shwc) != 3:
-        raise ValueError("training.satimg_npy_shape_hwc must be a length-3 sequence [H, W, C]")
-    t = tuple(int(x) for x in shwc)
-    if any(x < 1 for x in t):
-        raise ValueError("training.satimg_npy_shape_hwc entries must be positive")
-    out["satimg_npy_shape_hwc"] = t
+    if not is_folsom:
+        shwc = out["satimg_npy_shape_hwc"]
+        if not isinstance(shwc, (list, tuple)) or len(shwc) != 3:
+            raise ValueError("training.satimg_npy_shape_hwc must be a length-3 sequence [H, W, C]")
+        t = tuple(int(x) for x in shwc)
+        if any(x < 1 for x in t):
+            raise ValueError("training.satimg_npy_shape_hwc entries must be positive")
+        out["satimg_npy_shape_hwc"] = t
 
     tf = out["pv_train_time_fraction"]
     if isinstance(tf, str):
@@ -93,12 +106,12 @@ def get_training_hparams_from_conf(conf: dict | None = None) -> dict:
 
 def get_training_paths_from_conf(conf: dict | None = None, project_root: Path | None = None) -> dict[str, str]:
     """
-    Resolve PV CSV, sky JPEG, and Himawari NPY dirs under ``paths.data_dir``.
+    Resolve data roots under ``paths.data_dir``.
 
-    Required ``paths`` keys (relative to ``data_dir``):
-
-    ``pv_path``, ``sky_image_path``, ``sat_path``. Train/test time split uses the same directories;
-    returned keys are ``pv_dir``, ``skyimg_dir``, ``satimg_dir``.
+    - Default (Luoyang): ``pv_path``, ``sky_image_path``, ``sat_path`` relative to ``data_dir``;
+      returns ``pv_dir``, ``skyimg_dir``, ``satimg_dir``.
+    - Folsom (``dataset_profile: folsom``): ``folsom_irradiance_csv`` + ``sky_image_path`` only;
+      returns ``pv_dir`` and ``skyimg_dir`` (no ``satimg_dir`` — no satellite data).
     """
     if conf is None:
         conf = load_config()
@@ -114,6 +127,20 @@ def get_training_paths_from_conf(conf: dict | None = None, project_root: Path | 
         if v is None or str(v).strip() == "":
             raise KeyError(f"conf paths.{key} is required")
         return str(v)
+
+    if _dataset_profile_is_folsom(conf):
+        irr_rel = paths_cfg.get("folsom_irradiance_csv")
+        if irr_rel is None or not str(irr_rel).strip():
+            raise KeyError("dataset_profile=folsom requires paths.folsom_irradiance_csv")
+        irr_path = (data_dir / str(irr_rel).strip()).resolve()
+        if not irr_path.is_file():
+            raise FileNotFoundError(f"Folsom irradiance CSV not found: {irr_path}")
+        pv_dir = irr_path.parent
+        sky_dir = (data_dir / _req("sky_image_path")).resolve()
+        return {
+            "pv_dir": str(pv_dir),
+            "skyimg_dir": str(sky_dir),
+        }
 
     pv_dir = (data_dir / _req("pv_path")).resolve()
     sky_dir = (data_dir / _req("sky_image_path")).resolve()

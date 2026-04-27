@@ -6,7 +6,7 @@ site:
   longitude: 112.28440
 
 paths:
-  data_dir: "/home/kyber/projects/digital energy/dataset/processed"
+  data_dir: "/home/kyber/projects/digital energy/luoyang_ds/processed"
   config_dir: config
   nwp_config: config/NWP.yaml
   pv_download: pv
