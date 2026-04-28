@@ -2,15 +2,38 @@
 Folsom dataset: one CSV with time + GHI, DNI, DHI (and optional header aliases).
 
 Designed for multi-million-row files: never loads the full table into RAM.
-Each sample reads one contiguous row block (~5760 lines for default horizons).
+Each sample reads one contiguous row block (length set by ``irr_input_len`` / ``irr_output_len``).
 
-Horizon math matches Luoyang dataset anchor conventions (anchor = last input row index).
+Horizon math matches Luoyang anchor conventions (anchor = last input row index).
 
-Each sample dict: ``ghi``, ``dni``, ``dhi``; ``input_mask``; ``target_*``; ``target_mask``;
-``skimg_tensor`` / ``skimg_timefeats`` / ``skimg_timestamps``; ``nwp_tensor``;
-``input_timestamps_utc`` / ``forecast_timestamps_utc`` (string lists for debugging).
-JPEG names ``YYYYMMDDHHMMSS.jpg`` use **UTC** wall clock;
-naive CSV timestamps are read as **UTC**. See :data:`FOLSOM_GHI_DNI_DHI_KEYS`.
+Training usage (same two-step pattern as ``dataloader.luoyang``):
+
+1. **Sample** — :meth:`FolsomIrradianceDataset.__getitem__` → :meth:`FolsomIrradianceDataset._build_tensors`
+   returns one ``dict`` per index.
+2. **Batch** — :func:`collate_folsom_irradiance` stacks a ``list`` of those dicts; every key in
+   :data:`FOLSOM_BATCH_TENSOR_KEYS` gains a leading batch dimension ``B``.
+
+**Batched tensor keys** (after ``collate_folsom_irradiance``; shapes use ``T_in`` = ``irr_input_len``,
+``T_out`` = ``irr_output_len``, ``T_sky`` = ``skyimg_window_size``, ``C_nwp`` = NWP feature count + 1 mask channel):
+
+- ``ghi``, ``dni``, ``dhi``: ``[B, T_in]``
+- ``input_mask``: ``[B, 1, T_in]`` (valid input timesteps; leading ``1`` matches Luoyang-style mask layout)
+- ``irr_timefeats``: ``[B, T_in, 9]`` (solar + delta-time encoding on input window)
+- ``forecast_timefeats``: ``[B, T_out, 9]`` (same on forecast timesteps)
+- ``target_ghi``, ``target_dni``, ``target_dhi``: ``[B, T_out]``
+- ``target_mask``: ``[B, T_out]``
+- ``skimg_tensor``: ``[B, T_sky, 3, H, W]`` with ``H=W=skyimg_spatial_size``
+- ``skimg_timefeats``: ``[B, T_sky, feat_dim]``
+- ``nwp_tensor``: ``[B, T_out, C_nwp]`` (zeros + invalid mask if NWP file missing)
+
+**Not stacked by collate** (debug / metadata; lists length ``B`` of per-sample lists):
+
+- ``skimg_timestamps``, ``input_timestamps_utc``, ``forecast_timestamps_utc``
+
+Optional keys ``skimg_tensor``, ``skimg_timefeats``, ``nwp_tensor`` may be stacked as ``None`` if a future
+sample path omits them — same guard pattern as :func:`dataloader.luoyang.collate_batched`.
+
+JPEG stems ``YYYYMMDDHHMMSS.jpg`` use **UTC**; naive CSV times are read as **UTC**.
 """
 
 from __future__ import annotations
@@ -38,12 +61,14 @@ if str(_PROJECT_ROOT) not in sys.path:
 from modules.solar_encoder import compute_solar_features, delta_time_encoder, solar_features_encoder
 from training.training_conf import get_training_paths_from_conf
 
-# Sample / batch tensor keys: three series + one joint validity mask per horizon (Luoyang-style).
+# Keys collate stacks with batch dim B first (single source of truth for trainers).
 FOLSOM_GHI_DNI_DHI_KEYS: tuple[str, ...] = (
     "ghi",
     "dni",
     "dhi",
     "input_mask",
+    "irr_timefeats",
+    "forecast_timefeats",
     "target_ghi",
     "target_dni",
     "target_dhi",
@@ -52,6 +77,7 @@ FOLSOM_GHI_DNI_DHI_KEYS: tuple[str, ...] = (
     "skimg_timefeats",
     "nwp_tensor",
 )
+FOLSOM_BATCH_TENSOR_KEYS = FOLSOM_GHI_DNI_DHI_KEYS
 
 _TIME_HEADER_CANDIDATES = frozenset(
     {"time", "timestamp", "datetime", "collecttime", "date_time", "dt", "local_time"}
@@ -283,6 +309,9 @@ class FolsomIrradianceDataset(Dataset):
 
     ``skyimg_window_size`` is the count of sky frames **ending at the last input timestep** (anchor),
     spaced by ``skyimg_time_resolution_min`` (oldest first in ``skimg_tensor``).
+
+    For the training batch contract (stacked keys, shapes), see :data:`FOLSOM_BATCH_TENSOR_KEYS` and
+    :func:`collate_folsom_irradiance`.
     """
 
     def __init__(
@@ -678,6 +707,16 @@ class FolsomIrradianceDataset(Dataset):
         ]
         nwp_tensor = self._interpolate_nwp(forecast_timestamps)
 
+        irr_solar = compute_solar_features(timestamps, self.latitude, self.longitude)
+        irr_tf = solar_features_encoder(irr_solar)
+        irr_dtf = delta_time_encoder(timestamps, time0)
+        irr_timefeats = torch.cat([irr_tf, irr_dtf.unsqueeze(1)], dim=1)
+
+        forecast_solar = compute_solar_features(forecast_timestamps, self.latitude, self.longitude)
+        f_tf = solar_features_encoder(forecast_solar)
+        f_dtf = delta_time_encoder(forecast_timestamps, time0)
+        forecast_timefeats = torch.cat([f_tf, f_dtf.unsqueeze(1)], dim=1)
+
         t_x_end = sub_x[self._time_col].iloc[-1]
         skimg_timestamps, skimg_paths = self._history_sky_frame_records(t_x_end)
         skimg_solar_features = compute_solar_features(
@@ -700,6 +739,8 @@ class FolsomIrradianceDataset(Dataset):
             "dni": torch.from_numpy(dni),
             "dhi": torch.from_numpy(dhi),
             "input_mask": input_mask,
+            "irr_timefeats": irr_timefeats,
+            "forecast_timefeats": forecast_timefeats,
             "target_ghi": torch.from_numpy(tg),
             "target_dni": torch.from_numpy(td),
             "target_dhi": torch.from_numpy(th),
@@ -722,10 +763,33 @@ class FolsomIrradianceDataset(Dataset):
 
 
 def collate_folsom_irradiance(batch: list[dict]) -> dict:
-    """Stack tensor keys (batch dim ``B`` first) and keep ``skimg_timestamps`` as Python lists."""
+    """Stack list of samples into one dict with batch dim ``B`` first (Luoyang ``collate_batched`` style)."""
     if not batch:
         raise ValueError("empty batch")
-    out = {k: torch.stack([b[k] for b in batch]) for k in FOLSOM_GHI_DNI_DHI_KEYS}
+
+    def _stack(key: str) -> torch.Tensor:
+        return torch.stack([s[key] for s in batch])
+
+    out: dict[str, Any] = {
+        "ghi": _stack("ghi"),
+        "dni": _stack("dni"),
+        "dhi": _stack("dhi"),
+        "input_mask": _stack("input_mask"),
+        "irr_timefeats": _stack("irr_timefeats"),
+        "forecast_timefeats": _stack("forecast_timefeats"),
+        "target_ghi": _stack("target_ghi"),
+        "target_dni": _stack("target_dni"),
+        "target_dhi": _stack("target_dhi"),
+        "target_mask": _stack("target_mask"),
+    }
+    for key in ("skimg_tensor", "skimg_timefeats", "nwp_tensor"):
+        vals = [s[key] for s in batch]
+        if vals[0] is None:
+            if not all(v is None for v in vals):
+                raise ValueError(f"collate_folsom_irradiance: mixed None and tensor for {key!r}")
+            out[key] = None
+        else:
+            out[key] = torch.stack(vals)
     out["skimg_timestamps"] = [b["skimg_timestamps"] for b in batch]
     return out
 
@@ -796,6 +860,7 @@ def build_folsom_irradiance_datasets_from_conf(
 __all__ = [
     "FolsomIrradianceDataset",
     "FOLSOM_GHI_DNI_DHI_KEYS",
+    "FOLSOM_BATCH_TENSOR_KEYS",
     "collate_folsom_irradiance",
     "build_folsom_irradiance_datasets_from_conf",
     "load_folsom_conf",
@@ -1053,7 +1118,15 @@ def run_smoke_cli(argv: list[str] | None = None) -> int:
     batch_lines = [
         f"batch_size={bs}  (train split randomizes anchor each __getitem__; shapes only here)",
     ]
-    for k in ("ghi", "target_ghi", "skimg_tensor", "skimg_timefeats", "nwp_tensor"):
+    for k in (
+        "ghi",
+        "irr_timefeats",
+        "forecast_timefeats",
+        "target_ghi",
+        "skimg_tensor",
+        "skimg_timefeats",
+        "nwp_tensor",
+    ):
         v = batch[k]
         batch_lines.append(f"{k}: shape={tuple(v.shape)} dtype={v.dtype}")
     _smoke_section("DATALOADER (first batch)", batch_lines)

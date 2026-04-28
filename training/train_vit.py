@@ -1,6 +1,8 @@
 """
 Training script for pv_forecasting_model_vit (sat + sky TimeSformer + PV TCN).
 Uses the same Luoyang CSV / sky / sat DataLoader as train.py.
+
+Folsom irradiance trainer: ``training/train_vit_folsom.py``.
 """
 
 from __future__ import annotations

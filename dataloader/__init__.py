@@ -9,7 +9,12 @@ Other datasets can add ``dataloader/foo.py`` and use ``from dataloader.foo impor
 
 Folsom (GHI / DNI / DHI CSV):
 
-    from dataloader.folsom import FolsomIrradianceDataset, collate_folsom_irradiance, FOLSOM_GHI_DNI_DHI_KEYS
+    from dataloader.folsom import (
+        FolsomIrradianceDataset,
+        collate_folsom_irradiance,
+        FOLSOM_GHI_DNI_DHI_KEYS,
+        FOLSOM_BATCH_TENSOR_KEYS,
+    )
 
 Smoke test (optional ``--last-input-time`` for anchor = last input row time):
 

@@ -10,6 +10,7 @@ from config_utils import get_resolved_paths
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONF_PATH = PROJECT_ROOT / "config" / "conf.yaml"
+FOLSOM_CONF_PATH = PROJECT_ROOT / "config" / "conf_folsom.yaml"
 
 TRAINING_HPARAM_KEYS = frozenset({
     "csv_interval_min",
@@ -34,10 +35,31 @@ TRAINING_HPARAM_KEYS = frozenset({
     "train_max_batches_per_epoch",
 })
 
-# Folsom (irradiance + sky + NWP): no satellite branch — training YAML omits ``satimg_*`` keys.
+# Legacy: Luoyang-style keys minus satimg (still uses ``pv_*`` — do not use for ``conf_folsom.yaml``).
 FOLSOM_TRAINING_HPARAM_KEYS = TRAINING_HPARAM_KEYS - frozenset(
     {"satimg_window_size", "satimg_time_resolution_min", "satimg_npy_shape_hwc"}
 )
+
+# Folsom irradiance YAML (``irr_*`` horizons; no ``pv_*`` / no ``satimg_*``).
+FOLSOM_IRR_TRAINING_HPARAM_KEYS = frozenset({
+    "csv_interval_min",
+    "irr_input_interval_min",
+    "irr_output_interval_min",
+    "irr_input_len",
+    "irr_output_len",
+    "irr_train_time_fraction",
+    "test_anchor_stride_min",
+    "test_collect_time_match_tolerance_min",
+    "skyimg_window_size",
+    "skyimg_time_resolution_min",
+    "skyimg_spatial_size",
+    "epochs",
+    "lr",
+    "batch_size",
+    "save_every",
+    "num_workers",
+    "train_max_batches_per_epoch",
+})
 
 
 def _dataset_profile_is_folsom(conf: dict) -> bool:
@@ -49,18 +71,25 @@ def load_config() -> dict:
         return yaml.safe_load(f)
 
 
+def load_config_path(path: Path | str | None = None) -> dict:
+    """Load a YAML config file (default: main Luoyang ``conf.yaml``)."""
+    p = Path(path) if path is not None else CONF_PATH
+    with open(p) as f:
+        return yaml.safe_load(f)
+
+
 def get_training_hparams_from_conf(conf: dict | None = None) -> dict:
-    """Load ``conf['training']``; required keys depend on ``dataset_profile`` (Folsom omits ``satimg_*``)."""
+    """Load ``conf['training']``; required keys depend on ``dataset_profile``."""
     if conf is None:
         conf = load_config()
     raw = conf.get("training")
     if not isinstance(raw, dict):
-        raise ValueError("conf.yaml must define a non-empty 'training:' mapping")
+        raise ValueError("conf must define a non-empty 'training:' mapping")
     is_folsom = _dataset_profile_is_folsom(conf)
-    keys = FOLSOM_TRAINING_HPARAM_KEYS if is_folsom else TRAINING_HPARAM_KEYS
+    keys = FOLSOM_IRR_TRAINING_HPARAM_KEYS if is_folsom else TRAINING_HPARAM_KEYS
     missing = sorted(keys - raw.keys())
     if missing:
-        ref = "FOLSOM_TRAINING_HPARAM_KEYS" if is_folsom else "TRAINING_HPARAM_KEYS"
+        ref = "FOLSOM_IRR_TRAINING_HPARAM_KEYS" if is_folsom else "TRAINING_HPARAM_KEYS"
         raise KeyError(
             "conf training section missing required key(s): "
             + ", ".join(missing)
@@ -84,15 +113,26 @@ def get_training_hparams_from_conf(conf: dict | None = None) -> dict:
             raise ValueError("training.satimg_npy_shape_hwc entries must be positive")
         out["satimg_npy_shape_hwc"] = t
 
-    tf = out["pv_train_time_fraction"]
-    if isinstance(tf, str):
+    if is_folsom:
+        tf = out["irr_train_time_fraction"]
+        if isinstance(tf, str):
+            tf = float(tf)
+        if not isinstance(tf, (int, float)) or isinstance(tf, bool):
+            raise ValueError("training.irr_train_time_fraction must be a number in (0, 1)")
         tf = float(tf)
-    if not isinstance(tf, (int, float)) or isinstance(tf, bool):
-        raise ValueError("training.pv_train_time_fraction must be a number in (0, 1)")
-    tf = float(tf)
-    if not (0.0 < tf < 1.0):
-        raise ValueError("training.pv_train_time_fraction must be strictly between 0 and 1")
-    out["pv_train_time_fraction"] = tf
+        if not (0.0 < tf < 1.0):
+            raise ValueError("training.irr_train_time_fraction must be strictly between 0 and 1")
+        out["irr_train_time_fraction"] = tf
+    else:
+        tf = out["pv_train_time_fraction"]
+        if isinstance(tf, str):
+            tf = float(tf)
+        if not isinstance(tf, (int, float)) or isinstance(tf, bool):
+            raise ValueError("training.pv_train_time_fraction must be a number in (0, 1)")
+        tf = float(tf)
+        if not (0.0 < tf < 1.0):
+            raise ValueError("training.pv_train_time_fraction must be strictly between 0 and 1")
+        out["pv_train_time_fraction"] = tf
 
     tol = out["test_collect_time_match_tolerance_min"]
     if isinstance(tol, str):
