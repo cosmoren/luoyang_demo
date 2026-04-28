@@ -24,23 +24,18 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from config_utils import get_resolved_paths
-from dataloader.luoyang import PVDataset, collate_batched, load_csv, INVERTER_STATE_COL, VALID_STATE, what_to_fetch, data_fetched
+from dataloader.luoyang import PVDataset, collate_batched, what_to_fetch, data_fetched
 from models.models import pv_forecasting_model_vit_nwp
+from training.luoyang_debug import (
+    choose_deterministic_debug_sample,
+    choose_random_debug_sample,
+    normalize_debug_split,
+)
 from training.training_conf import (
     get_training_hparams_from_conf,
     get_training_paths_from_conf,
     load_config,
 )
-
-# Debug `what_to_fetch`/`data_fetched` by printing one sample and optionally exiting before training.
-# If random selection is off, set CSV path plus the exact `collectTime` for the window's last PV input row.
-_RUN_DEBUG_FETCH_INSPECT = False
-_DEBUG_FETCH_SPLIT = "train"  # "train" or "test"
-_DEBUG_FETCH_USE_RANDOM_FILE_AND_ROW = False
-_DEBUG_FETCH_CSV_PATH: Path | str = "/home/kyber/projects/digital energy/dataset/processed/luoayng_data_626/NE_333621155.csv"
-_DEBUG_FETCH_LAST_INPUT_COLLECT_TIME: str = "2025-01-04 22:00:00"
-# After fetch-debug (when not exiting early): pull one train batch and assert layout + optional forward smoke test.
-_RUN_DEBUG_BATCH_INSPECT = True
 
 
 def batch_evaluation(
@@ -547,6 +542,40 @@ def _build_parser(path_defaults: dict, h: dict) -> argparse.ArgumentParser:
         default=h["train_max_batches_per_epoch"],
         help="Stop each training epoch after this many batches (default from conf; null = no cap).",
     )
+    parser.add_argument(
+        "--debug-fetch-only",
+        action="store_true",
+        help="Print one Luoyang fetch inspection sample and exit.",
+    )
+    parser.add_argument(
+        "--debug-split",
+        type=str,
+        default="train",
+        choices=("train", "test"),
+        help="Dataset split used by --debug-fetch-only.",
+    )
+    parser.add_argument(
+        "--debug-random",
+        action="store_true",
+        help="Use random file + random valid anchor for --debug-fetch-only.",
+    )
+    parser.add_argument(
+        "--debug-csv-path",
+        type=str,
+        default="",
+        help="CSV path (or basename from pv_dir) for deterministic --debug-fetch-only.",
+    )
+    parser.add_argument(
+        "--debug-last-input-collect-time",
+        type=str,
+        default="",
+        help="Required with deterministic --debug-fetch-only; collectTime for last PV input row.",
+    )
+    parser.add_argument(
+        "--debug-batch-only",
+        action="store_true",
+        help="Pull one train batch, run batch_evaluation checks, then exit.",
+    )
     return parser
 
 
@@ -627,85 +656,28 @@ def main() -> None:
         persistent_workers=True,
     )
 
-    # Debug: inspect one sample before training loop
-    if _RUN_DEBUG_FETCH_INSPECT:
-        debug_split = str(_DEBUG_FETCH_SPLIT).strip().lower()
-        if debug_split not in {"train", "test"}:
-            raise ValueError(f"_DEBUG_FETCH_SPLIT must be 'train' or 'test', got {debug_split!r}")
+    if args.debug_fetch_only:
+        debug_split = normalize_debug_split(args.debug_split)
         debug_dataset = train_dataset if debug_split == "train" else test_dataset
-        split_mask = debug_dataset._train_anchor_mask if debug_split == "train" else debug_dataset._test_anchor_mask
 
-        if _DEBUG_FETCH_USE_RANDOM_FILE_AND_ROW:
-            rng = np.random.default_rng()
-            fi = int(rng.integers(0, len(debug_dataset.sample_files)))
-            sample_path = debug_dataset.sample_files[fi]
-            df = load_csv(sample_path)
-            inv = (
-                pd.to_numeric(df[INVERTER_STATE_COL], errors="coerce").fillna(0).astype(int).values
-                == VALID_STATE
-            )
-            valid_mask = inv[debug_dataset._y_idx_per_anchor].any(axis=1) & split_mask
-            valid_rows = np.nonzero(valid_mask)[0]
-            r = int(rng.choice(valid_rows))
+        if args.debug_random:
+            sample_path, df, r = choose_random_debug_sample(debug_dataset, debug_split)
             what_to_fetch(debug_dataset, df, r)
             data_fetched(debug_dataset, sample_path, df, r)
         else:
-            if not str(_DEBUG_FETCH_CSV_PATH).strip():
-                raise ValueError(
-                    "_DEBUG_FETCH_CSV_PATH must be set when _DEBUG_FETCH_USE_RANDOM_FILE_AND_ROW is False"
-                )
-            want = Path(_DEBUG_FETCH_CSV_PATH).expanduser()
-            resolved_files = {p.resolve(): p for p in debug_dataset.sample_files}
-            key = want.resolve()
-            if key not in resolved_files:
-                names = {p.name: p for p in debug_dataset.sample_files}
-                if want.name in names:
-                    sample_path = names[want.name]
-                else:
-                    raise ValueError(
-                        f"_DEBUG_FETCH_CSV_PATH={want!r} is not in {debug_split}_dataset.sample_files "
-                        f"(try a full path or exact CSV basename from pv_dir)"
-                    )
-            else:
-                sample_path = resolved_files[key]
-            df = load_csv(sample_path)
-            inv = (
-                pd.to_numeric(df[INVERTER_STATE_COL], errors="coerce").fillna(0).astype(int).values
-                == VALID_STATE
+            if not str(args.debug_last_input_collect_time).strip():
+                raise ValueError("--debug-last-input-collect-time is required unless --debug-random is set")
+            sample_path, df, j = choose_deterministic_debug_sample(
+                debug_dataset,
+                debug_split=debug_split,
+                csv_path=args.debug_csv_path,
+                last_input_collect_time=args.debug_last_input_collect_time,
             )
-            valid_mask = inv[debug_dataset._y_idx_per_anchor].any(axis=1) & split_mask
-            valid_rows = np.nonzero(valid_mask)[0]
-            ct = pd.to_datetime(df["collectTime"], errors="coerce")
-            desired = pd.Timestamp(_DEBUG_FETCH_LAST_INPUT_COLLECT_TIME)
-            matches = np.flatnonzero((ct == desired).to_numpy())
-            if matches.size != 1:
-                raise ValueError(
-                    f"expected exactly one row with collectTime={desired!r}, found {matches.size} in {sample_path.name}"
-                )
-            j = int(matches[0])
-            last_x_for_valid = debug_dataset._x_idx_per_anchor[valid_rows, -1]
-            valid_last_set = set(last_x_for_valid.tolist())
-            if j not in valid_last_set:
-                order = np.argsort(np.abs(last_x_for_valid.astype(np.int64) - j))
-                hint_lines = []
-                for k in order[:10]:
-                    jj = int(last_x_for_valid[int(k)])
-                    hint_lines.append(f"  row={jj}  collectTime={ct.iloc[jj]}")
-                j_best = int(last_x_for_valid[int(order[0])])
-                hint = "\n".join(hint_lines)
-                raise ValueError(
-                    f"collectTime row index j={j} is not the last PV input row of any valid {debug_split} anchor "
-                    f"for {sample_path.name} ({debug_split} split + inverter mask). "
-                    "This split only uses windows whose last input row is one of these anchor end rows.\n"
-                    "Nearest valid last-input rows (copy a collectTime into _DEBUG_FETCH_LAST_INPUT_COLLECT_TIME):\n"
-                    f"{hint}\n"
-                    f"Closest valid row index: {j_best} (Δ {abs(j_best - j)} rows from your j={j})."
-                )
             what_to_fetch(debug_dataset, df, 0, anchor_last_row=j)
             data_fetched(debug_dataset, sample_path, df, 0, anchor_last_row=j)
         return
 
-    if _RUN_DEBUG_BATCH_INSPECT:
+    if args.debug_batch_only:
         batch0 = next(iter(train_loader))
         batch_evaluation(
             batch0,
@@ -719,8 +691,7 @@ def main() -> None:
             model=model,
             device=device,
         )
-
-    return
+        return
 
     checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else _PROJECT_ROOT / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
