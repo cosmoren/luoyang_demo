@@ -2,6 +2,7 @@
 import sys
 from datetime import timedelta
 from pathlib import Path
+from threading import Lock
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -19,6 +20,14 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from config_utils import get_resolved_paths
 from training.training_conf import CONF_PATH, get_training_hparams_from_conf, load_config
+
+# Process-global preload cache so that train/val/test ``PVDataset`` instances built in the
+# same process reuse one set of sky/sat tensors instead of loading + storing 3x.
+# Key: (skyimg_dir, skyimg_spatial_size, satimg_dir, satimg_npy_shape_hwc).
+# Value: {"sky_cache": dict[str, Tensor(uint8)], "sat_cache": dict[str, Tensor(uint8)],
+#         "sat_scale": float, "sat_offset": float}.
+_IMAGE_PRELOAD_CACHE: dict[tuple, dict] = {}
+_IMAGE_PRELOAD_LOCK = Lock()
 
 # --- PV per-station CSV helpers (5-minute rows, ``collectTime`` sorted) ---
 
@@ -443,6 +452,127 @@ class PVDataset(Dataset):
                 )
             )
 
+        # --- Preload sky/sat image tensors into memory to avoid disk I/O in __getitem__ ---
+        # Shared fallback tensors reused for every missing file (avoids duplicating zeros in RAM).
+        # Cache stores uint8 to save memory; lookups dequantize back to float32.
+        # A process-global dict keyed by (sky_dir, sky_size, sat_dir, sat_shape) lets the three
+        # train/val/test ``PVDataset`` instances share one set of tensors instead of holding 3x.
+        self._shared_black_sky: torch.Tensor = self._black_sky_tensor()
+        self._shared_dummy_sat: torch.Tensor = self._dummy_satimg_tensor()
+
+        cache_key = (
+            self._skyimg_dir.as_posix(),
+            int(self._skyimg_spatial_size),
+            self._satimg_dir.as_posix(),
+            tuple(self._satimg_npy_shape_hwc),
+        )
+        with _IMAGE_PRELOAD_LOCK:
+            entry = _IMAGE_PRELOAD_CACHE.get(cache_key)
+            if entry is None:
+                print(
+                    f"[split={self.split}] first dataset instance for key "
+                    f"(sky_dir={cache_key[0]!r}, sky_size={cache_key[1]}, "
+                    f"sat_dir={cache_key[2]!r}, sat_shape={cache_key[3]}); preloading ..."
+                )
+                entry = self._preload_images_into_ram()
+                _IMAGE_PRELOAD_CACHE[cache_key] = entry
+            else:
+                print(
+                    f"[split={self.split}] reusing shared preload cache "
+                    f"(sky={len(entry['sky_cache'])}, sat={len(entry['sat_cache'])}, "
+                    f"sat_scale={entry['sat_scale']:.6g}, sat_offset={entry['sat_offset']:.6g})"
+                )
+
+        # All PVDataset instances with the same cache_key share these dict objects (not copies).
+        self._sky_cache: dict[str, torch.Tensor] = entry["sky_cache"]
+        self._sat_cache: dict[str, torch.Tensor] = entry["sat_cache"]
+        self._sat_quant_scale: float = float(entry["sat_scale"])
+        self._sat_quant_offset: float = float(entry["sat_offset"])
+
+    def _preload_images_into_ram(self) -> dict:
+        """Glob ``_skyimg_dir`` / ``_satimg_dir`` and load every ``*.jpg`` / ``*.npy`` into memory.
+
+        Returns a dict ``{"sky_cache", "sat_cache", "sat_scale", "sat_offset"}``. Sky images are
+        stored uint8 ``[3, s, s]`` (lossless re: JPG's 8-bit encoding). Sat NPYs are loaded as
+        float32, then quantized uint8 using a single global ``(scale, offset)`` derived from the
+        observed min/max so ``x ≈ u8 * scale + offset`` at lookup time.
+        """
+        sky_cache: dict[str, torch.Tensor] = {}
+        sat_cache: dict[str, torch.Tensor] = {}
+        sat_scale: float = 1.0
+        sat_offset: float = 0.0
+
+        sky_paths: list[Path] = (
+            sorted(self._skyimg_dir.glob("*.jpg")) if self._skyimg_dir.is_dir() else []
+        )
+        sat_paths: list[Path] = (
+            sorted(self._satimg_dir.glob("*.npy")) if self._satimg_dir.is_dir() else []
+        )
+        n_sky = len(sky_paths)
+        n_sat = len(sat_paths)
+        print(
+            f"Preloading into memory: {n_sky} sky JPGs from {self._skyimg_dir}, "
+            f"{n_sat} sat NPYs from {self._satimg_dir} (dtype=uint8)"
+        )
+
+        # Sky: decode → resize → uint8 tensor directly (JPG is already 0-255, lossless).
+        sky_report_every = max(1, n_sky // 20) if n_sky else 1
+        for i, path in enumerate(sky_paths):
+            u8 = self._load_sky_uint8_from_disk(path)
+            if u8 is not None:
+                sky_cache[path.as_posix()] = u8
+            if (i + 1) % sky_report_every == 0 or (i + 1) == n_sky:
+                print(f"  sky preload {i + 1}/{n_sky}")
+
+        # Sat: NPY is float32 with unknown range → two-phase: (1) load float32 tensors into
+        # a tmp dict and track global min/max; (2) quantize each to uint8 via
+        # ``uint8 = round((x - min) / (max - min) * 255)`` and store in ``sat_cache``.
+        sat_tmp: dict[str, torch.Tensor] = {}
+        sat_min = float("inf")
+        sat_max = float("-inf")
+        sat_report_every = max(1, n_sat // 20) if n_sat else 1
+        for i, path in enumerate(sat_paths):
+            t = self._load_satimg_float32_from_disk(path)
+            if t is not None:
+                sat_tmp[path.as_posix()] = t
+                t_min = float(t.min().item())
+                t_max = float(t.max().item())
+                if t_min < sat_min:
+                    sat_min = t_min
+                if t_max > sat_max:
+                    sat_max = t_max
+            if (i + 1) % sat_report_every == 0 or (i + 1) == n_sat:
+                print(f"  sat preload {i + 1}/{n_sat}")
+
+        if sat_tmp:
+            if sat_max > sat_min:
+                sat_offset = float(sat_min)
+                sat_scale = float(sat_max - sat_min) / 255.0
+            else:
+                # Degenerate: all values equal → store zeros; dequant reconstructs exactly.
+                sat_offset = float(sat_min)
+                sat_scale = 0.0
+            inv = 1.0 / sat_scale if sat_scale > 0.0 else 0.0
+            for key, t in sat_tmp.items():
+                if inv > 0.0:
+                    q = ((t - sat_offset) * inv).round().clamp_(0, 255).to(torch.uint8)
+                else:
+                    q = torch.zeros_like(t, dtype=torch.uint8)
+                sat_cache[key] = q
+            sat_tmp.clear()
+
+        print(
+            f"Preload done: sky_cached={len(sky_cache)}/{n_sky} (uint8), "
+            f"sat_cached={len(sat_cache)}/{n_sat} (uint8, "
+            f"scale={sat_scale:.6g}, offset={sat_offset:.6g})"
+        )
+        return {
+            "sky_cache": sky_cache,
+            "sat_cache": sat_cache,
+            "sat_scale": sat_scale,
+            "sat_offset": sat_offset,
+        }
+
     def __len__(self):
         if self.split == "train":
             return len(self.sample_files)
@@ -524,22 +654,30 @@ class PVDataset(Dataset):
         s = self._skyimg_spatial_size
         return torch.zeros((3, s, s), dtype=torch.float32)
 
-    def _load_sky_tensor(self, path: Path) -> torch.Tensor:
+    def _load_sky_uint8_from_disk(self, path: Path) -> torch.Tensor | None:
+        """Load and resize a sky JPG as ``[3, s, s]`` uint8 tensor; ``None`` on failure."""
         try:
-            if path.is_file():
-                try:
-                    resample = Image.Resampling.LANCZOS
-                except AttributeError:
-                    resample = Image.LANCZOS
-                s = self._skyimg_spatial_size
-                with Image.open(path) as im:
-                    im = im.convert("RGB")
-                    im = im.resize((s, s), resample)
-                    arr = np.asarray(im, dtype=np.float32) / 255.0
-                return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+            if not path.is_file():
+                return None
+            try:
+                resample = Image.Resampling.LANCZOS
+            except AttributeError:
+                resample = Image.LANCZOS
+            s = self._skyimg_spatial_size
+            with Image.open(path) as im:
+                im = im.convert("RGB")
+                im = im.resize((s, s), resample)
+                arr = np.asarray(im, dtype=np.uint8)
+            return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
         except Exception:
-            pass
-        return self._black_sky_tensor()
+            return None
+
+    def _load_sky_tensor(self, path: Path) -> torch.Tensor:
+        """Return ``[3, s, s]`` float32 in ``[0, 1]``. Cache stores uint8 to save memory."""
+        t = self._sky_cache.get(path.as_posix())
+        if t is not None:
+            return t.to(torch.float32) / 255.0
+        return self._shared_black_sky
 
     def _history_sky_frame_times(self, t_end: pd.Timestamp) -> list[pd.Timestamp]:
         t_end = self._sky_collect_ts_local(t_end)
@@ -598,15 +736,24 @@ class PVDataset(Dataset):
         h, w, c = self._satimg_npy_shape_hwc
         return torch.zeros((c, h, w), dtype=torch.float32)
 
-    def _load_satimg_tensor(self, path: Path) -> torch.Tensor:
+    def _load_satimg_float32_from_disk(self, path: Path) -> torch.Tensor | None:
+        """Load NPY as ``[C, H, W]`` float32 tensor; ``None`` on failure or shape/dtype mismatch."""
         try:
-            if path.is_file():
-                arr = np.load(path, allow_pickle=False)
-                if arr.shape == self._satimg_npy_shape_hwc and arr.dtype == np.float32:
-                    return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+            if not path.is_file():
+                return None
+            arr = np.load(path, allow_pickle=False)
+            if arr.shape != self._satimg_npy_shape_hwc or arr.dtype != np.float32:
+                return None
+            return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
         except Exception:
-            pass
-        return self._dummy_satimg_tensor()
+            return None
+
+    def _load_satimg_tensor(self, path: Path) -> torch.Tensor:
+        """Return ``[C, H, W]`` float32. Cache stores uint8 + global (scale, offset) for dequant."""
+        t = self._sat_cache.get(path.as_posix())
+        if t is not None:
+            return t.to(torch.float32) * self._sat_quant_scale + self._sat_quant_offset
+        return self._shared_dummy_sat
 
     def _history_satimg_frame_utc_times(self, t_end_raw) -> list[pd.Timestamp]:
         t_end_utc = self._satimg_utc_key_time(t_end_raw)

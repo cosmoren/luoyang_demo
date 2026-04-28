@@ -36,8 +36,9 @@ TRAINING_HPARAM_KEYS = frozenset({
 })
 
 
-def load_config() -> dict:
-    with open(CONF_PATH) as f:
+def load_config(config_path: str | Path | None = None) -> dict:
+    path = Path(config_path) if config_path is not None else CONF_PATH
+    with open(path) as f:
         return yaml.safe_load(f)
 
 

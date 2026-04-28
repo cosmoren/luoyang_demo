@@ -6,33 +6,14 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-
-def _sinusoidal_encoding_1d(pos: torch.Tensor, dim: int, base: float = 10_000.0) -> torch.Tensor:
-    """
-    ``pos``: [B, T] continuous coordinates (e.g. normalized timestamps).
-    Returns: [B, T, dim] with dim even (sin/cos pairs).
-    """
-    if dim % 2 != 0:
-        raise ValueError(f"sinusoidal dim must be even, got {dim}")
-    device = pos.device
-    half = dim // 2
-    pos_f = pos.float()
-    freqs = torch.exp(
-        -math.log(base) * torch.arange(0, half, device=device, dtype=torch.float32) / half
-    )
-    ang = pos_f.unsqueeze(-1) * freqs.view(1, 1, -1)
-    enc = torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
-    return enc.to(dtype=pos.dtype)
-
-
 class VideoPatchSpatiotemporalEmbed(nn.Module):
     """
-    Patchify ``[B, T, 3, H, W]`` (default ``H=W=224``, ``patch_size=16`` → 196 patches/frame),
-    then add **learned** spatial position embedding per patch and **sinusoidal** temporal encoding
-    (from optional non-uniform ``time_offsets`` or normalized frame indices).
+    Patchify ``[B, T, 3, H, W]`` (default ``H=W=112``, ``patch_size=16`` → 196 patches/frame),
+    then add **learned** spatial position embedding per patch and temporal encoding
+    (MLP on ``timefeats`` ``[B, T, 9]`` broadcast to patches, or sinusoidal if ``timefeats`` is None).
     """
 
-    def __init__(self, embed_dim: int = 192, patch_size: int = 16, image_size: int = 224):
+    def __init__(self, embed_dim: int = 192, patch_size: int = 16, image_size: int = 112):
         super().__init__()
         if image_size % patch_size != 0:
             raise ValueError(f"image_size ({image_size}) must be divisible by patch_size ({patch_size})")
@@ -47,14 +28,21 @@ class VideoPatchSpatiotemporalEmbed(nn.Module):
         self.spatial_pos_embed = nn.Parameter(torch.zeros(1, 1, self.num_patches, embed_dim))
         nn.init.trunc_normal_(self.spatial_pos_embed, std=0.02)
 
-    def forward(self, x: torch.Tensor, time_offsets: Optional[torch.Tensor] = None) -> torch.Tensor:
+        self.timefeats_mlp = nn.Sequential(
+            nn.Linear(9, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+
+    def forward(self, x: torch.Tensor, timefeats: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
-            x: ``[B, T, 3, H, W]`` with ``H=W=self.image_size`` (typically 224).
-            time_offsets: optional ``[B, T]`` same unit per batch (e.g. seconds since clip start);
-                used for non-uniform sampling. If ``None``, uses ``linspace(0, 1, T)`` per batch.
+            x: ``[B, T, 3, H, W]`` with ``H=W=self.image_size`` (typically 112).
+            timefeats: optional ``[B, T, 9]``. MLP → ``[B, T, embed_dim]``, then ``unsqueeze(2)``
+                → ``[B, T, 1, embed_dim]``, added (broadcast) to all patch positions.
+            If ``None``, uses normalized frame indices and sinusoidal encoding (same as before).
         Returns:
-            ``[B, T, num_patches, embed_dim]`` patch tokens with spatial + temporal encodings added.
+            ``[B, T, num_patches, embed_dim]``.
         """
         B, T, C, H, W = x.shape
         if H != self.image_size or W != self.image_size:
@@ -67,39 +55,29 @@ class VideoPatchSpatiotemporalEmbed(nn.Module):
         tok = tok.flatten(2).transpose(1, 2)  # [B*T, P, D]
         tok = tok.view(B, T, self.num_patches, self.embed_dim)
         tok = tok + self.spatial_pos_embed
+        time_tok = self.timefeats_mlp(timefeats.to(dtype=tok.dtype)).unsqueeze(2)  # [B, T, 1, D]
+        tok = tok + time_tok
 
-        if time_offsets is None:
-            tpos = torch.linspace(0.0, 1.0, steps=T, device=x.device, dtype=x.dtype).view(1, T).expand(B, -1)
-        else:
-            if time_offsets.shape != (B, T):
-                raise ValueError(f"time_offsets must be [B, T]={B, T}, got {tuple(time_offsets.shape)}")
-            tpos = time_offsets.to(dtype=x.dtype, device=x.device)
-            tpos = tpos - tpos[:, :1]
-            denom = (tpos[:, -1:] - tpos[:, :1]).clamp(min=1e-6)
-            tpos = tpos / denom
-
-        temb = _sinusoidal_encoding_1d(tpos, self.embed_dim).to(dtype=tok.dtype)
-        tok = tok + temb.unsqueeze(2)
         return tok
 
 
 def patchify_spatiotemporal_images(
     x: torch.Tensor,
     embedder: VideoPatchSpatiotemporalEmbed,
-    time_offsets: Optional[torch.Tensor] = None,
+    timefeats: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Patchify video frames and add spatial + temporal encodings (see :class:`VideoPatchSpatiotemporalEmbed`).
 
     Args:
-        x: ``[B, T, 3, 224, 224]`` (``224`` must match ``embedder.image_size``).
+        x: ``[B, T, 3, 112, 112]`` (``112`` must match ``embedder.image_size``).
         embedder: holds Conv patch projection and spatial positional parameters.
-        time_offsets: optional ``[B, T]`` for non-uniform temporal spacing.
+        timefeats: optional ``[B, T, 9]``.
 
     Returns:
-        ``[B, T, 196, embed_dim]`` when ``patch_size=16``, ``image_size=224``.
+        ``[B, T, 196, embed_dim]`` when ``patch_size=16``, ``image_size=112``.
     """
-    return embedder(x, time_offsets=time_offsets)
+    return embedder(x, timefeats=timefeats)
 
 
 class _TokenTransformerBlock(nn.Module):

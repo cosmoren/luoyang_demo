@@ -6,6 +6,7 @@ Uses the same Luoyang CSV / sky / sat DataLoader as train.py.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -18,16 +19,41 @@ from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_CONFIG_DIR = _PROJECT_ROOT / "config"
+_DEFAULT_CONF_NAME = "conf.yaml"
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from config_utils import get_resolved_paths
-from dataloader.luoyang import PVDataset, collate_batched
-from models.models import pv_forecasting_model_vit_nwp_short
+from dataloader.luoyang_mem import PVDataset, collate_batched
+from models.models import pv_forecasting_model_vit_imgs
 from training.training_conf import (
     get_training_hparams_from_conf,
     get_training_paths_from_conf,
     load_config,
 )
+
+
+def _gpu_id_for_checkpoint() -> int:
+    """
+    Label for ``pv_forecast_vit_best_gpu*.pt`` (not necessarily PyTorch logical index).
+
+    If ``CUDA_VISIBLE_DEVICES`` is set to a comma-separated list, use the first token
+    when it is a non-negative integer (e.g. ``4`` or ``4,5`` -> 4). Otherwise fall back
+    to ``torch.cuda.current_device()`` (logical id, often 0 when only ``cuda`` is used).
+    """
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if raw is None:
+        return torch.cuda.current_device()
+    s = raw.strip()
+    if not s:
+        return torch.cuda.current_device()
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    if not parts:
+        return torch.cuda.current_device()
+    first = parts[0]
+    if first.isdigit():
+        return int(first)
+    return torch.cuda.current_device()
 
 
 def _batch_to_device(batch: dict, device: torch.device) -> dict:
@@ -81,7 +107,7 @@ def train_one_epoch(
         B = d["device_id"].size(0)
         optimizer.zero_grad()
         pv_pred = forward_vit(model, d)
-        loss = criterion(pv_pred * d["target_mask"], d["target_pv"] * d["target_mask"])
+        loss = criterion( (pv_pred * d["target_mask"])[:,0:16], (d["target_pv"] * d["target_mask"])[:,0:16])
         # loss = criterion(pv_pred, d["target_pv"])
         loss.backward()
         optimizer.step()
@@ -104,7 +130,7 @@ def evaluate(
             d = _batch_to_device(batch, device)
             B = d["device_id"].size(0)
             pv_pred = forward_vit(model, d)
-            loss = criterion(pv_pred * d["target_mask"], d["target_pv"] * d["target_mask"])
+            loss = criterion( (pv_pred * d["target_mask"])[:,0:16], (d["target_pv"] * d["target_mask"])[:,0:16] )
             # loss = criterion(pv_pred, d["target_pv"])
             total_loss += loss.item()
             n += B
@@ -112,10 +138,11 @@ def evaluate(
             for i in range(pv_pred.shape[0]):
                 kk = int(d["device_id"][i].item()) # the inverter ID
                 # forecast_timefeats[:, 3] == cos_zenith (see solar_features_encoder column order)
-                cos_zenith = d["forecast_timefeats"][i][:, 3].detach().cpu().float().numpy()
+                # RMSE/MAE aggregation: first 16 horizons only (match training loss window)
+                cos_zenith = d["forecast_timefeats"][i][:16, 3].detach().cpu().float().numpy()
                 night = cos_zenith < 0
-                pred_np = pv_pred[i].detach().cpu().float().numpy().copy()
-                tgt_np = d["target_pv"][i].detach().cpu().float().numpy().copy()
+                pred_np = pv_pred[i, :16].detach().cpu().float().numpy().copy()
+                tgt_np = d["target_pv"][i, :16].detach().cpu().float().numpy().copy()
                 pred_np[night] = 0.0
                 # tgt_np[night] = 0.0
                 discrete_pred = pred_np.tolist()
@@ -139,11 +166,12 @@ def evaluate(
             else:
                 total_target = total_target + np.asarray(target_dict[kk]).reshape(-1)
         
+        
         mae = np.mean(np.abs(total_pred*50 - total_target*50))
         rmse = np.sqrt(np.mean((total_pred*50 - total_target*50) ** 2))
 
         capacity = 54600
-        print(f"t0 - t0+48h, 15min interval, 192 points. Capacity: {capacity}(KW)")
+        print(f"RMSE/MAE on first 16 steps (15min), ~4h. Capacity: {capacity}(KW)")
         print(f"MAE: {mae:.6f}, RMSE: {rmse:.6f}, ACC(MAE): {1.0 - mae/capacity:.6f}, ACC(RMSE): {1.0 - rmse/capacity:.6f}")
     
     return total_loss / max(n, 1), rmse, mae
@@ -183,8 +211,24 @@ def _build_lr_scheduler(
     )
 
 
-def _build_parser(path_defaults: dict, h: dict) -> argparse.ArgumentParser:
+def _resolve_config_path(config_name: str) -> Path:
+    cfg = Path(config_name)
+    if cfg.name != config_name:
+        raise ValueError("--config only accepts a filename under project config/, e.g. --config conf_train.yaml")
+    cfg_path = _CONFIG_DIR / cfg.name
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"config file not found under config/: {cfg_path}")
+    return cfg_path
+
+
+def _build_parser(path_defaults: dict, h: dict, config_default: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train PV forecasting model (ViT / TimeSformer)")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=config_default,
+        help=f"Config filename under project config/ (default: {config_default!r}).",
+    )
     parser.add_argument("--epochs", type=int, default=h["epochs"])
     parser.add_argument("--lr", type=float, default=h["lr"])
     parser.add_argument(
@@ -348,10 +392,14 @@ def _dataset_kwargs(args: argparse.Namespace, satimg_hwc: tuple[int, int, int], 
 
 
 def main() -> None:
-    conf = load_config()
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", type=str, default=_DEFAULT_CONF_NAME)
+    pre_args, _ = pre_parser.parse_known_args()
+
+    conf = load_config(_resolve_config_path(pre_args.config))
     h = get_training_hparams_from_conf(conf)
     path_defaults = get_training_paths_from_conf(conf)
-    parser = _build_parser(path_defaults, h)
+    parser = _build_parser(path_defaults, h, config_default=pre_args.config)
     args = parser.parse_args()
     satimg_hwc = tuple(args.satimg_npy_shape_hwc)
 
@@ -363,7 +411,7 @@ def main() -> None:
     dev_dn_list = pv_device_df["devDn"].dropna().unique().tolist()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = pv_forecasting_model_vit_nwp_short(dev_dn_list=dev_dn_list).to(device)
+    model = pv_forecasting_model_vit_imgs(dev_dn_list=dev_dn_list).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -413,7 +461,12 @@ def main() -> None:
 
     checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else _PROJECT_ROOT / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    best_ckpt_path = checkpoint_dir / "pv_forecast_vit_best.pt"
+    if device.type == "cuda":
+        _gpu_id = _gpu_id_for_checkpoint()
+        _ckpt_suffix = f"gpu{_gpu_id}"
+    else:
+        _ckpt_suffix = "cpu"
+    best_ckpt_path = checkpoint_dir / f"pv_forecast_vit_best_{_ckpt_suffix}.pt"
 
     initial_test_loss, _, _ = evaluate(model, device, test_loader, criterion)
     print(f"Initial test loss: {initial_test_loss:.6f}")
@@ -437,7 +490,7 @@ def main() -> None:
         scheduler.step()
 
         if args.save_every and epoch % args.save_every == 0:
-            path = checkpoint_dir / f"pv_forecast_vit_epoch_{epoch}.pt"
+            path = checkpoint_dir / f"pv_forecast_vit_epoch_{epoch}_{_ckpt_suffix}.pt"
             torch.save(
                 {
                     "epoch": epoch,
@@ -465,7 +518,7 @@ def main() -> None:
                 best_ckpt_path,
             )
 
-    final_path = checkpoint_dir / "pv_forecast_vit_final.pt"
+    final_path = checkpoint_dir / f"pv_forecast_vit_final_{_ckpt_suffix}.pt"
     torch.save(
         {
             "epoch": args.epochs,
@@ -486,7 +539,7 @@ def main() -> None:
             f"Test set with best val-RMSE checkpoint ({best_ckpt_path.name}, epoch={ckpt.get('epoch', '?')}): "
             f"loss={test_loss_best:.6f}, RMSE={test_rmse_best:.6f}, MAE={test_mae_best:.6f}"
         )
-        metrics_log = checkpoint_dir / "pv_forecast_ssrd_t2m_short_addcorasequeries_again_32.txt"
+        metrics_log = checkpoint_dir / f"pv_forecast_4h_pv_sat_{_ckpt_suffix}.txt"
         with open(metrics_log, "a", encoding="utf-8") as mf:
             mf.write(
                 f"{test_loss_best:.8f}\t{test_rmse_best:.8f}\t{test_mae_best:.8f}\n"

@@ -7,38 +7,13 @@ site:
 
 paths:
   data_dir: "/work/datasets/luoyang_dataset"
-  config_dir: config
-  nwp_config: config/NWP.yaml
-  pv_download: pv
-  pv_station_meta: data
+  # config_dir: config
   pv_device_path: dataloader/XINSHENG_power_total_devices_type1.xlsx
-  sat_download: himawari
-  nwp_download: nwp_download
-  nwp_newest: nwp_newest
-  # Under data_dir: camera/download base and inference sky folders
-  skyimg_download: skyimg
-  skyimg_pred: skyimg_pred
-  # asi: skyimg_download / sky_image_asi_16613_subpath; pred: skyimg_pred / sky_image_asi_16613_subpath
-  sky_image_asi_16613_subpath: asi_16613
-  # wylc: skyimg_download / sky_image_wylc_subpath; pred: skyimg_pred / same (optional sky_image_wylc_pred_subpath)
-  sky_image_wylc_subpath: wylc
-
   # Training / eval data (single folder each under data_dir; train and test use the same roots)
   sky_image_path: asi_16613
   pv_path: luoyang_data_626
   sat_path: himawari_cropped
   nwp_path: NWP
-
-nwp:
-  solar_subdir: solar
-  wind_subdir: wind
-
-# USB camera for sky images (0 = first camera, 1 = second/"other" camera)
-camera:
-  camera_id: 2
-
-download:
-  user_agent: "Mozilla/5.0 (compatible; NWP downloader)"
 
 # Hyperparameters for training/train.py (CLI flags override these when passed)
 training:
