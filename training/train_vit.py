@@ -1,6 +1,8 @@
 """
 Training script for pv_forecasting_model_vit (sat + sky TimeSformer + PV TCN).
 Uses the same Luoyang CSV / sky / sat DataLoader as train.py.
+
+Folsom irradiance trainer: ``training/train_vit_folsom.py``.
 """
 
 from __future__ import annotations
@@ -8,6 +10,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import numpy as np
@@ -21,13 +24,247 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from config_utils import get_resolved_paths
-from dataloader.luoyang import PVDataset, collate_batched
-from models.models import pv_forecasting_model_vit_nwp_short
+from dataloader.luoyang import PVDataset, collate_batched, what_to_fetch, data_fetched
+from models.models import pv_forecasting_model_vit_nwp
+from training.luoyang_debug import (
+    choose_deterministic_debug_sample,
+    choose_random_debug_sample,
+    normalize_debug_split,
+)
 from training.training_conf import (
     get_training_hparams_from_conf,
     get_training_paths_from_conf,
     load_config,
 )
+
+
+def batch_evaluation(
+    batch: dict[str, Any],
+    *,
+    num_devices: int,
+    pv_input_len: int,
+    pv_output_len: int,
+    satimg_window_size: int,
+    skyimg_window_size: int,
+    skyimg_spatial_size: int,
+    satimg_npy_shape_hwc: tuple[int, int, int],
+    model: nn.Module,
+    device: torch.device,
+) -> None:
+    """Run a descriptive, multi-check batch validation and raise on the first failure."""
+    title = "batch inspect"
+    print(f"{title}: start train batch validation")
+    passed = 0
+    total = 8
+
+    def _run_check(name: str, why: str, fn) -> None:
+        nonlocal passed
+        try:
+            detail = fn()
+            print(f"{title}: {name}: PASS - {why}. {detail}")
+            passed += 1
+        except Exception as e:
+            print(f"{title}: {name}: FAIL - {why}. {e}")
+            print(f"{title}: summary FAIL ({passed}/{total} checks passed)")
+            raise
+
+    expected_keys = (
+        "dev_idx",
+        "pv",
+        "pv_mask",
+        "pv_timefeats",
+        "forecast_timefeats",
+        "sat_tensor",
+        "sat_timefeats",
+        "skimg_tensor",
+        "skimg_timefeats",
+        "nwp_tensor",
+        "target_pv",
+        "target_mask",
+    )
+    h_w_c = satimg_npy_shape_hwc
+    exp_c, exp_h, exp_w = h_w_c[2], h_w_c[0], h_w_c[1]
+
+    def _check_keys() -> str:
+        missing = [k for k in expected_keys if k not in batch]
+        if missing:
+            raise AssertionError(f"missing required keys: {missing}")
+        extra = sorted(set(batch.keys()) - set(expected_keys))
+        return f"found all {len(expected_keys)} required keys; extra keys={extra if extra else 'none'}"
+
+    _run_check(
+        "1/8 Keys",
+        "model and trainer need a stable batch contract",
+        _check_keys,
+    )
+
+    dev_idx = batch["dev_idx"]
+    B = int(dev_idx.shape[0])
+
+    def _check_batch_and_device_ids() -> str:
+        if dev_idx.dtype != torch.long:
+            raise AssertionError(f"dev_idx dtype should be torch.int64, got {dev_idx.dtype}")
+        if B < 1:
+            raise AssertionError(f"batch size must be >=1, got {B}")
+        if (dev_idx < 0).any() or (dev_idx >= num_devices).any():
+            raise AssertionError(
+                f"dev_idx out of range [0, {num_devices}); min={int(dev_idx.min())} max={int(dev_idx.max())}"
+            )
+        return (
+            f"B={B}, dev_idx dtype={dev_idx.dtype}, "
+            f"dev_idx range={int(dev_idx.min())}..{int(dev_idx.max())} in [0,{num_devices})"
+        )
+
+    _run_check(
+        "2/8 Batch size and dev ids",
+        "all modalities must align on the same sample axis and device ids must be valid",
+        _check_batch_and_device_ids,
+    )
+
+    pv, pm = batch["pv"], batch["pv_mask"]
+    pvf, ftf = batch["pv_timefeats"], batch["forecast_timefeats"]
+    tpv, tm = batch["target_pv"], batch["target_mask"]
+
+    def _check_pv_target_time_shapes() -> str:
+        if pv.shape[0] != B or pm.shape[0] != B:
+            raise AssertionError(f"pv/pv_mask leading dim mismatch for B={B}: pv={tuple(pv.shape)} pm={tuple(pm.shape)}")
+        if pv.shape != pm.shape:
+            raise AssertionError(f"pv and pv_mask must match exactly: pv={tuple(pv.shape)} pm={tuple(pm.shape)}")
+        if int(pv.shape[-1]) != pv_input_len:
+            raise AssertionError(f"pv T_in mismatch: expected {pv_input_len}, got {tuple(pv.shape)}")
+        if tpv.shape[0] != B or tm.shape[0] != B:
+            raise AssertionError(f"target leading dim mismatch for B={B}: target={tuple(tpv.shape)} mask={tuple(tm.shape)}")
+        if tpv.shape != tm.shape:
+            raise AssertionError(f"target_pv and target_mask must match exactly: {tuple(tpv.shape)} vs {tuple(tm.shape)}")
+        if int(tpv.shape[-1]) != pv_output_len:
+            raise AssertionError(f"target T_out mismatch: expected {pv_output_len}, got {tuple(tpv.shape)}")
+        return f"pv={tuple(pv.shape)}, pv_mask={tuple(pm.shape)}, target_pv={tuple(tpv.shape)}, target_mask={tuple(tm.shape)}"
+
+    _run_check(
+        "3/8 PV and target shapes",
+        "input and output horizons must match configuration",
+        _check_pv_target_time_shapes,
+    )
+
+    def _check_time_feature_alignment() -> str:
+        if pvf.shape[0] != B or ftf.shape[0] != B:
+            raise AssertionError(f"timefeats leading dim mismatch for B={B}: pvf={tuple(pvf.shape)} ftf={tuple(ftf.shape)}")
+        if int(pvf.shape[1]) != pv_input_len:
+            raise AssertionError(f"pv_timefeats T_in mismatch: expected {pv_input_len}, got {tuple(pvf.shape)}")
+        if int(ftf.shape[1]) != pv_output_len:
+            raise AssertionError(f"forecast_timefeats T_out mismatch: expected {pv_output_len}, got {tuple(ftf.shape)}")
+        if int(pvf.shape[2]) != int(ftf.shape[2]):
+            raise AssertionError(f"timefeat channel mismatch: pv={pvf.shape[2]} forecast={ftf.shape[2]}")
+        return f"pv_timefeats={tuple(pvf.shape)}, forecast_timefeats={tuple(ftf.shape)}, C_tf={int(pvf.shape[2])}"
+
+    _run_check(
+        "4/8 Time features",
+        "history and forecast temporal features must align with their horizons",
+        _check_time_feature_alignment,
+    )
+
+    st, stf = batch["sat_tensor"], batch["sat_timefeats"]
+    sk, skf = batch["skimg_tensor"], batch["skimg_timefeats"]
+    nwp = batch["nwp_tensor"]
+
+    def _check_modal_shapes() -> str:
+        if st.shape[0] != B or stf.shape[0] != B:
+            raise AssertionError(f"sat leading dim mismatch for B={B}: sat={tuple(st.shape)} sat_tf={tuple(stf.shape)}")
+        if int(st.shape[1]) != satimg_window_size or int(stf.shape[1]) != satimg_window_size:
+            raise AssertionError(
+                f"sat window mismatch: expected T={satimg_window_size}, got sat={tuple(st.shape)} sat_tf={tuple(stf.shape)}"
+            )
+        if tuple(st.shape[2:5]) != (exp_c, exp_h, exp_w):
+            raise AssertionError(
+                f"sat CHW mismatch: expected {(exp_c, exp_h, exp_w)}, got {tuple(st.shape[2:5])}"
+            )
+        if sk is None or skf is None:
+            raise AssertionError("skimg tensors are None but model path expects sky inputs")
+        if sk.shape[0] != B or skf.shape[0] != B:
+            raise AssertionError(f"sky leading dim mismatch for B={B}: sky={tuple(sk.shape)} sky_tf={tuple(skf.shape)}")
+        if int(sk.shape[1]) != skyimg_window_size or int(skf.shape[1]) != skyimg_window_size:
+            raise AssertionError(
+                f"sky window mismatch: expected T={skyimg_window_size}, got sky={tuple(sk.shape)} sky_tf={tuple(skf.shape)}"
+            )
+        if int(sk.shape[3]) != skyimg_spatial_size or int(sk.shape[4]) != skyimg_spatial_size:
+            raise AssertionError(
+                f"sky H/W mismatch: expected {skyimg_spatial_size}, got sky={tuple(sk.shape)}"
+            )
+        if nwp is None:
+            raise AssertionError("nwp_tensor is None but model forward uses NWP columns")
+        if nwp.shape[0] != B or int(nwp.shape[1]) != pv_output_len or int(nwp.shape[2]) < 2:
+            raise AssertionError(
+                f"nwp shape mismatch: expected (B={B}, T_out={pv_output_len}, C>=2), got {tuple(nwp.shape)}"
+            )
+        return f"sat={tuple(st.shape)}, sky={tuple(sk.shape)}, nwp={tuple(nwp.shape)}"
+
+    _run_check(
+        "5/8 Modal tensor shapes",
+        "satellite, sky, and NWP branches must be geometrically consistent",
+        _check_modal_shapes,
+    )
+
+    float_tensors = (
+        ("pv", pv),
+        ("pv_mask", pm),
+        ("pv_timefeats", pvf),
+        ("forecast_timefeats", ftf),
+        ("sat_tensor", st),
+        ("sat_timefeats", stf),
+        ("skimg_tensor", sk),
+        ("skimg_timefeats", skf),
+        ("nwp_tensor", nwp),
+        ("target_pv", tpv),
+        ("target_mask", tm),
+    )
+
+    def _check_dtypes() -> str:
+        parts: list[str] = []
+        for name, t in float_tensors:
+            if not t.is_floating_point():
+                raise AssertionError(f"{name} must be floating type, got {t.dtype}")
+            parts.append(f"{name}={t.dtype}")
+        return ", ".join(parts)
+
+    _run_check(
+        "6/8 Dtypes",
+        "model math expects float inputs (with integer dev indices only)",
+        _check_dtypes,
+    )
+
+    def _check_finite_values() -> str:
+        checked = []
+        for name, t in float_tensors:
+            if not torch.isfinite(t).all():
+                n_bad = int((~torch.isfinite(t)).sum().item())
+                raise AssertionError(f"{name} has non-finite values; bad_count={n_bad}, shape={tuple(t.shape)}")
+            checked.append(name)
+        return f"all finite: {', '.join(checked)}"
+
+    _run_check(
+        "7/8 Finite values",
+        "NaN/Inf in a batch usually breaks loss/gradients quickly",
+        _check_finite_values,
+    )
+
+    def _check_forward_smoke() -> str:
+        model.eval()
+        with torch.no_grad():
+            d = _batch_to_device(batch, device)
+            out = forward_vit(model, d)
+        if out.shape != (B, pv_output_len):
+            raise AssertionError(f"output shape mismatch: expected ({B}, {pv_output_len}), got {tuple(out.shape)}")
+        if not torch.isfinite(out).all():
+            raise AssertionError("output contains NaN/Inf")
+        return f"device={device!r}, output_shape={tuple(out.shape)}, output_dtype={out.dtype}"
+
+    _run_check(
+        "8/8 Forward smoke test",
+        "end-to-end collation-to-model path must execute cleanly once before training",
+        _check_forward_smoke,
+    )
+
+    print(f"{title}: summary PASS ({passed}/{total} checks passed)")
 
 
 def _batch_to_device(batch: dict, device: torch.device) -> dict:
@@ -320,6 +557,40 @@ def _build_parser(path_defaults: dict, h: dict) -> argparse.ArgumentParser:
         default=h["train_max_batches_per_epoch"],
         help="Stop each training epoch after this many batches (default from conf; null = no cap).",
     )
+    parser.add_argument(
+        "--debug-fetch-only",
+        action="store_true",
+        help="Print one Luoyang fetch inspection sample and exit.",
+    )
+    parser.add_argument(
+        "--debug-split",
+        type=str,
+        default="train",
+        choices=("train", "test"),
+        help="Dataset split used by --debug-fetch-only.",
+    )
+    parser.add_argument(
+        "--debug-random",
+        action="store_true",
+        help="Use random file + random valid anchor for --debug-fetch-only.",
+    )
+    parser.add_argument(
+        "--debug-csv-path",
+        type=str,
+        default="",
+        help="CSV path (or basename from pv_dir) for deterministic --debug-fetch-only.",
+    )
+    parser.add_argument(
+        "--debug-last-input-collect-time",
+        type=str,
+        default="",
+        help="Required with deterministic --debug-fetch-only; collectTime for last PV input row.",
+    )
+    parser.add_argument(
+        "--debug-batch-only",
+        action="store_true",
+        help="Pull one train batch, run batch_evaluation checks, then exit.",
+    )
     return parser
 
 
@@ -410,6 +681,43 @@ def main() -> None:
         pin_memory=True,
         persistent_workers=True,
     )
+
+    if args.debug_fetch_only:
+        debug_split = normalize_debug_split(args.debug_split)
+        debug_dataset = train_dataset if debug_split == "train" else test_dataset
+
+        if args.debug_random:
+            sample_path, df, r = choose_random_debug_sample(debug_dataset, debug_split)
+            what_to_fetch(debug_dataset, df, r)
+            data_fetched(debug_dataset, sample_path, df, r)
+        else:
+            if not str(args.debug_last_input_collect_time).strip():
+                raise ValueError("--debug-last-input-collect-time is required unless --debug-random is set")
+            sample_path, df, j = choose_deterministic_debug_sample(
+                debug_dataset,
+                debug_split=debug_split,
+                csv_path=args.debug_csv_path,
+                last_input_collect_time=args.debug_last_input_collect_time,
+            )
+            what_to_fetch(debug_dataset, df, 0, anchor_last_row=j)
+            data_fetched(debug_dataset, sample_path, df, 0, anchor_last_row=j)
+        return
+
+    if args.debug_batch_only:
+        batch0 = next(iter(train_loader))
+        batch_evaluation(
+            batch0,
+            num_devices=len(dev_dn_list),
+            pv_input_len=args.pv_input_len,
+            pv_output_len=args.pv_output_len,
+            satimg_window_size=args.satimg_window_size,
+            skyimg_window_size=args.skyimg_window_size,
+            skyimg_spatial_size=args.skyimg_spatial_size,
+            satimg_npy_shape_hwc=satimg_hwc,
+            model=model,
+            device=device,
+        )
+        return
 
     checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else _PROJECT_ROOT / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)

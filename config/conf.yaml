@@ -24,9 +24,9 @@ paths:
   sky_image_wylc_subpath: wylc
 
   # Training / eval data (single folder each under data_dir; train and test use the same roots)
-  sky_image_path: asi_16613
-  pv_path: luoyang_data_626
-  sat_path: himawari_cropped
+  sky_image_path: skyimg
+  pv_path: luoayng_data_626
+  sat_path: himawari2025L2cloud_npy
   nwp_path: NWP
 
 nwp:

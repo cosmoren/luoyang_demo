@@ -626,3 +626,115 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         pv = self.fc(pv_feats)
 
         return pv.squeeze(-1)
+
+
+class irr_forecasting_model_vit_folsom(nn.Module):
+    """
+    Folsom multimodal forecaster: 3-channel irradiance TCN, NWP-augmented forecast queries,
+    sky TimeSformer branch fused with cross-attention. Returns ``[B, T_out, 3]`` (GHI, DNI, DHI).
+    """
+
+    _timefeat_dim = 9
+
+    def __init__(
+        self,
+        *,
+        skyimg_window_size: int,
+        skyimg_spatial_size: int = 224,
+        use_batchnorm: bool = True,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.skyimg_window_size = int(skyimg_window_size)
+        self.skyimg_spatial_size = int(skyimg_spatial_size)
+
+        logging.getLogger("transformers").setLevel(logging.ERROR)
+        os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+        config = TimesformerConfig(
+            num_frames=self.skyimg_window_size,
+            image_size=224,
+            patch_size=16,
+            num_channels=3,
+        )
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.skimg_extractor = TimeSformerFeatureExtractor(
+                pretrained="facebook/timesformer-base-finetuned-k400",
+                output_format="sequence",
+                normalize=True,
+                config=config,
+            )
+
+        self.TCN = TemporalCNN1d(
+            in_channels=13,
+            out_channels=64,
+            use_batchnorm=use_batchnorm,
+            dropout=dropout,
+        )
+        self.query_mlp = MLP(in_dim=11, hidden_dims=(64, 64), out_dim=64, dropout=0.0)
+        self.cross_attention_irr = CrossAttention(
+            query_dim=64, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout
+        )
+        self.cross_attention_skimg = CrossAttention(
+            query_dim=64, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout
+        )
+        self.skimg_downdim = MLP(in_dim=768, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
+        self.timefeats_encoder = MLP(in_dim=self._timefeat_dim, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
+        self.irr_feats_head = MLP(in_dim=64, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
+        self.fc_out = nn.Linear(64, 3)
+
+    def forward(
+        self,
+        ghi: torch.Tensor,
+        dni: torch.Tensor,
+        dhi: torch.Tensor,
+        input_mask: torch.Tensor,
+        irr_timefeats: torch.Tensor,
+        forecast_timefeats: torch.Tensor,
+        skimg_tensor: Optional[torch.Tensor] = None,
+        skimg_timefeats: Optional[torch.Tensor] = None,
+        nwp_tensor: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        gm = input_mask.to(ghi.dtype)
+        ghi_m = ghi.unsqueeze(1) * gm
+        dni_m = dni.unsqueeze(1) * gm
+        dhi_m = dhi.unsqueeze(1) * gm
+        irr_tf = irr_timefeats.permute(0, 2, 1)
+        irr_hist = torch.cat([ghi_m, dni_m, dhi_m, gm, irr_tf], dim=1)
+        # Keep mask shape [B,1,T] so it broadcasts across all history channels in TemporalCNN1d.
+        irr_mem = self.TCN(irr_hist, gm)
+        kv_irr = irr_mem.permute(0, 2, 1)
+
+        B, T_out, _ = forecast_timefeats.shape
+        if nwp_tensor is None:
+            nwp_front = torch.zeros(B, T_out, device=ghi.device, dtype=ghi.dtype)
+            nwp_bad = torch.ones(B, T_out, device=ghi.device, dtype=ghi.dtype)
+        else:
+            nwp_front = (nwp_tensor[:, :, 0].clamp(min=0.0) / 1000.0 - 0.5) * 2.0
+            nwp_bad = nwp_tensor[:, :, -1]
+
+        q_in = torch.cat(
+            [forecast_timefeats, nwp_front.unsqueeze(2), nwp_bad.unsqueeze(2)],
+            dim=2,
+        )
+        forecast_query = self.query_mlp(q_in)
+        irr_q = self.cross_attention_irr(query=forecast_query, key=kv_irr, value=kv_irr)
+
+        if skimg_tensor is None or skimg_timefeats is None:
+            sky_q = torch.zeros_like(irr_q)
+        else:
+            H0, W0 = int(skimg_tensor.shape[-2]), int(skimg_tensor.shape[-1])
+            sk = nn.functional.interpolate(
+                skimg_tensor.reshape(-1, 3, H0, W0),
+                size=(224, 224),
+                mode="bilinear",
+                align_corners=False,
+            ).view(ghi.shape[0], self.skyimg_window_size, 3, 224, 224)
+            sk_feat = self.skimg_extractor(sk)
+            sk_down = self.skimg_downdim(sk_feat)
+            sk_tf = self.timefeats_encoder(skimg_timefeats)
+            sk_kv = sk_down + sk_tf
+            sky_q = self.cross_attention_skimg(query=forecast_query, key=sk_kv, value=sk_kv)
+
+        fused = irr_q + sky_q
+        x = self.irr_feats_head(fused)
+        return self.fc_out(x)
