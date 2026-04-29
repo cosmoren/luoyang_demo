@@ -13,6 +13,12 @@ from modules.SatEncoder import (
     patchify_spatiotemporal_images,
 )
 from modules.SatCompressor import SatelliteTwoStageCompressor
+from modules.SkyEncoder import (
+    SkyAlternatingIntraInterFrameAttention,
+    SkyPatchSpatiotemporalEmbed,
+    patchify_spatiotemporal_sky_images,
+)
+from modules.SkyCompressor import SkyTwoStageCompressor
 from .timesformer import TimeSformerFeatureExtractor, TimesformerConfig
 import logging
 import os
@@ -558,6 +564,26 @@ class pv_forecasting_model_vit_imgs(nn.Module):
                                             use_frame_time=True,
                                             use_coarse_spatial=True,
                                             coarse_query_grid_hw=(6, 8),)
+        
+        self.sky_embed_dim = 64
+        self.sky_patch_embed = SkyPatchSpatiotemporalEmbed(
+            embed_dim=self.sky_embed_dim, patch_size=16, image_size=112
+        )
+        self.sky_alt_attn = SkyAlternatingIntraInterFrameAttention(
+            embed_dim=self.sky_embed_dim, num_heads=8, num_cycles=4, dropout=dropout
+        )
+        self.sky_two_stage_compressor = SkyTwoStageCompressor(
+            dim=self.sky_embed_dim,
+            num_frames=24,
+            num_patches=49,
+            num_frame_queries=8,
+            num_sky_queries=48,
+            num_heads=8,
+            use_patch_pos=True,
+            use_frame_time=True,
+            use_coarse_spatial=True,
+            coarse_query_grid_hw=(6, 8),
+        )
 
         self.cross_attention_pv = CrossAttention(query_dim=64, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
         self.pv_feats_head = MLP(in_dim=80, hidden_dims=(128, 64), out_dim=64, dropout=0.0)  # PV 64 + sat 64 + inverter 16
@@ -614,7 +640,27 @@ class pv_forecasting_model_vit_imgs(nn.Module):
 
             sat_compressed = self.sat_two_stage_compressor(sat_patch_tokens) + self.sat_mod_embed # [B,P=48,D=64]
 
-        hist_mem_compressed = torch.cat([KV_hist_mem_compressed, sat_compressed], dim=1) # 
+        # sky images encoder
+        if skimg_tensor is None or skimg_tensor.max() == 0:
+            sky_compressed = torch.zeros(B, 48, 64, device=pv.device, dtype=pv.dtype) + self.sky_mod_embed
+        else:
+            B_sky, T_sky, C_sky, H_sky, W_sky = skimg_tensor.shape
+            if C_sky != 3:
+                raise ValueError(f"skimg_tensor expected 3 channels, got {C_sky}")
+            sky_hr = nn.functional.interpolate(
+                skimg_tensor.reshape(B_sky * T_sky, C_sky, H_sky, W_sky),
+                size=(112, 112),
+                mode="bilinear",
+                align_corners=False,
+            ).view(B_sky, T_sky, 3, 112, 112)
+
+            sky_patch_tokens = patchify_spatiotemporal_sky_images(
+                sky_hr, self.sky_patch_embed, timefeats=skimg_timefeats
+            )
+            sky_patch_tokens = self.sky_alt_attn(sky_patch_tokens)
+            sky_compressed = self.sky_two_stage_compressor(sky_patch_tokens) + self.sky_mod_embed
+
+        hist_mem_compressed = torch.cat([KV_hist_mem_compressed, sat_compressed, sky_compressed], dim=1)
         forecast_pv_features = self.cross_attention_pv(query=forecast_query, key=hist_mem_compressed, value=hist_mem_compressed)
 
         # Inverter features (embeddings)
