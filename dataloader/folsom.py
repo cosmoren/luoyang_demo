@@ -16,19 +16,17 @@ Training usage (same two-step pattern as ``dataloader.luoyang``):
 **Batched tensor keys** (after ``collate_folsom_irradiance``; shapes use ``T_in`` = ``irr_input_len``,
 ``T_out`` = ``irr_output_len``, ``T_sky`` = ``skyimg_window_size``, ``C_nwp`` = NWP feature count + 1 mask channel):
 
-- ``ghi``, ``dni``, ``dhi``: ``[B, T_in]``
-- ``input_mask``: ``[B, 1, T_in]`` (valid input timesteps; leading ``1`` matches Luoyang-style mask layout)
-- ``irr_timefeats``: ``[B, T_in, 9]`` (solar + delta-time encoding on input window)
+- ``dev_idx``: ``[B]`` (constant 0 for single-station Folsom)
+- ``pv``: ``[B, 1, T_in]`` (mapped from input GHI)
+- ``pv_mask``: ``[B, 1, T_in]`` (finite/valid input GHI timesteps)
+- ``pv_timefeats``: ``[B, T_in, 9]`` (solar + delta-time encoding on input window)
 - ``forecast_timefeats``: ``[B, T_out, 9]`` (same on forecast timesteps)
-- ``target_ghi``, ``target_dni``, ``target_dhi``: ``[B, T_out]``
+- ``target_pv``: ``[B, T_out]`` (mapped from target GHI)
 - ``target_mask``: ``[B, T_out]``
+- ``sat_tensor``, ``sat_timefeats``: ``None`` (kept for Luoyang contract parity)
 - ``skimg_tensor``: ``[B, T_sky, 3, H, W]`` with ``H=W=skyimg_spatial_size``
 - ``skimg_timefeats``: ``[B, T_sky, feat_dim]``
 - ``nwp_tensor``: ``[B, T_out, C_nwp]`` (zeros + invalid mask if NWP file missing)
-
-**Not stacked by collate** (debug / metadata; lists length ``B`` of per-sample lists):
-
-- ``skimg_timestamps``, ``input_timestamps_utc``, ``forecast_timestamps_utc``
 
 Optional keys ``skimg_tensor``, ``skimg_timefeats``, ``nwp_tensor`` may be stacked as ``None`` if a future
 sample path omits them — same guard pattern as :func:`dataloader.luoyang.collate_batched`.
@@ -61,18 +59,17 @@ if str(_PROJECT_ROOT) not in sys.path:
 from modules.solar_encoder import compute_solar_features, delta_time_encoder, solar_features_encoder
 from training.training_conf import get_training_paths_from_conf
 
-# Keys collate stacks with batch dim B first (single source of truth for trainers).
+# Keys collate stacks with batch dim B first (Luoyang-compatible contract).
 FOLSOM_GHI_DNI_DHI_KEYS: tuple[str, ...] = (
-    "ghi",
-    "dni",
-    "dhi",
-    "input_mask",
-    "irr_timefeats",
+    "dev_idx",
+    "pv",
+    "pv_mask",
+    "pv_timefeats",
     "forecast_timefeats",
-    "target_ghi",
-    "target_dni",
-    "target_dhi",
+    "target_pv",
     "target_mask",
+    "sat_tensor",
+    "sat_timefeats",
     "skimg_tensor",
     "skimg_timefeats",
     "nwp_tensor",
@@ -677,24 +674,21 @@ class FolsomIrradianceDataset(Dataset):
             if name not in sub_x.columns:
                 raise KeyError(f"missing column {name!r}")
 
+        # Luoyang-compatible model contract uses one signal (`pv`) + masks.
+        # For Folsom we map that signal to GHI only.
         gx = pd.to_numeric(sub_x[self._ghi_dni_dhi_cols[0]], errors="coerce")
-        dx = pd.to_numeric(sub_x[self._ghi_dni_dhi_cols[1]], errors="coerce")
-        hx = pd.to_numeric(sub_x[self._ghi_dni_dhi_cols[2]], errors="coerce")
-        x_stack = np.stack([gx.to_numpy(), dx.to_numpy(), hx.to_numpy()], axis=0).astype(np.float32)
-        x_stack = np.nan_to_num(x_stack, nan=0.0, posinf=0.0, neginf=0.0)
-        valid_in = np.isfinite(np.stack([gx.to_numpy(), dx.to_numpy(), hx.to_numpy()], axis=0)).all(axis=0)
-        input_mask = torch.from_numpy(valid_in.astype(np.float32)).unsqueeze(0)
+        ghi_in_raw = gx.to_numpy(dtype=np.float32)
+        valid_in = np.isfinite(ghi_in_raw)
+        ghi_in = np.nan_to_num(ghi_in_raw, nan=0.0, posinf=0.0, neginf=0.0)
+        pv = torch.from_numpy(ghi_in).unsqueeze(0)
+        pv_mask = torch.from_numpy(valid_in.astype(np.float32)).unsqueeze(0)
 
         gy = pd.to_numeric(sub_y[self._ghi_dni_dhi_cols[0]], errors="coerce")
-        dy = pd.to_numeric(sub_y[self._ghi_dni_dhi_cols[1]], errors="coerce")
-        hy = pd.to_numeric(sub_y[self._ghi_dni_dhi_cols[2]], errors="coerce")
-        y_raw = np.stack([gy.to_numpy(), dy.to_numpy(), hy.to_numpy()], axis=0).astype(np.float32)
-        valid_out = np.isfinite(y_raw).all(axis=0)
+        ghi_out_raw = gy.to_numpy(dtype=np.float32)
+        valid_out = np.isfinite(ghi_out_raw)
+        ghi_out = np.nan_to_num(ghi_out_raw, nan=0.0, posinf=0.0, neginf=0.0)
+        target_pv = torch.from_numpy(ghi_out)
         target_mask = torch.from_numpy(valid_out.astype(np.float32))
-        y_stack = np.nan_to_num(y_raw, nan=0.0, posinf=0.0, neginf=0.0)
-
-        ghi, dni, dhi = x_stack[0], x_stack[1], x_stack[2]
-        tg, td, th = y_stack[0], y_stack[1], y_stack[2]
 
         x_times = pd.to_datetime(sub_x[self._time_col], errors="coerce")
         if bool(x_times.isna().any()):
@@ -710,7 +704,7 @@ class FolsomIrradianceDataset(Dataset):
         irr_solar = compute_solar_features(timestamps, self.latitude, self.longitude)
         irr_tf = solar_features_encoder(irr_solar)
         irr_dtf = delta_time_encoder(timestamps, time0)
-        irr_timefeats = torch.cat([irr_tf, irr_dtf.unsqueeze(1)], dim=1)
+        pv_timefeats = torch.cat([irr_tf, irr_dtf.unsqueeze(1)], dim=1)
 
         forecast_solar = compute_solar_features(forecast_timestamps, self.latitude, self.longitude)
         f_tf = solar_features_encoder(forecast_solar)
@@ -726,31 +720,19 @@ class FolsomIrradianceDataset(Dataset):
         skimg_dtf = delta_time_encoder(skimg_timestamps, time0)
         skimg_timefeats = torch.cat([skimg_tf, skimg_dtf.unsqueeze(1)], dim=1)
         skimg_tensor = self._stack_sky_frames(skimg_paths)
-        skimg_timestamps = [
-            (None if p is None else pd.Timestamp(t).strftime("%Y%m%d%H%M%S"))
-            for t, p in zip(skimg_timestamps, skimg_paths)
-        ]
-
-        input_timestamps_utc = [str(pd.Timestamp(t)) for t in timestamps]
-        forecast_timestamps_utc = [str(pd.Timestamp(t)) for t in forecast_timestamps]
-
         return {
-            "ghi": torch.from_numpy(ghi),
-            "dni": torch.from_numpy(dni),
-            "dhi": torch.from_numpy(dhi),
-            "input_mask": input_mask,
-            "irr_timefeats": irr_timefeats,
+            "dev_idx": torch.tensor(0, dtype=torch.long),
+            "pv": pv,
+            "pv_mask": pv_mask,
+            "pv_timefeats": pv_timefeats,
             "forecast_timefeats": forecast_timefeats,
-            "target_ghi": torch.from_numpy(tg),
-            "target_dni": torch.from_numpy(td),
-            "target_dhi": torch.from_numpy(th),
+            "sat_tensor": None,
+            "sat_timefeats": None,
+            "target_pv": target_pv,
             "target_mask": target_mask,
             "skimg_tensor": skimg_tensor,
             "skimg_timefeats": skimg_timefeats,
-            "skimg_timestamps": skimg_timestamps,
             "nwp_tensor": nwp_tensor,
-            "input_timestamps_utc": input_timestamps_utc,
-            "forecast_timestamps_utc": forecast_timestamps_utc,
         }
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
@@ -771,18 +753,16 @@ def collate_folsom_irradiance(batch: list[dict]) -> dict:
         return torch.stack([s[key] for s in batch])
 
     out: dict[str, Any] = {
-        "ghi": _stack("ghi"),
-        "dni": _stack("dni"),
-        "dhi": _stack("dhi"),
-        "input_mask": _stack("input_mask"),
-        "irr_timefeats": _stack("irr_timefeats"),
+        "dev_idx": _stack("dev_idx"),
+        "pv": _stack("pv"),
+        "pv_mask": _stack("pv_mask"),
+        "pv_timefeats": _stack("pv_timefeats"),
         "forecast_timefeats": _stack("forecast_timefeats"),
-        "target_ghi": _stack("target_ghi"),
-        "target_dni": _stack("target_dni"),
-        "target_dhi": _stack("target_dhi"),
+        "nwp_tensor": _stack("nwp_tensor"),
+        "target_pv": _stack("target_pv"),
         "target_mask": _stack("target_mask"),
     }
-    for key in ("skimg_tensor", "skimg_timefeats", "nwp_tensor"):
+    for key in ("sat_tensor", "sat_timefeats", "skimg_tensor", "skimg_timefeats"):
         vals = [s[key] for s in batch]
         if vals[0] is None:
             if not all(v is None for v in vals):
@@ -790,7 +770,6 @@ def collate_folsom_irradiance(batch: list[dict]) -> dict:
             out[key] = None
         else:
             out[key] = torch.stack(vals)
-    out["skimg_timestamps"] = [b["skimg_timestamps"] for b in batch]
     return out
 
 
@@ -883,8 +862,6 @@ def _smoke_section(title: str, lines: list[str]) -> None:
 def _smoke_irradiance_lines(
     times: list[str],
     g: torch.Tensor,
-    dn: torch.Tensor,
-    dh: torch.Tensor,
 ) -> list[str]:
     n = int(g.shape[0])
     lines: list[str] = [f"size (per series, num steps): ({n},)"]
@@ -893,12 +870,12 @@ def _smoke_irradiance_lines(
         return lines
     for i in range(min(2, n)):
         lines.append(
-            f"  first[{i}]  t={times[i]}  ghi={float(g[i]):.3f}  dni={float(dn[i]):.3f}  dhi={float(dh[i]):.3f}"
+            f"  first[{i}]  t={times[i]}  ghi={float(g[i]):.3f}"
         )
     if n > 2:
         for i in (n - 2, n - 1):
             lines.append(
-                f"  last[{i}]  t={times[i]}  ghi={float(g[i]):.3f}  dni={float(dn[i]):.3f}  dhi={float(dh[i]):.3f}"
+                f"  last[{i}]  t={times[i]}  ghi={float(g[i]):.3f}"
             )
     return lines
 
@@ -1060,15 +1037,20 @@ def run_smoke_cli(argv: list[str] | None = None) -> int:
     sky = ds.sky_inspect(anchor0)
     sample = ds._build_tensors(anchor0)
 
-    tin: list[str] = sample["input_timestamps_utc"]
-    tout: list[str] = sample["forecast_timestamps_utc"]
-    g, dn, dh = sample["ghi"], sample["dni"], sample["dhi"]
-    tg, tdn, tdh = sample["target_ghi"], sample["target_dni"], sample["target_dhi"]
+    t_end = sky["last_input_time_utc_naive"]
+    sk_times, sk_paths = ds._history_sky_frame_records(t_end)
+    tin: list[str] = [f"step-{i}" for i in range(int(sample["pv"].shape[-1]))]
+    tout: list[str] = [f"step+{i + 1}" for i in range(int(sample["target_pv"].shape[0]))]
+    g = sample["pv"][0]
+    tg = sample["target_pv"]
     sk = sample["skimg_tensor"]
-    sk_ts: list = sample["skimg_timestamps"]
+    sk_ts = [
+        (None if p is None else pd.Timestamp(t).strftime("%Y%m%d%H%M%S"))
+        for t, p in zip(sk_times, sk_paths)
+    ]
     nwp = sample["nwp_tensor"]
 
-    im = sample["input_mask"]
+    im = sample["pv_mask"]
     inv = float(im.sum())
     im_tot = int(im.numel())
     tm = sample["target_mask"]
@@ -1086,13 +1068,13 @@ def run_smoke_cli(argv: list[str] | None = None) -> int:
         f"jpeg_files_found (on disk vs window slots): {sky['n_files_found']}/{sky['n_frames']}",
     ])
 
-    in_lines = _smoke_irradiance_lines(tin, g, dn, dh)
+    in_lines = _smoke_irradiance_lines(tin, g)
     in_lines.append(f"input_mask valid values: {inv:.0f} / {im_tot}")
-    _smoke_section("IRRADIANCE INPUT (GHI, DNI, DHI)", in_lines)
+    _smoke_section("IRRADIANCE INPUT (GHI)", in_lines)
 
-    out_lines = _smoke_irradiance_lines(tout, tg, tdn, tdh)
+    out_lines = _smoke_irradiance_lines(tout, tg)
     out_lines.append(f"target_mask valid values: {tnv:.0f} / {tm_tot}")
-    _smoke_section("IRRADIANCE OUTPUT / TARGETS (GHI, DNI, DHI)", out_lines)
+    _smoke_section("IRRADIANCE OUTPUT / TARGETS (GHI)", out_lines)
 
     sky_lines = [
         f"skimg_tensor shape: {tuple(sk.shape)}  (N, C, H, W)",
@@ -1119,16 +1101,23 @@ def run_smoke_cli(argv: list[str] | None = None) -> int:
         f"batch_size={bs}  (train split randomizes anchor each __getitem__; shapes only here)",
     ]
     for k in (
-        "ghi",
-        "irr_timefeats",
+        "dev_idx",
+        "pv",
+        "pv_mask",
+        "pv_timefeats",
         "forecast_timefeats",
-        "target_ghi",
+        "target_pv",
+        "sat_tensor",
+        "sat_timefeats",
         "skimg_tensor",
         "skimg_timefeats",
         "nwp_tensor",
     ):
         v = batch[k]
-        batch_lines.append(f"{k}: shape={tuple(v.shape)} dtype={v.dtype}")
+        if v is None:
+            batch_lines.append(f"{k}: None")
+        else:
+            batch_lines.append(f"{k}: shape={tuple(v.shape)} dtype={v.dtype}")
     _smoke_section("DATALOADER (first batch)", batch_lines)
 
     print("smoke OK")
