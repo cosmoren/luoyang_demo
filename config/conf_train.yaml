@@ -6,13 +6,13 @@ site:
   longitude: 112.28440
 
 paths:
-  data_dir: "/work/datasets/luoyang_dataset"
+  data_dir: "/work/datasets/luoyang_SPMF"
   # config_dir: config
   pv_device_path: dataloader/XINSHENG_power_total_devices_type1.xlsx
   # Training / eval data (single folder each under data_dir; train and test use the same roots)
-  sky_image_path: asi_16613
-  pv_path: luoyang_data_626
-  sat_path: himawari_cropped
+  sky_image_path: sky_asi
+  pv_path: pv
+  sat_path: sat_himawari
   nwp_path: NWP
 
 # Hyperparameters for training/train.py (CLI flags override these when passed)

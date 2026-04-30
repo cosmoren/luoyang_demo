@@ -3,7 +3,6 @@ import sys
 from datetime import timedelta
 from pathlib import Path
 from threading import Lock
-from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -195,11 +194,12 @@ class PVDataset(Dataset):
     step size is ``skyimg_time_resolution_min`` (independent of PV CSV spacing).
     Missing files → black ``(3, H, W)`` tensors resized to ``training.skyimg_spatial_size``.
 
-    Himawari NPY (``satimg``): names ``NC_H09_YYYYMMDD_HHMM_L2CLP010_FLDK.02401_02401.npy`` with
-    ``YYYYMMDD_HHMM`` in UTC; ``collectTime`` is interpreted as Asia/Shanghai local, converted to UTC,
-    then floored to 10-minute boundaries for the key timestep. History/forecast windows step in UTC
-    (sizes from ``conf.yaml`` ``training``). Arrays are float32 HWC per ``training.satimg_npy_shape_hwc``;
-    missing files → zeros.
+    All timestamps in this dataloader are treated as **UTC**: PV CSV ``collectTime`` rows, sky JPEG
+    filenames (``YYYYMMDDHHMMSS_12.jpg``), and Himawari NPY filenames
+    (``NC_H09_YYYYMMDD_HHMM_L2CLP010_FLDK.02401_02401.npy``) all use UTC wall time. ``collectTime``
+    is floored to 10-minute boundaries for the satellite key timestep. History/forecast windows step
+    in UTC (sizes from ``conf.yaml`` ``training``). Sat arrays are float32 HWC per
+    ``training.satimg_npy_shape_hwc``; missing files → zeros.
 
     If ``conf paths.nwp_path`` is set (relative to ``paths.data_dir`` unless absolute) and ``solar.csv`` /
     ``wind.csv`` exist and load successfully, they populate ``nwp_solar_df`` and ``nwp_wind_df``; otherwise
@@ -623,31 +623,30 @@ class PVDataset(Dataset):
         return int(best_j)
 
     @staticmethod
-    def _to_utc_timestamps(values, *, naive_tz: str) -> list[pd.Timestamp]:
+    def _to_utc_timestamps(values) -> list[pd.Timestamp]:
         """
         Normalize a sequence to UTC-aware ``pd.Timestamp`` (same format for forecast / sat / sky).
 
-        - If an element is naive, it is interpreted as wall time in ``naive_tz`` (``UTC`` or ``Asia/Shanghai``).
-        - If timezone-aware, it is converted to UTC.
+        Naive inputs are interpreted as UTC; tz-aware inputs are converted to UTC.
         """
         out: list[pd.Timestamp] = []
         for v in values:
             t = pd.Timestamp(v)
             if t.tz is None:
-                t = t.tz_localize(naive_tz, ambiguous=True)
+                t = t.tz_localize("UTC")
             out.append(t.tz_convert("UTC"))
         return out
 
     @staticmethod
-    def _sky_collect_ts_local(ts_raw) -> pd.Timestamp:
-        """Local-time timestamp for sky filenames; seconds floored to 0."""
+    def _sky_filename_ts(ts_raw) -> pd.Timestamp:
+        """Naive UTC timestamp for sky filenames; seconds floored to 0."""
         ts = pd.Timestamp(ts_raw)
         if ts.tzinfo is not None:
-            ts = ts.tz_convert(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+            ts = ts.tz_convert("UTC").tz_localize(None)
         return ts.replace(second=0, microsecond=0, nanosecond=0)
 
     def _sky_jpg_path(self, ts: pd.Timestamp) -> Path:
-        stem = ts.strftime("%Y%m%d%H%M%S") + "_12"
+        stem = ts.strftime("%Y%m%d%H%M%S")
         return self._skyimg_dir / f"{stem}.jpg"
 
     def _black_sky_tensor(self) -> torch.Tensor:
@@ -680,31 +679,22 @@ class PVDataset(Dataset):
         return self._shared_black_sky
 
     def _history_sky_frame_times(self, t_end: pd.Timestamp) -> list[pd.Timestamp]:
-        t_end = self._sky_collect_ts_local(t_end)
+        t_end = self._sky_filename_ts(t_end)
         w = self.skyimg_window_size
         return [
             t_end - timedelta(minutes=(w - 1 - i) * self._skyimg_dt_min) for i in range(w)
         ]
 
     def _forecast_sky_frame_times(self, t_start: pd.Timestamp) -> list[pd.Timestamp]:
-        t_start = self._sky_collect_ts_local(t_start)
+        t_start = self._sky_filename_ts(t_start)
         w = self.skyimg_window_size
         return [t_start + timedelta(minutes=i * self._skyimg_dt_min) for i in range(w)]
-
-    def _utc_to_sky_local_filename_ts(self, ts_utc: pd.Timestamp) -> pd.Timestamp:
-        """UTC instant → Asia/Shanghai wall time (second floored) for sky JPEG naming."""
-        return (
-            pd.Timestamp(ts_utc)
-            .tz_convert("Asia/Shanghai")
-            .replace(tzinfo=None)
-            .replace(second=0, microsecond=0, nanosecond=0)
-        )
 
     def _stack_sky_frames(self, frame_times_utc: list[pd.Timestamp]) -> torch.Tensor:
         """``frame_times_utc``: UTC-aware timestamps (same convention as ``forecast_timestamps_utc``)."""
         return torch.stack(
             [
-                self._load_sky_tensor(self._sky_jpg_path(self._utc_to_sky_local_filename_ts(t)))
+                self._load_sky_tensor(self._sky_jpg_path(self._sky_filename_ts(t)))
                 for t in frame_times_utc
             ],
             dim=0,
@@ -717,13 +707,11 @@ class PVDataset(Dataset):
         return u.replace(minute=m, second=0, microsecond=0, nanosecond=0)
 
     def _satimg_utc_key_time(self, ts_raw) -> pd.Timestamp:
-        """UTC naive timestamp floored to 10 min; derived from local collectTime (Asia/Shanghai)."""
-        local_naive = self._sky_collect_ts_local(ts_raw)
-        # ambiguous=True: older pandas rejects ambiguous="infer" on Timestamp.tz_localize;
-        # Asia/Shanghai has no DST so wall times are not ambiguous.
-        loc = local_naive.tz_localize("Asia/Shanghai", ambiguous=True)
-        u = loc.tz_convert("UTC").tz_localize(None)
-        return self._satimg_floor_utc_10min(u)
+        """UTC naive timestamp floored to 10 min; ``ts_raw`` is already UTC (naive or aware)."""
+        ts = pd.Timestamp(ts_raw)
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert("UTC").tz_localize(None)
+        return self._satimg_floor_utc_10min(ts)
 
     def _satimg_npy_path(self, t_utc_naive: pd.Timestamp) -> Path:
         u = self._satimg_floor_utc_10min(t_utc_naive)
@@ -811,7 +799,7 @@ class PVDataset(Dataset):
         sub_y = df.iloc[y_idx_1d]
 
         # Same as forecast_timestamps_utc / sat_timestamps_utc / skimg_timestamps_utc: UTC-aware pd.Timestamp
-        timestamps = self._to_utc_timestamps(list(sub_x["collectTime"]), naive_tz="Asia/Shanghai")
+        timestamps = self._to_utc_timestamps(list(sub_x["collectTime"]))
         time0_utc = timestamps[-1]
 
         inv_x = pd.to_numeric(sub_x[INVERTER_STATE_COL], errors="coerce").fillna(0).astype(np.int32).values
@@ -847,10 +835,10 @@ class PVDataset(Dataset):
 
         t_x_end = sub_x["collectTime"].iloc[-1]
         sat_timestamps_utc = self._to_utc_timestamps(
-            self._history_satimg_frame_utc_times(t_x_end), naive_tz="UTC"
+            self._history_satimg_frame_utc_times(t_x_end)
         )
         skimg_timestamps_utc = self._to_utc_timestamps(
-            self._history_sky_frame_times(t_x_end), naive_tz="Asia/Shanghai"
+            self._history_sky_frame_times(t_x_end)
         )
         # timestamps, forecast_timestamps_utc, sat_timestamps_utc, skimg_timestamps_utc: list[pd.Timestamp] tz=UTC
         sat_solar_features = compute_solar_features(sat_timestamps_utc, self.latitude, self.longitude)
