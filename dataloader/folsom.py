@@ -2,7 +2,8 @@
 Folsom dataset: one CSV with time + GHI, DNI, DHI (and optional header aliases).
 
 Designed for multi-million-row files: never loads the full table into RAM.
-Each sample reads one contiguous row block (length set by ``irr_input_len`` / ``irr_output_len``).
+Each sample reads one contiguous row block (length set by ``pv_input_len`` / ``pv_output_len`` —
+:class:`FolsomIrradianceDataset` mirrors :class:`dataloader.luoyang_mem.PVDataset`'s constructor).
 
 Horizon math matches Luoyang anchor conventions (anchor = last input row index).
 
@@ -13,8 +14,8 @@ Training usage (same two-step pattern as ``dataloader.luoyang``):
 2. **Batch** — :func:`collate_folsom_irradiance` stacks a ``list`` of those dicts; every key in
    :data:`FOLSOM_BATCH_TENSOR_KEYS` gains a leading batch dimension ``B``.
 
-**Batched tensor keys** (after ``collate_folsom_irradiance``; shapes use ``T_in`` = ``irr_input_len``,
-``T_out`` = ``irr_output_len``, ``T_sky`` = ``skyimg_window_size``, ``C_nwp`` = NWP feature count + 1 mask channel):
+**Batched tensor keys** (after ``collate_folsom_irradiance``; shapes use ``T_in`` = ``pv_input_len``,
+``T_out`` = ``pv_output_len``, ``T_sky`` = ``skyimg_window_size``, ``C_nwp`` = NWP feature count + 1 mask channel):
 
 - ``ghi``, ``dni``, ``dhi``: ``[B, T_in]``
 - ``input_mask``: ``[B, 1, T_in]`` (valid input timesteps; leading ``1`` matches Luoyang-style mask layout)
@@ -36,8 +37,6 @@ sample path omits them — same guard pattern as :func:`dataloader.luoyang.colla
 JPEG stems ``YYYYMMDDHHMMSS.jpg`` use **UTC**; naive CSV times are read as **UTC**.
 """
 
-from __future__ import annotations
-
 import argparse
 import bisect
 import csv
@@ -45,7 +44,7 @@ import os
 import sys
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -58,8 +57,20 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from dataloader.luoyang_mem import list_csv_files
 from modules.solar_encoder import compute_solar_features, delta_time_encoder, solar_features_encoder
-from training.training_conf import get_training_paths_from_conf
+from training.training_conf import (
+    get_training_hparams_from_conf,
+    get_training_paths_from_conf,
+    load_config_path,
+)
+
+# All site / NWP / training-section reads inside this module go through ``conf_folsom.yaml``.
+# The schema is the same PVDataset / Luoyang ``pv_*`` schema as ``conf_train.yaml`` (no ``irr_*`` /
+# no ``dataset_profile: folsom``), so :class:`FolsomIrradianceDataset` is a drop-in replacement
+# for :class:`dataloader.luoyang_mem.PVDataset` in ``training/train_vit_test.py`` when invoked
+# with ``--config conf_folsom.yaml``.
+_FOLSOM_CONF_PATH = _PROJECT_ROOT / "config" / "conf_folsom.yaml"
 
 # Keys collate stacks with batch dim B first (single source of truth for trainers).
 FOLSOM_GHI_DNI_DHI_KEYS: tuple[str, ...] = (
@@ -94,6 +105,19 @@ _FOLSOM_NWP_FEATURE_COLS = (
     "rel_humidity",
 )
 _SKY_INDEX_CACHE: dict[str, tuple[list[pd.Timestamp], list[Path], list[int]]] = {}
+
+
+def _load_training_defaults() -> dict:
+    return get_training_hparams_from_conf(load_config_path(_FOLSOM_CONF_PATH))
+
+
+_FOLSOM_TRAINING_HPARAM_DEFAULTS = _load_training_defaults()
+_DEFAULT_FOLSOM_TRAIN_EPOCH_LEN = 50_000
+
+# Train mode: a Y window is "valid" if any of its rows has finite GHI strictly above this
+# threshold (W/m^2). Mirrors PVDataset's "any inverter_state == VALID_STATE" filter so we
+# avoid sampling all-night windows where target_pv is uniformly 0.
+_FOLSOM_TRAIN_GHI_DAYTIME_THRESHOLD = 10.0
 
 
 def _folsom_progress(msg: str) -> None:
@@ -226,8 +250,13 @@ def _pick_time_and_ghi_dni_dhi_columns(header_cells: list[str]) -> tuple[str, li
 
 
 def load_folsom_conf(path: Path | str | None = None) -> dict:
-    """Load ``config/conf_folsom.yaml`` (or a custom path)."""
-    p = Path(path) if path is not None else _PROJECT_ROOT / "config" / "conf_folsom.yaml"
+    """Load ``config/conf_folsom.yaml`` (or a custom path).
+
+    The new ``conf_folsom.yaml`` uses the same PVDataset / Luoyang ``pv_*`` training schema as
+    ``conf_train.yaml`` (no ``irr_*`` / no ``dataset_profile: folsom``), so the same trainer
+    (``training/train_vit_test.py``) can switch datasets via ``--config``.
+    """
+    p = Path(path) if path is not None else _FOLSOM_CONF_PATH
     with p.open() as f:
         return yaml.safe_load(f)
 
@@ -298,62 +327,145 @@ def _load_folsom_nwp_merged_csv(path: Path | str) -> pd.DataFrame:
 
 class FolsomIrradianceDataset(Dataset):
     """
-    Single CSV with time + GHI, DNI, DHI columns (names detected from header).
+    Folsom irradiance dataset with the **same** ``__init__`` signature as
+    :class:`dataloader.luoyang_mem.PVDataset` (``pv_dir``/``skyimg_dir``/``satimg_dir`` plus the
+    Luoyang-style ``pv_*`` / ``skyimg_*`` / ``satimg_*`` keyword args). Folsom has no satellite
+    data, so the ``satimg_*`` arguments are accepted for API parity but unused — ``sat_tensor``
+    and ``sat_timefeats`` in returned samples are ``None``.
 
-    - **Train** (``split="train"``): ``__len__`` = ``train_epoch_len``; each item samples a
-      random valid train anchor (same CSV row can repeat across epochs).
-    - **Test** (``split="test"``): ``__len__`` = number of strided test anchors; deterministic.
+    ``pv_dir`` must contain exactly one irradiance CSV (time + GHI/DNI/DHI columns; column names
+    auto-detected from the header). Latitude/longitude and the optional NWP merged CSV are read
+    internally from ``config/conf_folsom.yaml`` (mirroring how PVDataset reads from ``CONF_PATH``).
 
-    Parameters mirror ``conf_folsom.yaml`` / ``training`` plus ``site`` (lat/lon) and ``paths.skyimg_dir``
-    from :func:`training.training_conf.get_training_paths_from_conf`. All times are **UTC**.
+    Splits: rows are partitioned in fixed proportions ``60% train / 10% val / 30% test`` (same as
+    PVDataset). ``pv_train_time_fraction`` is kept for call-site parity but **not** used. Train
+    samples a random valid anchor per ``__getitem__`` (epoch length defaults to
+    ``_DEFAULT_FOLSOM_TRAIN_EPOCH_LEN``; settable via ``self._train_epoch_len``); val/test use the
+    respective ``*_anchor_stride_min`` strides over their bands.
 
-    ``skyimg_window_size`` is the count of sky frames **ending at the last input timestep** (anchor),
-    spaced by ``skyimg_time_resolution_min`` (oldest first in ``skimg_tensor``).
-
-    For the training batch contract (stacked keys, shapes), see :data:`FOLSOM_BATCH_TENSOR_KEYS` and
-    :func:`collate_folsom_irradiance`.
+    ``skyimg_window_size`` is the count of sky JPEGs ending at the last input timestep (anchor),
+    spaced by ``skyimg_time_resolution_min`` (oldest first in ``skimg_tensor``). All timestamps
+    are UTC.
     """
 
     def __init__(
         self,
-        csv_path: Path | str,
+        pv_dir: str,
+        skyimg_dir: str,
+        satimg_dir: str,
         *,
-        split: Literal["train", "test"],
-        csv_interval_min: int,
-        irr_input_interval_min: int,
-        irr_input_len: int,
-        irr_output_interval_min: int,
-        irr_output_len: int,
-        irr_train_time_fraction: float,
-        test_anchor_stride_min: int,
-        train_epoch_len: int,
-        skyimg_dir: Path | str,
-        skyimg_window_size: int,
-        skyimg_time_resolution_min: int,
-        skyimg_spatial_size: int,
-        nwp_merged_csv_path: Path | str | None = None,
-        latitude: float,
-        longitude: float,
+        split: str = "train",
+        csv_interval_min: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["csv_interval_min"],
+        pv_input_interval_min: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["pv_input_interval_min"],
+        pv_input_len: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["pv_input_len"],
+        pv_output_interval_min: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["pv_output_interval_min"],
+        pv_output_len: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["pv_output_len"],
+        pv_train_time_fraction: float = _FOLSOM_TRAINING_HPARAM_DEFAULTS["pv_train_time_fraction"],
+        test_anchor_stride_min: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["test_anchor_stride_min"],
+        val_anchor_stride_min: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["val_anchor_stride_min"],
+        test_collect_time_match_tolerance_min: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS[
+            "test_collect_time_match_tolerance_min"
+        ],
+        skyimg_window_size: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["skyimg_window_size"],
+        skyimg_time_resolution_min: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["skyimg_time_resolution_min"],
+        skyimg_spatial_size: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["skyimg_spatial_size"],
+        satimg_window_size: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["satimg_window_size"],
+        satimg_time_resolution_min: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["satimg_time_resolution_min"],
+        satimg_npy_shape_hwc: tuple[int, int, int] = _FOLSOM_TRAINING_HPARAM_DEFAULTS["satimg_npy_shape_hwc"],
     ):
-        if split not in ("train", "test"):
-            raise ValueError("split must be 'train' or 'test'")
+        if split not in ("train", "val", "test"):
+            raise ValueError("split must be 'train', 'val', or 'test'")
         self.split = split
-        self._csv_path = Path(csv_path).resolve()
-        if not self._csv_path.is_file():
-            raise FileNotFoundError(str(self._csv_path))
-        _folsom_progress(f"dataset split={split!r}: preparing {self._csv_path.name} ...")
 
-        self._skyimg_dir = Path(skyimg_dir).resolve()
         if skyimg_window_size < 1:
             raise ValueError("skyimg_window_size must be >= 1")
         self.skyimg_window_size = int(skyimg_window_size)
-        self._skyimg_dt_min = int(skyimg_time_resolution_min)
-        if self._skyimg_dt_min <= 0:
+        if satimg_window_size < 1:
+            raise ValueError("satimg_window_size must be >= 1")
+        self.satimg_window_size = int(satimg_window_size)
+
+        if csv_interval_min <= 0 or pv_input_interval_min % csv_interval_min:
+            raise ValueError("pv_input_interval_min must be a positive multiple of csv_interval_min")
+        if pv_output_interval_min % csv_interval_min:
+            raise ValueError("pv_output_interval_min must be a positive multiple of csv_interval_min")
+        self._sx = pv_input_interval_min // csv_interval_min
+        self._sy = pv_output_interval_min // csv_interval_min
+        self.pv_input_len = int(pv_input_len)
+        self.pv_output_len = int(pv_output_len)
+        self.pv_output_interval_min = int(pv_output_interval_min)
+        self._lx = self.pv_input_len
+        self._ly = self.pv_output_len
+
+        tf = float(pv_train_time_fraction)
+        if not (0.0 < tf < 1.0):
+            raise ValueError("pv_train_time_fraction must be strictly between 0 and 1")
+        self._pv_train_time_fraction = tf
+
+        if skyimg_time_resolution_min <= 0:
             raise ValueError("skyimg_time_resolution_min must be positive")
-        ss = int(skyimg_spatial_size)
-        if ss < 1:
+        self._skyimg_dt_min = int(skyimg_time_resolution_min)
+        self._skyimg_dir = Path(skyimg_dir).resolve()
+        if skyimg_spatial_size < 1:
             raise ValueError("skyimg_spatial_size must be >= 1")
-        self._skyimg_spatial_size = ss
+        self._skyimg_spatial_size = int(skyimg_spatial_size)
+
+        # Sat config: accepted for API parity with PVDataset; Folsom has no satellite data.
+        if len(satimg_npy_shape_hwc) != 3 or any(x < 1 for x in satimg_npy_shape_hwc):
+            raise ValueError("satimg_npy_shape_hwc must be three positive ints (H, W, C)")
+        self._satimg_npy_shape_hwc = tuple(int(x) for x in satimg_npy_shape_hwc)
+        if satimg_time_resolution_min <= 0:
+            raise ValueError("satimg_time_resolution_min must be positive")
+        self._satimg_dt_min = int(satimg_time_resolution_min)
+        self._satimg_dir = Path(satimg_dir).resolve() if str(satimg_dir) else Path(".")
+
+        if test_anchor_stride_min <= 0 or test_anchor_stride_min % csv_interval_min:
+            raise ValueError(
+                "test_anchor_stride_min must be a positive multiple of csv_interval_min "
+                f"(got {test_anchor_stride_min}, csv_interval_min={csv_interval_min})"
+            )
+        self._test_anchor_stride_rows = test_anchor_stride_min // csv_interval_min
+        if val_anchor_stride_min <= 0 or val_anchor_stride_min % csv_interval_min:
+            raise ValueError(
+                "val_anchor_stride_min must be a positive multiple of csv_interval_min "
+                f"(got {val_anchor_stride_min}, csv_interval_min={csv_interval_min})"
+            )
+        self._val_anchor_stride_rows = val_anchor_stride_min // csv_interval_min
+        tol_m = int(test_collect_time_match_tolerance_min)
+        if tol_m < 0:
+            raise ValueError("test_collect_time_match_tolerance_min must be >= 0")
+        self._test_collect_time_match_tolerance_min = tol_m
+        self._test_collect_tolerance_ns = tol_m * 60 * 1_000_000_000
+
+        # Site + NWP from conf_folsom.yaml (mirrors PVDataset's CONF_PATH usage).
+        conf = load_config_path(_FOLSOM_CONF_PATH)
+        site = conf.get("site") or {}
+        self.latitude = float(site.get("latitude"))
+        self.longitude = float(site.get("longitude"))
+        self._nwp_feature_cols = tuple(_FOLSOM_NWP_FEATURE_COLS)
+        paths_cfg = conf.get("paths") or {}
+        nwp_rel = paths_cfg.get("folsom_nwp_merged_csv")
+        self._nwp_merged_df = None
+        if nwp_rel is not None and str(nwp_rel).strip() != "":
+            try:
+                nwp_csv = _resolve_folsom_nwp_csv_path(conf)
+                self._nwp_merged_df = _load_folsom_nwp_merged_csv(nwp_csv)
+            except (FileNotFoundError, KeyError):
+                self._nwp_merged_df = None
+
+        # CSV: glob ``pv_dir`` for *.csv (PVDataset convention); Folsom expects exactly one.
+        self.sample_files = list_csv_files(data_dir=pv_dir)
+        if not self.sample_files:
+            raise FileNotFoundError(f"No CSV files in {pv_dir!r}")
+        if len(self.sample_files) != 1:
+            names = ", ".join(p.name for p in self.sample_files)
+            raise RuntimeError(
+                f"Folsom dataset expects exactly one irradiance CSV under {pv_dir!r}, "
+                f"found {len(self.sample_files)}: {names}"
+            )
+        self._csv_path = self.sample_files[0].resolve()
+        _folsom_progress(f"dataset split={split!r}: preparing {self._csv_path.name} ...")
+
+        # Sky index (cached across instances sharing skyimg_dir).
         cache_key = str(self._skyimg_dir)
         cached = _SKY_INDEX_CACHE.get(cache_key)
         if cached is None:
@@ -366,97 +478,153 @@ class FolsomIrradianceDataset(Dataset):
             _folsom_progress(
                 f"sky index (cached): {len(self._sky_times):,} JPGs under {self._skyimg_dir}"
             )
-        # If consecutive sky frames are farther apart than this, treat older frames as invalid history.
         self._sky_gap_threshold = pd.Timedelta(minutes=5)
-        # Newest sky frame must be within this lag of anchor (last input time); else whole window is black.
         self._sky_anchor_max_lag = pd.Timedelta(minutes=5)
-        self._nwp_feature_cols = tuple(_FOLSOM_NWP_FEATURE_COLS)
-        if nwp_merged_csv_path is None:
-            self._nwp_merged_df = None
-        else:
-            self._nwp_merged_df = _load_folsom_nwp_merged_csv(nwp_merged_csv_path)
-        self.latitude = float(latitude)
-        self.longitude = float(longitude)
-        self.irr_output_interval_min = int(irr_output_interval_min)
 
-        if csv_interval_min <= 0 or irr_input_interval_min % csv_interval_min:
-            raise ValueError("irr_input_interval_min must be a positive multiple of csv_interval_min")
-        if irr_output_interval_min % csv_interval_min:
-            raise ValueError("irr_output_interval_min must be a positive multiple of csv_interval_min")
-        self._sx = irr_input_interval_min // csv_interval_min
-        self._sy = irr_output_interval_min // csv_interval_min
-        self.irr_input_len = int(irr_input_len)
-        self.irr_output_len = int(irr_output_len)
-        self._lx = self.irr_input_len
-        self._ly = self.irr_output_len
-
-        tf = float(irr_train_time_fraction)
-        if not (0.0 < tf < 1.0):
-            raise ValueError("irr_train_time_fraction must be strictly between 0 and 1")
-        self._irr_train_time_fraction = tf
-
-        if test_anchor_stride_min <= 0 or test_anchor_stride_min % csv_interval_min:
-            raise ValueError(
-                "test_anchor_stride_min must be a positive multiple of csv_interval_min "
-                f"(got {test_anchor_stride_min}, csv_interval_min={csv_interval_min})"
-            )
-        self._test_anchor_stride_rows = test_anchor_stride_min // csv_interval_min
-
+        # CSV header & row count.
         header_line = _read_header_line(self._csv_path)
         reader = csv.reader([header_line])
         header_cells = next(reader)
         self._time_col, _order, self._file_columns = _pick_time_and_ghi_dni_dhi_columns(header_cells)
-        self._ghi_dni_dhi_cols = _order[1:]  # file header names for ghi, dni, dhi in that order
-
-        _folsom_progress(f"counting lines in irradiance CSV {self._csv_path.name} (large files can take a bit) ...")
+        self._ghi_dni_dhi_cols = _order[1:]
+        _folsom_progress(
+            f"counting lines in irradiance CSV {self._csv_path.name} (large files can take a bit) ..."
+        )
         total_lines = _count_newlines(self._csv_path)
         _folsom_progress(f"irradiance CSV: {total_lines - 1:,} data rows (+ header)")
         if total_lines < 2:
             raise RuntimeError(f"{self._csv_path.name}: expected header + at least one data row")
         self._n = int(total_lines - 1)
 
+        # Anchor bookkeeping.
+        n = self._n
         lx, ly = self._lx, self._ly
         sx, sy = self._sx, self._sy
         amin = (lx - 1) * sx
         y_last_off = sy * ly
-        amax = self._n - 1 - y_last_off
-        if self._n == 0 or amin > amax:
+        amax = n - 1 - y_last_off
+        if n == 0 or amin > amax:
             raise RuntimeError(
                 f"{self._csv_path.name}: no anchor fits bounds "
-                f"(n={self._n}, need {amin}<=anchor<={amax}); check row count and window lengths"
+                f"(n={n}, need {amin}<=anchor<={amax}); check row count and window lengths"
             )
         self._anchors = np.arange(amin, amax + 1, dtype=np.intp)
         self._x_tail_1d = (-(lx - 1) * sx + np.arange(lx, dtype=np.intp) * sx).astype(np.intp, copy=False)
         self._y_off_1d = (sy + np.arange(ly, dtype=np.intp) * sy).astype(np.intp, copy=False)
 
-        split_idx = int(self._n * self._irr_train_time_fraction)
-        if split_idx <= 0 or split_idx >= self._n:
+        # Fixed 60% / 10% / 30% train/val/test split (matches PVDataset).
+        split_train_end = int(n * 0.6)
+        split_val_end = int(n * 0.7)
+        if not (0 < split_train_end < split_val_end < n):
             raise ValueError(
-                f"irr_train_time_fraction={self._irr_train_time_fraction} gives split_idx={split_idx} for n={self._n}"
+                f"fixed 60%/10%/30% row split invalid for n={n}: "
+                f"split_train_end={split_train_end}, split_val_end={split_val_end}"
             )
         min_row = self._anchors - (lx - 1) * sx
         max_row = self._anchors + ly * sy
-        self._train_anchor_mask = max_row < split_idx
-        self._test_anchor_mask = min_row >= split_idx
+        self._train_anchor_mask = max_row < split_train_end
+        self._val_anchor_mask = (min_row >= split_train_end) & (max_row < split_val_end)
+        self._test_anchor_mask = min_row >= split_val_end
         if self.split == "train" and not bool(self._train_anchor_mask.any()):
-            raise RuntimeError("split=train: no valid train anchors after time split")
+            raise RuntimeError(
+                f"split=train: no anchor fits entirely in the first {split_train_end} rows (60% of n={n}); "
+                "shorten windows or check data length"
+            )
+        if self.split == "val" and not bool(self._val_anchor_mask.any()):
+            raise RuntimeError(
+                f"split=val: no anchor fits entirely in rows [{split_train_end}, {split_val_end}) "
+                f"(10% val band); adjust window lengths or stride"
+            )
         if self.split == "test" and not bool(self._test_anchor_mask.any()):
-            raise RuntimeError("split=test: no valid test anchors after time split")
+            raise RuntimeError(
+                f"split=test: no anchor fits entirely from row {split_val_end} onward (last 30%); "
+                "adjust window lengths"
+            )
 
         train_positions = np.nonzero(self._train_anchor_mask)[0]
         self._train_anchor_positions = train_positions.astype(np.intp, copy=False)
         self._num_train_anchors = int(train_positions.size)
 
+        val_positions = np.nonzero(self._val_anchor_mask)[0]
+        self._val_r_indices = val_positions[::self._val_anchor_stride_rows].astype(np.intp, copy=False)
+        self._num_val_windows = int(self._val_r_indices.size)
+        if self.split == "val" and self._num_val_windows == 0:
+            raise RuntimeError(
+                "split=val: no val anchors after stride subsampling "
+                "(reduce val_anchor_stride_min or widen the val segment)"
+            )
+
         test_positions = np.nonzero(self._test_anchor_mask)[0]
-        stride = self._test_anchor_stride_rows
-        self._test_r_indices = test_positions[::stride].astype(np.intp, copy=False)
+        self._test_r_indices = test_positions[::self._test_anchor_stride_rows].astype(np.intp, copy=False)
         self._num_test_windows = int(self._test_r_indices.size)
         if self.split == "test" and self._num_test_windows == 0:
-            raise RuntimeError("split=test: no test windows after stride; reduce test_anchor_stride_min")
+            raise RuntimeError(
+                "split=test: no test anchors after time split and stride "
+                "(reduce test_anchor_stride_min or widen the test segment)"
+            )
 
-        self._train_epoch_len = max(1, int(train_epoch_len))
+        # Internal: train epoch length (random anchors per epoch). Builders may override.
+        self._train_epoch_len = _DEFAULT_FOLSOM_TRAIN_EPOCH_LEN
         # Contiguous data rows from first X row through last Y row (inclusive).
         self._block_nrows = int((lx - 1) * sx + ly * sy + 1)
+
+        # Train anchor validity filter: keep only anchors whose Y window has at least one
+        # row with finite GHI > _FOLSOM_TRAIN_GHI_DAYTIME_THRESHOLD (avoid all-night windows).
+        # Only computed for split=="train" — val/test use deterministic strided positions.
+        if self.split == "train":
+            self._train_anchor_valid_positions = self._compute_train_anchor_valid_positions()
+        else:
+            self._train_anchor_valid_positions = self._train_anchor_positions
+
+    def _compute_train_anchor_valid_positions(self) -> np.ndarray:
+        """
+        Scan the GHI column once and return the subset of ``self._train_anchor_positions`` whose
+        Y window has any finite ``GHI > _FOLSOM_TRAIN_GHI_DAYTIME_THRESHOLD``.
+
+        Mirrors :class:`dataloader.luoyang_mem.PVDataset`'s train-time filter
+        (``inverter_state == VALID_STATE`` on Y rows) so random anchors don't land on
+        all-night windows where ``target_pv`` is uniformly zero.
+        """
+        ghi_col = self._ghi_dni_dhi_cols[0]
+        _folsom_progress(
+            f"train anchor filter: scanning {ghi_col} column for daytime Y windows ..."
+        )
+        # Read just the GHI column (full file). Use str + to_numeric to tolerate non-numeric tokens.
+        ghi_series = pd.read_csv(
+            self._csv_path,
+            usecols=[ghi_col],
+            engine="c",
+            memory_map=True,
+            dtype={ghi_col: str},
+        )[ghi_col]
+        ghi_full = pd.to_numeric(ghi_series, errors="coerce").to_numpy(dtype=np.float32)
+        if ghi_full.size != self._n:
+            raise RuntimeError(
+                f"{self._csv_path.name}: expected {self._n} GHI rows, got {ghi_full.size}"
+            )
+        # Replace NaN/inf with 0 so the threshold check excludes them.
+        ghi_full = np.where(np.isfinite(ghi_full), ghi_full, 0.0)
+
+        train_anchor_rows = self._anchors[self._train_anchor_positions]  # [N_train]
+        if train_anchor_rows.size == 0:
+            return self._train_anchor_positions
+        # [N_train, ly] absolute Y row indices.
+        y_rows = train_anchor_rows[:, None] + self._y_off_1d[None, :]
+        y_ghi = ghi_full[y_rows]
+        has_daytime = (y_ghi > _FOLSOM_TRAIN_GHI_DAYTIME_THRESHOLD).any(axis=1)
+        kept = self._train_anchor_positions[has_daytime].astype(np.intp, copy=False)
+        n_kept = int(kept.size)
+        n_total = int(train_anchor_rows.size)
+        _folsom_progress(
+            f"train anchor filter: {n_kept:,} / {n_total:,} train anchors kept "
+            f"(GHI > {_FOLSOM_TRAIN_GHI_DAYTIME_THRESHOLD:g} W/m^2 in Y window)"
+        )
+        if n_kept == 0:
+            raise RuntimeError(
+                "split=train: no anchor with any Y row above the GHI daytime threshold "
+                f"({_FOLSOM_TRAIN_GHI_DAYTIME_THRESHOLD} W/m^2); check data or lower threshold"
+            )
+        return kept
 
     def _scan_sky_index(self) -> tuple[list[pd.Timestamp], list[Path]]:
         """
@@ -496,10 +664,12 @@ class FolsomIrradianceDataset(Dataset):
         return times, paths
 
     def _black_sky_tensor(self) -> torch.Tensor:
+        """Return ``[3, s, s]`` float32 (zeros). Matches PVDataset's float32-in-[0,1] convention."""
         s = self._skyimg_spatial_size
-        return torch.zeros((3, s, s), dtype=torch.uint8)
+        return torch.zeros((3, s, s), dtype=torch.float32)
 
     def _load_sky_tensor(self, path: Path) -> torch.Tensor:
+        """Return ``[3, s, s]`` float32 in ``[0, 1]`` (matches PVDataset)."""
         try:
             if path.is_file():
                 try:
@@ -511,7 +681,8 @@ class FolsomIrradianceDataset(Dataset):
                     im = im.convert("RGB")
                     im = im.resize((s, s), resample)
                     arr = np.asarray(im, dtype=np.uint8).copy()
-                return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+                t = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+                return t.to(torch.float32) / 255.0
         except Exception:
             pass
         return self._black_sky_tensor()
@@ -628,6 +799,8 @@ class FolsomIrradianceDataset(Dataset):
     def __len__(self) -> int:
         if self.split == "train":
             return self._train_epoch_len
+        if self.split == "val":
+            return self._num_val_windows
         return self._num_test_windows
 
     def sky_inspect(self, anchor: int) -> dict:
@@ -702,8 +875,8 @@ class FolsomIrradianceDataset(Dataset):
         timestamps = _folsom_to_timestamps(list(x_times))
         time0 = timestamps[-1]
         forecast_timestamps = [
-            time0 + pd.Timedelta(minutes=self.irr_output_interval_min * (i + 1))
-            for i in range(self.irr_output_len)
+            time0 + pd.Timedelta(minutes=self.pv_output_interval_min * (i + 1))
+            for i in range(self.pv_output_len)
         ]
         nwp_tensor = self._interpolate_nwp(forecast_timestamps)
 
@@ -733,29 +906,31 @@ class FolsomIrradianceDataset(Dataset):
 
         input_timestamps_utc = [str(pd.Timestamp(t)) for t in timestamps]
         forecast_timestamps_utc = [str(pd.Timestamp(t)) for t in forecast_timestamps]
+        dev_idx = torch.tensor(700)
 
+        # Match PVDataset: pv is [1, T_in] (sensor/dev dim leading), target_pv is [T_out].
+        pv_tensor = torch.from_numpy((ghi / 1100.0).astype(np.float32)).unsqueeze(0)
+        target_pv_tensor = torch.from_numpy((tg / 1100.0).astype(np.float32))
         return {
-            "ghi": torch.from_numpy(ghi),
-            "dni": torch.from_numpy(dni),
-            "dhi": torch.from_numpy(dhi),
-            "input_mask": input_mask,
-            "irr_timefeats": irr_timefeats,
+            "dev_idx": dev_idx,
+            "pv": pv_tensor,
+            "pv_mask": input_mask,
+            "pv_timefeats": irr_timefeats,
             "forecast_timefeats": forecast_timefeats,
-            "target_ghi": torch.from_numpy(tg),
-            "target_dni": torch.from_numpy(td),
-            "target_dhi": torch.from_numpy(th),
+            "target_pv": target_pv_tensor,
             "target_mask": target_mask,
+            "sat_tensor": None,
+            "sat_timefeats": None,
             "skimg_tensor": skimg_tensor,
             "skimg_timefeats": skimg_timefeats,
-            "skimg_timestamps": skimg_timestamps,
             "nwp_tensor": nwp_tensor,
-            "input_timestamps_utc": input_timestamps_utc,
-            "forecast_timestamps_utc": forecast_timestamps_utc,
         }
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         if self.split == "train":
-            r = int(np.random.choice(self._train_anchor_positions))
+            r = int(np.random.choice(self._train_anchor_valid_positions))
+        elif self.split == "val":
+            r = int(self._val_r_indices[idx])
         else:
             r = int(self._test_r_indices[idx])
         anchor = int(self._anchors[r])
@@ -804,57 +979,46 @@ def build_folsom_irradiance_datasets_from_conf(
     """
     Build train/test :class:`FolsomIrradianceDataset` from ``conf_folsom.yaml`` (or passed ``conf``).
 
-    If ``skyimg_window_size`` is set, it overrides ``training.skyimg_window_size`` (last N JPEGs at anchor).
+    Reads the standard PVDataset-style ``training`` block (``pv_*`` keys) and Luoyang-style
+    ``paths.*`` (``pv_path``/``sky_image_path``/``sat_path``), so the same YAML can be used by
+    ``training/train_vit_test.py``. Lat/lon and the optional NWP merged CSV are read internally
+    by the dataset from ``conf_folsom.yaml``. ``train_epoch_len`` is set on the returned train
+    dataset by direct attribute assignment (the constructor mirrors PVDataset and does not take
+    it). If ``skyimg_window_size`` is set, it overrides ``training.skyimg_window_size``.
     """
     if conf is None:
         conf = load_folsom_conf(conf_path)
-    training_raw = conf.get("training") or {}
-    required = (
-        "csv_interval_min",
-        "irr_input_interval_min",
-        "irr_input_len",
-        "irr_output_interval_min",
-        "irr_output_len",
-        "irr_train_time_fraction",
-        "test_anchor_stride_min",
-        "skyimg_window_size",
-        "skyimg_time_resolution_min",
-        "skyimg_spatial_size",
-    )
-    missing = [k for k in required if k not in training_raw]
-    if missing:
-        raise KeyError(f"Folsom training section missing required key(s): {missing}")
-    h = {k: training_raw[k] for k in required}
+    h = get_training_hparams_from_conf(conf)
     if skyimg_window_size is not None:
         h["skyimg_window_size"] = int(skyimg_window_size)
-    csv_path = _resolve_folsom_csv_path(conf)
-    nwp_csv_path = _resolve_folsom_nwp_csv_path(conf)
+
     paths = get_training_paths_from_conf(conf)
-    site = conf.get("site") or {}
-    lat = float(site["latitude"])
-    lon = float(site["longitude"])
-    kwargs = dict(
-        csv_path=csv_path,
-        csv_interval_min=h["csv_interval_min"],
-        irr_input_interval_min=h["irr_input_interval_min"],
-        irr_input_len=h["irr_input_len"],
-        irr_output_interval_min=h["irr_output_interval_min"],
-        irr_output_len=h["irr_output_len"],
-        irr_train_time_fraction=h["irr_train_time_fraction"],
-        test_anchor_stride_min=h["test_anchor_stride_min"],
-        train_epoch_len=train_epoch_len,
-        skyimg_dir=paths["skyimg_dir"],
-        skyimg_window_size=h["skyimg_window_size"],
-        skyimg_time_resolution_min=h["skyimg_time_resolution_min"],
-        skyimg_spatial_size=h["skyimg_spatial_size"],
-        nwp_merged_csv_path=nwp_csv_path,
-        latitude=lat,
-        longitude=lon,
+    pv_dir = paths["pv_dir"]
+    skyimg_dir = paths["skyimg_dir"]
+    # Folsom has no satellite data; the dataset stores satimg_dir but never reads from it.
+    satimg_dir = paths.get("satimg_dir", "")
+
+    kwargs: dict[str, Any] = dict(
+        csv_interval_min=int(h["csv_interval_min"]),
+        pv_input_interval_min=int(h["pv_input_interval_min"]),
+        pv_input_len=int(h["pv_input_len"]),
+        pv_output_interval_min=int(h["pv_output_interval_min"]),
+        pv_output_len=int(h["pv_output_len"]),
+        pv_train_time_fraction=float(h["pv_train_time_fraction"]),
+        test_anchor_stride_min=int(h["test_anchor_stride_min"]),
+        val_anchor_stride_min=int(h["val_anchor_stride_min"]),
+        test_collect_time_match_tolerance_min=int(h["test_collect_time_match_tolerance_min"]),
+        skyimg_window_size=int(h["skyimg_window_size"]),
+        skyimg_time_resolution_min=int(h["skyimg_time_resolution_min"]),
+        skyimg_spatial_size=int(h["skyimg_spatial_size"]),
+        satimg_window_size=int(h["satimg_window_size"]),
+        satimg_time_resolution_min=int(h["satimg_time_resolution_min"]),
+        satimg_npy_shape_hwc=tuple(int(x) for x in h["satimg_npy_shape_hwc"]),
     )
-    return (
-        FolsomIrradianceDataset(split="train", **kwargs),
-        FolsomIrradianceDataset(split="test", **kwargs),
-    )
+    train_ds = FolsomIrradianceDataset(pv_dir, skyimg_dir, satimg_dir, split="train", **kwargs)
+    test_ds = FolsomIrradianceDataset(pv_dir, skyimg_dir, satimg_dir, split="test", **kwargs)
+    train_ds._train_epoch_len = max(1, int(train_epoch_len))
+    return train_ds, test_ds
 
 
 __all__ = [
@@ -959,13 +1123,13 @@ def _validate_smoke_anchor_train(ds: FolsomIrradianceDataset, anchor: int) -> No
     if not (amin <= anchor <= amax):
         raise ValueError(
             f"anchor_row={anchor} is outside the valid anchor range [{amin}, {amax}] "
-            f"(needs room for input length {ds.irr_input_len} and output length {ds.irr_output_len})."
+            f"(needs room for input length {ds.pv_input_len} and output length {ds.pv_output_len})."
         )
     r = anchor - amin
     if not bool(ds._train_anchor_mask[r]):
         raise ValueError(
-            f"anchor_row={anchor} falls in the **test** time split (irr_train_time_fraction). "
-            "Smoke uses the train dataset only: pick an earlier calendar time, or increase the train fraction in YAML."
+            f"anchor_row={anchor} falls outside the train time band (fixed 60% train / 10% val / 30% test). "
+            "Smoke uses the train dataset only: pick an earlier calendar time."
         )
 
 
@@ -1001,8 +1165,8 @@ def run_smoke_cli(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--conf",
         type=Path,
-        default=_PROJECT_ROOT / "config" / "conf_folsom.yaml",
-        help="Path to folsom YAML (paths.data_dir + folsom_irradiance_csv, sky, NWP).",
+        default=_FOLSOM_CONF_PATH,
+        help="Path to YAML (paths.data_dir + pv/sky/sat, NWP, site lat/lon).",
     )
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--train-epoch-len", type=int, default=8, help="Dataset __len__ for train split smoke.")
@@ -1032,14 +1196,15 @@ def run_smoke_cli(argv: list[str] | None = None) -> int:
     except (FileNotFoundError, KeyError, ValueError) as e:
         print(f"Failed to load Folsom data from {args.conf.resolve()}:\n  {e}", file=sys.stderr)
         print(
-            "Fix paths.data_dir, paths.folsom_irradiance_csv, paths.sky_image_path, "
-            "and paths.folsom_nwp_merged_csv in that YAML so files exist on disk.",
+            "Fix paths.data_dir, paths.pv_path (folder with the irradiance CSV), "
+            "paths.sky_image_path, paths.sat_path (placeholder), paths.folsom_nwp_merged_csv, "
+            "and site.latitude/longitude in that YAML so files exist on disk.",
             file=sys.stderr,
         )
         return 1
     ds = train_ds
     print(f"[conf] {args.conf.resolve()}")
-    print(f"  csv={_resolve_folsom_csv_path(conf)}  train_len={len(ds)}  test_len={len(test_ds)}")
+    print(f"  csv={ds._csv_path}  train_len={len(ds)}  test_len={len(test_ds)}")
 
     if args.last_input_time:
         anchor0 = _find_csv_data_row_index_for_time(

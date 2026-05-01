@@ -2,8 +2,6 @@
 
 site:
   name: Luoyang
-  latitude: 34.69984
-  longitude: 112.28440
 
 paths:
   data_dir: "/work/datasets/luoyang_SPMF"
@@ -16,7 +14,7 @@ paths:
   nwp_path: NWP
 
 # Hyperparameters for training/train.py (CLI flags override these when passed)
-training:
+sampling:
   # PVDataset: CSV spacing and PV window geometry
   csv_interval_min: 5 # Do not change unless the csv file has a different time resolution
   pv_input_interval_min: 5 # multiple of 5 or csv_interval_min
@@ -37,11 +35,3 @@ training:
   satimg_window_size: 24 # the newest frame has aligned time with the last PV output row
   satimg_time_resolution_min: 10 # multiple of 10
   satimg_npy_shape_hwc: [100, 100, 3] # expected np.load array layout (height, width, channels)
-  # Optimization and training loop
-  epochs: 20
-  lr: 5e-4
-  batch_size: 32
-  save_every: 5
-  num_workers: 48
-  # null = run every batch in an epoch
-  train_max_batches_per_epoch: null

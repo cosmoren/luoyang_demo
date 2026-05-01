@@ -1,0 +1,66 @@
+# Folsom, CA — single irradiance CSV + sky JPEGs + (optional) merged NWP CSV.
+# -----------------------------------------------------------------------------
+# Same schema as config/conf_train.yaml (PVDataset / Luoyang `pv_*` keys, no `irr_*`,
+# no `dataset_profile: folsom`), so dataloader/folsom.py and training/train_vit_test.py
+# read this file with the exact same code path that's used for Luoyang training.
+#
+# Run Folsom training:
+#   python training/train_vit_test.py --config conf_folsom.yaml
+# -----------------------------------------------------------------------------
+
+site:
+  name: "Folsom, CA"
+  latitude: 38.642
+  longitude: -121.148
+
+paths:
+  data_dir: "/work/folsom_dataset"
+  # PVDataset reads this Excel via train_vit_test.py main() to build dev_dn_list.
+  # FolsomIrradianceDataset itself never reads it (returns dev_idx=0 for the single GHI sensor),
+  # so we keep the Luoyang Excel as a placeholder; trainer's nn.Embedding lookup still works.
+  pv_device_path: dataloader/XINSHENG_power_total_devices_type1.xlsx
+  # FolsomIrradianceDataset globs `pv_path` for exactly one CSV (the Folsom irradiance file).
+  pv_path: irradiance
+  # Sky JPEGs (YYYYMMDDHHMMSS.jpg, UTC, ~1 minute resolution).
+  sky_image_path: sky
+  # FolsomIrradianceDataset stores `satimg_dir` but never reads from it; placeholder is fine.
+  sat_path: sat
+  # PVDataset uses `paths.nwp_path` (folder with solar.csv / wind.csv); placeholder for Folsom.
+  nwp_path: NWP
+  # Folsom-specific: single merged NWP CSV (reftime, valtime, ssrd/cloud_cover/.../temperature/.../wind).
+  # If missing or unreadable, FolsomIrradianceDataset falls back to zero NWP + per-step invalid mask.
+  folsom_nwp_merged_csv: NWP/nwp_merged_averaged.csv
+
+# Hyperparameters for training/train_vit_test.py (CLI flags override these when passed)
+training:
+  # CSV row spacing (Folsom is 1-min; Luoyang was 5-min).
+  csv_interval_min: 1
+  # PVDataset / FolsomIrradianceDataset input window (X) and forecast window (Y).
+  pv_input_interval_min: 5      # multiple of csv_interval_min
+  pv_input_len: 576             # 576 * 5min = 48 h history
+  pv_output_interval_min: 15    # multiple of csv_interval_min
+  pv_output_len: 192            # 192 * 15min = 48 h forecast
+  # Time-based split: 60% train / 10% val / 30% test (fixed in the dataset class; this fraction
+  # is required by the schema but only `pv_train_time_fraction` is read for legacy parity).
+  pv_train_time_fraction: 0.7
+  test_anchor_stride_min: 1500
+  val_anchor_stride_min: 1800
+  test_collect_time_match_tolerance_min: 0
+  # Sky stack (last N JPEGs ending at the anchor).
+  skyimg_window_size: 30
+  skyimg_time_resolution_min: 1
+  skyimg_spatial_size: 224
+  # Sat keys are required by TRAINING_HPARAM_KEYS for PVDataset compatibility; Folsom has no
+  # satellite data, so FolsomIrradianceDataset returns sat_tensor=None / sat_timefeats=None
+  # regardless of these values. Keep Luoyang defaults as placeholders.
+  satimg_window_size: 24
+  satimg_time_resolution_min: 10
+  satimg_npy_shape_hwc: [100, 100, 3]
+  # Optimization and training loop.
+  epochs: 50
+  lr: 5e-4
+  batch_size: 32
+  save_every: 5
+  num_workers: 8
+  # null = run every batch in an epoch
+  train_max_batches_per_epoch: null

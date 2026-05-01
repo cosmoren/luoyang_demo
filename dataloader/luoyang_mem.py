@@ -18,7 +18,6 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from config_utils import get_resolved_paths
-from training.training_conf import CONF_PATH, get_training_hparams_from_conf, load_config
 
 # Process-global preload cache so that train/val/test ``PVDataset`` instances built in the
 # same process reuse one set of sky/sat tensors instead of loading + storing 3x.
@@ -74,13 +73,6 @@ def list_csv_files(
         )
     return all_csvs[start_idx : end_idx + 1]
 
-
-def _load_training_defaults() -> dict:
-    conf = load_config()
-    return get_training_hparams_from_conf(conf)
-
-
-_TRAINING_HPARAM_DEFAULTS = _load_training_defaults()
 
 # ``nwp_interp`` columns: ssrd (solar) then wind fields, in this order.
 _NWP_INTERP_STACK_COLS = ("ssrd", "msl", "t2m", "u10", "v10", "u100", "v100")
@@ -198,39 +190,49 @@ class PVDataset(Dataset):
     filenames (``YYYYMMDDHHMMSS_12.jpg``), and Himawari NPY filenames
     (``NC_H09_YYYYMMDD_HHMM_L2CLP010_FLDK.02401_02401.npy``) all use UTC wall time. ``collectTime``
     is floored to 10-minute boundaries for the satellite key timestep. History/forecast windows step
-    in UTC (sizes from ``conf.yaml`` ``training``). Sat arrays are float32 HWC per
-    ``training.satimg_npy_shape_hwc``; missing files → zeros.
+    in UTC (sizes from constructor kwargs). Sat arrays are float32 HWC per ``satimg_npy_shape_hwc``;
+    missing files → zeros.
 
-    If ``conf paths.nwp_path`` is set (relative to ``paths.data_dir`` unless absolute) and ``solar.csv`` /
-    ``wind.csv`` exist and load successfully, they populate ``nwp_solar_df`` and ``nwp_wind_df``; otherwise
-    (missing key, missing ``data_dir``, missing files, or read error) both stay ``None`` without raising.
+    The ``config_path`` argument is the dataset YAML for this instance (e.g.
+    ``config/datasets/conf_luoyang.yaml``). It supplies ``paths.data_dir``,
+    ``paths.pv_device_path`` (PV device Excel), and (optionally) ``paths.nwp_path`` used to load
+    ``solar.csv`` / ``wind.csv``. Site coordinates are **not** taken from this YAML; they are
+    read from ``<data_dir>/info.yaml`` (``site.latitude`` / ``site.longitude``) so that the
+    same dataset folder yields the same coordinates regardless of which config selects it.
+
+    If ``paths.nwp_path`` is set (relative to ``paths.data_dir`` unless absolute) and ``solar.csv`` /
+    ``wind.csv`` exist and load successfully, they populate ``nwp_solar_df`` and ``nwp_wind_df``;
+    otherwise (missing key, missing ``data_dir``, missing files, or read error) both stay ``None``
+    without raising.
     """
 
     def __init__(
         self,
+        config_path: str | Path,
         pv_dir: str,
         skyimg_dir: str,
         satimg_dir: str,
         *,
-        split: str = "train",
-        csv_interval_min: int = _TRAINING_HPARAM_DEFAULTS["csv_interval_min"],
-        pv_input_interval_min: int = _TRAINING_HPARAM_DEFAULTS["pv_input_interval_min"],
-        pv_input_len: int = _TRAINING_HPARAM_DEFAULTS["pv_input_len"],
-        pv_output_interval_min: int = _TRAINING_HPARAM_DEFAULTS["pv_output_interval_min"],
-        pv_output_len: int = _TRAINING_HPARAM_DEFAULTS["pv_output_len"],
-        pv_train_time_fraction: float = _TRAINING_HPARAM_DEFAULTS["pv_train_time_fraction"],
-        test_anchor_stride_min: int = _TRAINING_HPARAM_DEFAULTS["test_anchor_stride_min"],
-        val_anchor_stride_min: int = _TRAINING_HPARAM_DEFAULTS["val_anchor_stride_min"],
-        test_collect_time_match_tolerance_min: int = _TRAINING_HPARAM_DEFAULTS[
-            "test_collect_time_match_tolerance_min"
-        ],
-        skyimg_window_size: int = _TRAINING_HPARAM_DEFAULTS["skyimg_window_size"],
-        skyimg_time_resolution_min: int = _TRAINING_HPARAM_DEFAULTS["skyimg_time_resolution_min"],
-        skyimg_spatial_size: int = _TRAINING_HPARAM_DEFAULTS["skyimg_spatial_size"],
-        satimg_window_size: int = _TRAINING_HPARAM_DEFAULTS["satimg_window_size"],
-        satimg_time_resolution_min: int = _TRAINING_HPARAM_DEFAULTS["satimg_time_resolution_min"],
-        satimg_npy_shape_hwc: tuple[int, int, int] = _TRAINING_HPARAM_DEFAULTS["satimg_npy_shape_hwc"],
+        split: str,
+        csv_interval_min: int,
+        pv_input_interval_min: int,
+        pv_input_len: int,
+        pv_output_interval_min: int,
+        pv_output_len: int,
+        pv_train_time_fraction: float,
+        test_anchor_stride_min: int,
+        val_anchor_stride_min: int,
+        test_collect_time_match_tolerance_min: int,
+        skyimg_window_size: int,
+        skyimg_time_resolution_min: int,
+        skyimg_spatial_size: int,
+        satimg_window_size: int,
+        satimg_time_resolution_min: int,
+        satimg_npy_shape_hwc: tuple[int, int, int],
     ):
+        self._config_path = Path(config_path).resolve()
+        if not self._config_path.is_file():
+            raise FileNotFoundError(f"PVDataset config_path not found: {self._config_path}")
         if split not in ("train", "val", "test"):
             raise ValueError("split must be 'train', 'val', or 'test'")
         self.split = split
@@ -285,33 +287,55 @@ class PVDataset(Dataset):
         self._test_collect_time_match_tolerance_min = tol_m
         self._test_collect_tolerance_ns = tol_m * 60 * 1_000_000_000
 
-        with open(CONF_PATH) as f:
-            conf = yaml.safe_load(f)
+        with open(self._config_path) as f:
+            conf = yaml.safe_load(f) or {}
         paths = get_resolved_paths(conf, _PROJECT_ROOT)
         paths_cfg = conf.get("paths", {}) or {}
+        data_dir = paths.get("data_dir")
+
         nwp_raw = paths_cfg.get("nwp_path")
         self.nwp_solar_df = None
         self.nwp_wind_df = None
-        if nwp_raw is not None and str(nwp_raw).strip() != "":
-            data_dir = paths.get("data_dir")
-            if data_dir is not None:
-                try:
-                    nwp_p = Path(nwp_raw)
-                    nwp_dir = nwp_p.resolve() if nwp_p.is_absolute() else (data_dir / nwp_p).resolve()
-                    solar_csv = nwp_dir / "solar.csv"
-                    wind_csv = nwp_dir / "wind.csv"
-                    if solar_csv.is_file() and wind_csv.is_file():
-                        self.nwp_solar_df = pd.read_csv(solar_csv)
-                        self.nwp_wind_df = pd.read_csv(wind_csv)
-                except Exception:
-                    self.nwp_solar_df = None
-                    self.nwp_wind_df = None
+        if nwp_raw is not None and str(nwp_raw).strip() != "" and data_dir is not None:
+            try:
+                nwp_p = Path(nwp_raw)
+                nwp_dir = nwp_p.resolve() if nwp_p.is_absolute() else (data_dir / nwp_p).resolve()
+                solar_csv = nwp_dir / "solar.csv"
+                wind_csv = nwp_dir / "wind.csv"
+                if solar_csv.is_file() and wind_csv.is_file():
+                    self.nwp_solar_df = pd.read_csv(solar_csv)
+                    self.nwp_wind_df = pd.read_csv(wind_csv)
+            except Exception:
+                self.nwp_solar_df = None
+                self.nwp_wind_df = None
 
-        pv_device_path = paths["pv_device_path"]
+        pv_device_path = paths.get("pv_device_path")
+        if pv_device_path is None:
+            raise KeyError(
+                f"dataset config paths.pv_device_path is required (in {self._config_path})"
+            )
 
-        site = conf.get("site", {})
+        # Site coordinates live with the dataset itself (``<data_dir>/info.yaml``), not in the
+        # per-instance dataset config — same dataset folder reused across configs ⇒ same site.
+        if data_dir is None:
+            raise KeyError(
+                f"dataset config paths.data_dir is required (in {self._config_path})"
+            )
+        info_path = Path(data_dir) / "info.yaml"
+        if not info_path.is_file():
+            raise FileNotFoundError(
+                f"dataset info file not found: {info_path} "
+                f"(expected ``site.latitude`` / ``site.longitude``)"
+            )
+        with open(info_path) as f:
+            info = yaml.safe_load(f) or {}
+        site = info.get("site", {}) or {}
         self.latitude = site.get("latitude")
         self.longitude = site.get("longitude")
+        if self.latitude is None or self.longitude is None:
+            raise KeyError(
+                f"{info_path} must define both site.latitude and site.longitude"
+            )
 
         pv_device_df = pd.read_excel(pv_device_path)
         self.devDn_list = pv_device_df["devDn"].dropna().unique().tolist()

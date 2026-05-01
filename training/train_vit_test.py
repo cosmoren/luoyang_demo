@@ -10,27 +10,24 @@ import os
 import sys
 from pathlib import Path
 
-import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim.lr_scheduler as lr_scheduler
+import yaml
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CONFIG_DIR = _PROJECT_ROOT / "config"
-_DEFAULT_CONF_NAME = "conf.yaml"
+_TRAIN_CONFIG_DIR = _CONFIG_DIR / "train"
+_DATASETS_CONFIG_DIR = _CONFIG_DIR / "datasets"
+_DEFAULT_TRAIN_CONF_NAME = "conf_train.yaml"
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from config_utils import get_resolved_paths
 from dataloader.luoyang_mem import PVDataset, collate_batched
+# from dataloader.folsom import FolsomIrradianceDataset
 from models.models import pv_forecasting_model_vit_imgs
-from training.training_conf import (
-    get_training_hparams_from_conf,
-    get_training_paths_from_conf,
-    load_config,
-)
 
 
 def _gpu_id_for_checkpoint() -> int:
@@ -211,26 +208,46 @@ def _build_lr_scheduler(
     )
 
 
-def _resolve_config_path(config_name: str) -> Path:
-    cfg = Path(config_name)
-    if cfg.name != config_name:
-        raise ValueError("--config only accepts a filename under project config/, e.g. --config conf_train.yaml")
-    cfg_path = _CONFIG_DIR / cfg.name
+def _resolve_named_config(directory: Path, name: str, label: str) -> Path:
+    cfg = Path(name)
+    if cfg.name != name:
+        raise ValueError(
+            f"--{label} only accepts a bare filename under {directory.relative_to(_PROJECT_ROOT)}/, "
+            f"e.g. --{label} {cfg.name}"
+        )
+    cfg_path = directory / cfg.name
     if not cfg_path.is_file():
-        raise FileNotFoundError(f"config file not found under config/: {cfg_path}")
+        raise FileNotFoundError(f"{label} file not found: {cfg_path}")
     return cfg_path
 
 
-def _build_parser(path_defaults: dict, h: dict, config_default: str) -> argparse.ArgumentParser:
+def _load_yaml(path: Path) -> dict:
+    with open(path) as f:
+        data = yaml.safe_load(f)
+    return data or {}
+
+
+def _resolve_data_dir(paths_cfg: dict, cfg_path: Path) -> Path:
+    raw = paths_cfg.get("data_dir")
+    if raw is None or str(raw).strip() == "":
+        raise KeyError(f"dataset config paths.data_dir is required (in {cfg_path})")
+    p = Path(str(raw))
+    return p.resolve() if p.is_absolute() else (_PROJECT_ROOT / p).resolve()
+
+
+def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train PV forecasting model (ViT / TimeSformer)")
     parser.add_argument(
         "--config",
         type=str,
         default=config_default,
-        help=f"Config filename under project config/ (default: {config_default!r}).",
+        help=(
+            f"Training config filename under config/train/ "
+            f"(default: {config_default!r})."
+        ),
     )
-    parser.add_argument("--epochs", type=int, default=h["epochs"])
-    parser.add_argument("--lr", type=float, default=h["lr"])
+    parser.add_argument("--epochs", type=int, default=int(h["epochs"]))
+    parser.add_argument("--lr", type=float, default=float(h["lr"]))
     parser.add_argument(
         "--weight-decay",
         type=float,
@@ -249,166 +266,124 @@ def _build_parser(path_defaults: dict, h: dict, config_default: str) -> argparse
         default=1e-6,
         help="Minimum learning rate for cosine tail (default 1e-6).",
     )
-    parser.add_argument("--batch_size", type=int, default=h["batch_size"])
+    parser.add_argument("--batch_size", type=int, default=int(h["batch_size"]))
     parser.add_argument("--checkpoint_dir", type=str, default=None)
-    parser.add_argument("--save_every", type=int, default=h["save_every"])
-    parser.add_argument(
-        "--pv-dir",
-        type=str,
-        default=path_defaults["pv_dir"],
-        help=f"PV CSV directory (train/test split by time in each CSV; default: {path_defaults['pv_dir']!r}).",
-    )
-    parser.add_argument(
-        "--skyimg-dir",
-        type=str,
-        default=path_defaults["skyimg_dir"],
-        help=f"Sky JPEG root (default: {path_defaults['skyimg_dir']!r}).",
-    )
-    parser.add_argument(
-        "--csv_interval_min",
-        type=int,
-        default=h["csv_interval_min"],
-        help="CSV row spacing in minutes (must divide pv_input/output intervals).",
-    )
-    parser.add_argument(
-        "--pv_input_interval_min",
-        type=int,
-        default=h["pv_input_interval_min"],
-        help="Minutes between consecutive PV input (X) samples.",
-    )
-    parser.add_argument(
-        "--pv_output_interval_min",
-        type=int,
-        default=h["pv_output_interval_min"],
-        help="Minutes between consecutive PV target (Y) samples.",
-    )
-    parser.add_argument("--pv_input_len", type=int, default=h["pv_input_len"], help="Input sequence length (X).")
-    parser.add_argument("--pv_output_len", type=int, default=h["pv_output_len"], help="Target sequence length (Y).")
-    parser.add_argument(
-        "--pv_train_time_fraction",
-        type=float,
-        default=h["pv_train_time_fraction"],
-        help="Per CSV: first int(n*fraction) rows are train segment, rest test; anchors must fit entirely in segment.",
-    )
-    parser.add_argument(
-        "--test_anchor_stride_min",
-        type=int,
-        default=h["test_anchor_stride_min"],
-        help="For split=test: minutes between consecutive eval anchors (multiple of CSV row interval).",
-    )
-    parser.add_argument(
-        "--val_anchor_stride_min",
-        type=int,
-        default=h["val_anchor_stride_min"],
-        help="For split=val: minutes between consecutive val anchors (multiple of CSV row interval; val band is short, often smaller than test).",
-    )
-    parser.add_argument(
-        "--test_collect_time_match_tolerance_min",
-        type=int,
-        default=h["test_collect_time_match_tolerance_min"],
-        help="For split=test: max minutes between ref last-X collectTime and matched row in each CSV (0=exact).",
-    )
-    parser.add_argument(
-        "--skyimg_window_size",
-        type=int,
-        default=h["skyimg_window_size"],
-        help="Number of sky images per history and per forecast sequence.",
-    )
-    parser.add_argument(
-        "--skyimg_time_resolution_min",
-        type=int,
-        default=h["skyimg_time_resolution_min"],
-        help="Minutes between consecutive sky frames (independent of PV input spacing).",
-    )
-    parser.add_argument(
-        "--skyimg_spatial_size",
-        type=int,
-        default=h["skyimg_spatial_size"],
-        help="Sky JPEG resize side length (square, pixels).",
-    )
-    parser.add_argument(
-        "--satimg-dir",
-        type=str,
-        default=path_defaults["satimg_dir"],
-        help=f"Himawari NPY root (default: {path_defaults['satimg_dir']!r}).",
-    )
-    parser.add_argument(
-        "--satimg_window_size",
-        type=int,
-        default=h["satimg_window_size"],
-        help="Number of Himawari NPY frames per history and per forecast sequence.",
-    )
-    parser.add_argument(
-        "--satimg_time_resolution_min",
-        type=int,
-        default=h["satimg_time_resolution_min"],
-        help="Minutes between consecutive satimg frames in UTC.",
-    )
-    parser.add_argument(
-        "--satimg_npy_shape_hwc",
-        type=int,
-        nargs=3,
-        default=list(h["satimg_npy_shape_hwc"]),
-        metavar=("H", "W", "C"),
-        help="Expected Himawari NPY array shape H W C (default from conf).",
-    )
+    parser.add_argument("--save_every", type=int, default=int(h["save_every"]))
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=h["num_workers"],
+        default=int(h["num_workers"]),
         help="DataLoader worker processes.",
     )
+    mb = h.get("train_max_batches_per_epoch")
     parser.add_argument(
         "--train_max_batches_per_epoch",
         type=int,
-        default=h["train_max_batches_per_epoch"],
+        default=None if mb is None else int(mb),
         help="Stop each training epoch after this many batches (default from conf; null = no cap).",
     )
     return parser
 
 
-def _dataset_kwargs(args: argparse.Namespace, satimg_hwc: tuple[int, int, int], split: str) -> dict:
+def _dataset_kwargs(dataset_config_name: str, split: str) -> dict:
+    """
+    Build PVDataset-compatible kwargs from ``config/datasets/<dataset_config_name>``.
+
+    The dataset YAML is expected to contain:
+      - ``paths.data_dir`` plus ``pv_path`` / ``sky_image_path`` / ``sat_path``
+      - a ``sampling:`` section with all PVDataset window / stride / image-shape fields
+    """
+    cfg_path = _resolve_named_config(_DATASETS_CONFIG_DIR, dataset_config_name, "dataset-config")
+    cfg = _load_yaml(cfg_path)
+    paths_cfg = cfg.get("paths", {}) or {}
+    sampling_cfg = cfg.get("sampling", {}) or {}
+    if not sampling_cfg:
+        raise KeyError(f"dataset config {cfg_path} is missing a non-empty 'sampling:' section")
+
+    data_dir = _resolve_data_dir(paths_cfg, cfg_path)
+
+    def _req_path(key: str) -> str:
+        v = paths_cfg.get(key)
+        if v is None or str(v).strip() == "":
+            raise KeyError(f"dataset config paths.{key} is required (in {cfg_path})")
+        return str(v)
+
+    def _req_sampling(key: str):
+        if key not in sampling_cfg:
+            raise KeyError(f"dataset config sampling.{key} is required (in {cfg_path})")
+        return sampling_cfg[key]
+
+    pv_dir = (data_dir / _req_path("pv_path")).resolve()
+    skyimg_dir = (data_dir / _req_path("sky_image_path")).resolve()
+    satimg_dir = (data_dir / _req_path("sat_path")).resolve()
+
+    shwc = _req_sampling("satimg_npy_shape_hwc")
+    if not isinstance(shwc, (list, tuple)) or len(shwc) != 3:
+        raise ValueError(
+            f"sampling.satimg_npy_shape_hwc must be [H, W, C] (in {cfg_path})"
+        )
+
     return dict(
-        pv_dir=args.pv_dir,
-        skyimg_dir=args.skyimg_dir,
-        satimg_dir=args.satimg_dir,
+        config_path=str(cfg_path),
+        pv_dir=str(pv_dir),
+        skyimg_dir=str(skyimg_dir),
+        satimg_dir=str(satimg_dir),
         split=split,
-        csv_interval_min=args.csv_interval_min,
-        pv_input_interval_min=args.pv_input_interval_min,
-        pv_input_len=args.pv_input_len,
-        pv_output_interval_min=args.pv_output_interval_min,
-        pv_output_len=args.pv_output_len,
-        pv_train_time_fraction=args.pv_train_time_fraction,
-        test_anchor_stride_min=args.test_anchor_stride_min,
-        val_anchor_stride_min=args.val_anchor_stride_min,
-        test_collect_time_match_tolerance_min=args.test_collect_time_match_tolerance_min,
-        skyimg_window_size=args.skyimg_window_size,
-        skyimg_time_resolution_min=args.skyimg_time_resolution_min,
-        skyimg_spatial_size=args.skyimg_spatial_size,
-        satimg_window_size=args.satimg_window_size,
-        satimg_time_resolution_min=args.satimg_time_resolution_min,
-        satimg_npy_shape_hwc=satimg_hwc,
+        csv_interval_min=int(_req_sampling("csv_interval_min")),
+        pv_input_interval_min=int(_req_sampling("pv_input_interval_min")),
+        pv_input_len=int(_req_sampling("pv_input_len")),
+        pv_output_interval_min=int(_req_sampling("pv_output_interval_min")),
+        pv_output_len=int(_req_sampling("pv_output_len")),
+        pv_train_time_fraction=float(_req_sampling("pv_train_time_fraction")),
+        test_anchor_stride_min=int(_req_sampling("test_anchor_stride_min")),
+        val_anchor_stride_min=int(_req_sampling("val_anchor_stride_min")),
+        test_collect_time_match_tolerance_min=int(_req_sampling("test_collect_time_match_tolerance_min")),
+        skyimg_window_size=int(_req_sampling("skyimg_window_size")),
+        skyimg_time_resolution_min=int(_req_sampling("skyimg_time_resolution_min")),
+        skyimg_spatial_size=int(_req_sampling("skyimg_spatial_size")),
+        satimg_window_size=int(_req_sampling("satimg_window_size")),
+        satimg_time_resolution_min=int(_req_sampling("satimg_time_resolution_min")),
+        satimg_npy_shape_hwc=tuple(int(x) for x in shwc),
     )
 
 
 def main() -> None:
     pre_parser = argparse.ArgumentParser(add_help=False)
-    pre_parser.add_argument("--config", type=str, default=_DEFAULT_CONF_NAME)
+    pre_parser.add_argument("--config", type=str, default=_DEFAULT_TRAIN_CONF_NAME)
     pre_args, _ = pre_parser.parse_known_args()
 
-    conf = load_config(_resolve_config_path(pre_args.config))
-    h = get_training_hparams_from_conf(conf)
-    path_defaults = get_training_paths_from_conf(conf)
-    parser = _build_parser(path_defaults, h, config_default=pre_args.config)
-    args = parser.parse_args()
-    satimg_hwc = tuple(args.satimg_npy_shape_hwc)
+    train_conf_path = _resolve_named_config(_TRAIN_CONFIG_DIR, pre_args.config, "config")
+    train_conf = _load_yaml(train_conf_path)
+    h = train_conf.get("training") or {}
+    if not h:
+        raise KeyError(f"training config {train_conf_path} is missing a 'training:' section")
 
-    resolved_paths = get_resolved_paths(conf, _PROJECT_ROOT)
-    pv_device_path = resolved_paths["pv_device_path"]
-    if pv_device_path is None or not pv_device_path.is_file():
-        raise FileNotFoundError(f"pv_device_path not found: {pv_device_path}")
-    pv_device_df = pd.read_excel(pv_device_path)
-    dev_dn_list = pv_device_df["devDn"].dropna().unique().tolist()
+    parser = _build_parser(h, config_default=pre_args.config)
+    args = parser.parse_args()
+
+    # =========================================================================
+    # Dataset selection: change DATASET_CLS to a different Dataset class and
+    # DATASET_CONFIG to a YAML filename under config/datasets/ to train on a
+    # different dataset (e.g. ``conf_folsom.yaml``). The chosen YAML supplies
+    # ``paths.*`` and the ``sampling:`` section consumed by ``_dataset_kwargs``.
+    # =========================================================================
+    DATASET_CLS = PVDataset
+    DATASET_CONFIG = "conf_luoyang.yaml" # config file for the luoyang dataset
+
+    train_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "train"))
+    val_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "val"))
+    test_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "test"))
+
+    # DATASET_CLS = FolsomIrradianceDataset
+    # DATASET_CONFIG = "conf_folsom.yaml" # config file for the folsom dataset
+
+    # train_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "train"))
+    # val_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "val"))
+    # test_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "test"))
+
+    # =========================================================================
+
+    dev_dn_list = train_dataset.devDn_list
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = pv_forecasting_model_vit_imgs(dev_dn_list=dev_dn_list).to(device)
@@ -418,7 +393,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
         betas=(0.9, 0.999),
     )
-    
+
     scheduler = _build_lr_scheduler(
         optimizer,
         epochs=args.epochs,
@@ -426,10 +401,6 @@ def main() -> None:
         lr_min=args.lr_min,
     )
     criterion = nn.HuberLoss(delta=1.0)  # nn.MSELoss()
-
-    train_dataset = PVDataset(**_dataset_kwargs(args, satimg_hwc, "train"))
-    val_dataset = PVDataset(**_dataset_kwargs(args, satimg_hwc, "val"))
-    test_dataset = PVDataset(**_dataset_kwargs(args, satimg_hwc, "test"))
 
     train_loader = DataLoader(
         train_dataset,
