@@ -57,20 +57,14 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from config_utils import get_resolved_paths
 from dataloader.luoyang_mem import list_csv_files
 from modules.solar_encoder import compute_solar_features, delta_time_encoder, solar_features_encoder
-from training.training_conf import (
-    get_training_hparams_from_conf,
-    get_training_paths_from_conf,
-    load_config_path,
-)
 
-# All site / NWP / training-section reads inside this module go through ``conf_folsom.yaml``.
-# The schema is the same PVDataset / Luoyang ``pv_*`` schema as ``conf_train.yaml`` (no ``irr_*`` /
-# no ``dataset_profile: folsom``), so :class:`FolsomIrradianceDataset` is a drop-in replacement
-# for :class:`dataloader.luoyang_mem.PVDataset` in ``training/train_vit_test.py`` when invoked
-# with ``--config conf_folsom.yaml``.
-_FOLSOM_CONF_PATH = _PROJECT_ROOT / "config" / "conf_folsom.yaml"
+# Default dataset YAML for Folsom under the new ``config/datasets/`` layout. Used only by the
+# smoke CLI as a convenience default; ``FolsomIrradianceDataset`` itself takes ``config_path``
+# as a required constructor argument and never falls back to a hardcoded path.
+_DEFAULT_FOLSOM_DATASET_CONFIG = _PROJECT_ROOT / "config" / "datasets" / "conf_folsom.yaml"
 
 # Keys collate stacks with batch dim B first (single source of truth for trainers).
 FOLSOM_GHI_DNI_DHI_KEYS: tuple[str, ...] = (
@@ -107,11 +101,6 @@ _FOLSOM_NWP_FEATURE_COLS = (
 _SKY_INDEX_CACHE: dict[str, tuple[list[pd.Timestamp], list[Path], list[int]]] = {}
 
 
-def _load_training_defaults() -> dict:
-    return get_training_hparams_from_conf(load_config_path(_FOLSOM_CONF_PATH))
-
-
-_FOLSOM_TRAINING_HPARAM_DEFAULTS = _load_training_defaults()
 _DEFAULT_FOLSOM_TRAIN_EPOCH_LEN = 50_000
 
 # Train mode: a Y window is "valid" if any of its rows has finite GHI strictly above this
@@ -249,16 +238,19 @@ def _pick_time_and_ghi_dni_dhi_columns(header_cells: list[str]) -> tuple[str, li
     return time_col, order, raw
 
 
-def load_folsom_conf(path: Path | str | None = None) -> dict:
-    """Load ``config/conf_folsom.yaml`` (or a custom path).
+def load_folsom_conf(path: Path | str) -> dict:
+    """Load a Folsom dataset YAML (typically ``config/datasets/conf_folsom.yaml``).
 
-    The new ``conf_folsom.yaml`` uses the same PVDataset / Luoyang ``pv_*`` training schema as
-    ``conf_train.yaml`` (no ``irr_*`` / no ``dataset_profile: folsom``), so the same trainer
-    (``training/train_vit_test.py``) can switch datasets via ``--config``.
+    Caller must supply the path explicitly; this module never reads a hardcoded canonical
+    config file. The expected schema mirrors ``config/datasets/conf_luoyang.yaml``:
+    ``paths.{data_dir, pv_path, sky_image_path, sat_path, ...}`` plus a ``sampling:``
+    section with the PVDataset-style window / stride / image-shape fields.
     """
-    p = Path(path) if path is not None else _FOLSOM_CONF_PATH
+    if path is None:
+        raise TypeError("load_folsom_conf(path) is required; no canonical default")
+    p = Path(path)
     with p.open() as f:
-        return yaml.safe_load(f)
+        return yaml.safe_load(f) or {}
 
 
 def _folsom_to_timestamps(values) -> list[pd.Timestamp]:
@@ -312,8 +304,10 @@ def _load_folsom_nwp_merged_csv(path: Path | str) -> pd.DataFrame:
         raise KeyError(f"{p.name}: missing required NWP column(s): {missing}")
 
     out = pd.DataFrame(index=df.index)
-    out["reftime"] = pd.to_datetime(df["reftime"], errors="coerce")
-    out["valtime"] = pd.to_datetime(df["valtime"], errors="coerce")
+    # Explicit format avoids the ``Could not infer format ... falling back to dateutil``
+    # warning and the per-element slow path. CSV stores naive ``YYYY-MM-DD HH:MM:SS``.
+    out["reftime"] = pd.to_datetime(df["reftime"], format="%Y-%m-%d %H:%M:%S", errors="coerce")
+    out["valtime"] = pd.to_datetime(df["valtime"], format="%Y-%m-%d %H:%M:%S", errors="coerce")
     for c in _FOLSOM_NWP_FEATURE_COLS:
         out[c] = pd.to_numeric(df[c], errors="coerce")
     out = out.dropna(subset=["reftime", "valtime"]).copy()
@@ -334,8 +328,10 @@ class FolsomIrradianceDataset(Dataset):
     and ``sat_timefeats`` in returned samples are ``None``.
 
     ``pv_dir`` must contain exactly one irradiance CSV (time + GHI/DNI/DHI columns; column names
-    auto-detected from the header). Latitude/longitude and the optional NWP merged CSV are read
-    internally from ``config/conf_folsom.yaml`` (mirroring how PVDataset reads from ``CONF_PATH``).
+    auto-detected from the header). The optional NWP merged CSV is resolved from
+    ``paths.folsom_nwp_merged_csv`` in the per-instance ``config_path``; site coordinates come
+    from ``<paths.data_dir>/info.yaml`` (``site.latitude`` / ``site.longitude``), matching
+    :class:`dataloader.luoyang_mem.PVDataset`.
 
     Splits: rows are partitioned in fixed proportions ``60% train / 10% val / 30% test`` (same as
     PVDataset). ``pv_train_time_fraction`` is kept for call-site parity but **not** used. Train
@@ -350,29 +346,33 @@ class FolsomIrradianceDataset(Dataset):
 
     def __init__(
         self,
+        config_path: str | Path,
         pv_dir: str,
         skyimg_dir: str,
         satimg_dir: str,
         *,
-        split: str = "train",
-        csv_interval_min: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["csv_interval_min"],
-        pv_input_interval_min: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["pv_input_interval_min"],
-        pv_input_len: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["pv_input_len"],
-        pv_output_interval_min: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["pv_output_interval_min"],
-        pv_output_len: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["pv_output_len"],
-        pv_train_time_fraction: float = _FOLSOM_TRAINING_HPARAM_DEFAULTS["pv_train_time_fraction"],
-        test_anchor_stride_min: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["test_anchor_stride_min"],
-        val_anchor_stride_min: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["val_anchor_stride_min"],
-        test_collect_time_match_tolerance_min: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS[
-            "test_collect_time_match_tolerance_min"
-        ],
-        skyimg_window_size: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["skyimg_window_size"],
-        skyimg_time_resolution_min: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["skyimg_time_resolution_min"],
-        skyimg_spatial_size: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["skyimg_spatial_size"],
-        satimg_window_size: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["satimg_window_size"],
-        satimg_time_resolution_min: int = _FOLSOM_TRAINING_HPARAM_DEFAULTS["satimg_time_resolution_min"],
-        satimg_npy_shape_hwc: tuple[int, int, int] = _FOLSOM_TRAINING_HPARAM_DEFAULTS["satimg_npy_shape_hwc"],
+        split: str,
+        csv_interval_min: int,
+        pv_input_interval_min: int,
+        pv_input_len: int,
+        pv_output_interval_min: int,
+        pv_output_len: int,
+        pv_train_time_fraction: float,
+        test_anchor_stride_min: int,
+        val_anchor_stride_min: int,
+        test_collect_time_match_tolerance_min: int,
+        skyimg_window_size: int,
+        skyimg_time_resolution_min: int,
+        skyimg_spatial_size: int,
+        satimg_window_size: int,
+        satimg_time_resolution_min: int,
+        satimg_npy_shape_hwc: tuple[int, int, int],
     ):
+        self._config_path = Path(config_path).resolve()
+        if not self._config_path.is_file():
+            raise FileNotFoundError(
+                f"FolsomIrradianceDataset config_path not found: {self._config_path}"
+            )
         if split not in ("train", "val", "test"):
             raise ValueError("split must be 'train', 'val', or 'test'")
         self.split = split
@@ -436,13 +436,39 @@ class FolsomIrradianceDataset(Dataset):
         self._test_collect_time_match_tolerance_min = tol_m
         self._test_collect_tolerance_ns = tol_m * 60 * 1_000_000_000
 
-        # Site + NWP from conf_folsom.yaml (mirrors PVDataset's CONF_PATH usage).
-        conf = load_config_path(_FOLSOM_CONF_PATH)
-        site = conf.get("site") or {}
-        self.latitude = float(site.get("latitude"))
-        self.longitude = float(site.get("longitude"))
-        self._nwp_feature_cols = tuple(_FOLSOM_NWP_FEATURE_COLS)
+        # Site + NWP from the per-instance dataset YAML (``self._config_path``):
+        #   * lat/lon → ``<paths.data_dir>/info.yaml`` (site.latitude / site.longitude),
+        #     matching :class:`dataloader.luoyang_mem.PVDataset`.
+        #   * NWP merged CSV → ``paths.folsom_nwp_merged_csv`` (relative to ``data_dir``
+        #     unless absolute); missing/unreadable falls back to None (zero NWP at runtime).
+        with self._config_path.open() as f:
+            conf = yaml.safe_load(f) or {}
+        paths = get_resolved_paths(conf, _PROJECT_ROOT)
         paths_cfg = conf.get("paths") or {}
+        data_dir = paths.get("data_dir")
+        if data_dir is None:
+            raise KeyError(
+                f"dataset config paths.data_dir is required (in {self._config_path})"
+            )
+        info_path = Path(data_dir) / "info.yaml"
+        if not info_path.is_file():
+            raise FileNotFoundError(
+                f"dataset info file not found: {info_path} "
+                f"(expected ``site.latitude`` / ``site.longitude``)"
+            )
+        with open(info_path) as f:
+            info = yaml.safe_load(f) or {}
+        site = info.get("site") or {}
+        lat = site.get("latitude")
+        lon = site.get("longitude")
+        if lat is None or lon is None:
+            raise KeyError(
+                f"{info_path} must define both site.latitude and site.longitude"
+            )
+        self.latitude = float(lat)
+        self.longitude = float(lon)
+
+        self._nwp_feature_cols = tuple(_FOLSOM_NWP_FEATURE_COLS)
         nwp_rel = paths_cfg.get("folsom_nwp_merged_csv")
         self._nwp_merged_df = None
         if nwp_rel is not None and str(nwp_rel).strip() != "":
@@ -451,6 +477,11 @@ class FolsomIrradianceDataset(Dataset):
                 self._nwp_merged_df = _load_folsom_nwp_merged_csv(nwp_csv)
             except (FileNotFoundError, KeyError):
                 self._nwp_merged_df = None
+
+        # API parity with PVDataset: trainer reads ``train_dataset.devDn_list`` to size the
+        # device-id embedding. Folsom is a single-sensor station, so a length-1 list is fine
+        # (paired with ``dev_idx=0`` returned by ``_build_tensors``).
+        self.devDn_list = [0]
 
         # CSV: glob ``pv_dir`` for *.csv (PVDataset convention); Folsom expects exactly one.
         self.sample_files = list_csv_files(data_dir=pv_dir)
@@ -733,28 +764,12 @@ class FolsomIrradianceDataset(Dataset):
         return sel_times, sel_paths
 
     def _stack_sky_frames(self, frame_paths: list[Path | None]) -> torch.Tensor:
-        frames: list[torch.Tensor] = []
-        to_load = sum(1 for x in frame_paths if x is not None)
-        s = self._skyimg_spatial_size
-        if to_load > 0:
-            _folsom_progress(
-                f"loading sky window: {to_load} JPEG(s) from disk (resize to {s}x{s}) ..."
-            )
-        load_i = 0
-        for slot, p in enumerate(frame_paths):
-            if p is None:
-                frames.append(self._black_sky_tensor())
-            else:
-                load_i += 1
-                if load_i == 1 or load_i == to_load:
-                    _folsom_progress(f"  sky JPEG {load_i}/{to_load} (slot {slot}) ...")
-                elif to_load >= 10:
-                    step = max(2, to_load // 5)
-                    if load_i % step == 0:
-                        _folsom_progress(f"  sky JPEG {load_i}/{to_load} (slot {slot}) ...")
-                frames.append(self._load_sky_tensor(p))
-        if to_load > 0:
-            _folsom_progress("sky window stack done")
+        # Per-sample hot path (called from every __getitem__): keep silent. The one-time
+        # ``sky index ready: N JPGs`` line emitted at construction is enough to confirm setup.
+        frames: list[torch.Tensor] = [
+            self._black_sky_tensor() if p is None else self._load_sky_tensor(p)
+            for p in frame_paths
+        ]
         return torch.stack(frames, dim=0)
 
     def _interpolate_nwp(self, forecast_timestamps: list[pd.Timestamp]) -> torch.Tensor:
@@ -869,7 +884,11 @@ class FolsomIrradianceDataset(Dataset):
         ghi, dni, dhi = x_stack[0], x_stack[1], x_stack[2]
         tg, td, th = y_stack[0], y_stack[1], y_stack[2]
 
-        x_times = pd.to_datetime(sub_x[self._time_col], errors="coerce")
+        # Explicit format keeps __getitem__ on pandas's vectorized C path (instead of the
+        # per-element ``dateutil`` fallback, which warns and is ~50-100x slower).
+        x_times = pd.to_datetime(
+            sub_x[self._time_col], format="%Y-%m-%d %H:%M:%S", errors="coerce"
+        )
         if bool(x_times.isna().any()):
             raise ValueError(f"NaT in {self._time_col!r} for input window")
         timestamps = _folsom_to_timestamps(list(x_times))
@@ -906,7 +925,8 @@ class FolsomIrradianceDataset(Dataset):
 
         input_timestamps_utc = [str(pd.Timestamp(t)) for t in timestamps]
         forecast_timestamps_utc = [str(pd.Timestamp(t)) for t in forecast_timestamps]
-        dev_idx = torch.tensor(700)
+        # Single-sensor station; index into ``self.devDn_list = [0]``.
+        dev_idx = torch.tensor(700, dtype=torch.long)
 
         # Match PVDataset: pv is [1, T_in] (sensor/dev dim leading), target_pv is [T_out].
         pv_tensor = torch.from_numpy((ghi / 1100.0).astype(np.float32)).unsqueeze(0)
@@ -969,6 +989,24 @@ def collate_folsom_irradiance(batch: list[dict]) -> dict:
     return out
 
 
+def _resolve_folsom_dataset_paths(conf: dict, conf_path: Path) -> tuple[Path, Path, Path]:
+    """Return ``(pv_dir, skyimg_dir, satimg_dir)`` from a Folsom dataset YAML (new schema)."""
+    paths_cfg = conf.get("paths") or {}
+    raw_dd = paths_cfg.get("data_dir")
+    if raw_dd is None or str(raw_dd).strip() == "":
+        raise KeyError(f"dataset config paths.data_dir is required (in {conf_path})")
+    dd = Path(str(raw_dd))
+    data_dir = dd.resolve() if dd.is_absolute() else (_PROJECT_ROOT / dd).resolve()
+
+    def _req(key: str) -> Path:
+        v = paths_cfg.get(key)
+        if v is None or str(v).strip() == "":
+            raise KeyError(f"dataset config paths.{key} is required (in {conf_path})")
+        return (data_dir / Path(str(v))).resolve()
+
+    return _req("pv_path"), _req("sky_image_path"), _req("sat_path")
+
+
 def build_folsom_irradiance_datasets_from_conf(
     conf: dict | None = None,
     *,
@@ -977,46 +1015,64 @@ def build_folsom_irradiance_datasets_from_conf(
     skyimg_window_size: int | None = None,
 ) -> tuple[FolsomIrradianceDataset, FolsomIrradianceDataset]:
     """
-    Build train/test :class:`FolsomIrradianceDataset` from ``conf_folsom.yaml`` (or passed ``conf``).
+    Build train/test :class:`FolsomIrradianceDataset` from a Folsom dataset YAML (new schema:
+    ``config/datasets/conf_folsom.yaml``).
 
-    Reads the standard PVDataset-style ``training`` block (``pv_*`` keys) and Luoyang-style
-    ``paths.*`` (``pv_path``/``sky_image_path``/``sat_path``), so the same YAML can be used by
-    ``training/train_vit_test.py``. Lat/lon and the optional NWP merged CSV are read internally
-    by the dataset from ``conf_folsom.yaml``. ``train_epoch_len`` is set on the returned train
-    dataset by direct attribute assignment (the constructor mirrors PVDataset and does not take
-    it). If ``skyimg_window_size`` is set, it overrides ``training.skyimg_window_size``.
+    Reads ``paths.{data_dir, pv_path, sky_image_path, sat_path}`` and the ``sampling:`` section
+    (PVDataset-style window / stride / image-shape fields). Lat/lon comes from
+    ``<paths.data_dir>/info.yaml`` and the optional NWP merged CSV from
+    ``paths.folsom_nwp_merged_csv`` — both read inside the dataset constructor.
+
+    A ``conf_path`` is required (it is also forwarded to the dataset as ``config_path``); pass
+    ``conf`` if you've already loaded the YAML to avoid re-reading it. ``train_epoch_len`` is
+    written onto the returned train dataset (the constructor mirrors PVDataset and does not
+    take it). If ``skyimg_window_size`` is set, it overrides ``sampling.skyimg_window_size``.
     """
+    if conf_path is None:
+        raise TypeError("build_folsom_irradiance_datasets_from_conf: conf_path is required")
+    cfg_path = Path(conf_path)
     if conf is None:
-        conf = load_folsom_conf(conf_path)
-    h = get_training_hparams_from_conf(conf)
-    if skyimg_window_size is not None:
-        h["skyimg_window_size"] = int(skyimg_window_size)
+        conf = load_folsom_conf(cfg_path)
 
-    paths = get_training_paths_from_conf(conf)
-    pv_dir = paths["pv_dir"]
-    skyimg_dir = paths["skyimg_dir"]
-    # Folsom has no satellite data; the dataset stores satimg_dir but never reads from it.
-    satimg_dir = paths.get("satimg_dir", "")
+    sampling_cfg = conf.get("sampling") or {}
+    if not sampling_cfg:
+        raise KeyError(f"dataset config {cfg_path} is missing a non-empty 'sampling:' section")
+
+    def _req_s(key: str):
+        if key not in sampling_cfg:
+            raise KeyError(f"dataset config sampling.{key} is required (in {cfg_path})")
+        return sampling_cfg[key]
+
+    pv_dir, skyimg_dir, satimg_dir = _resolve_folsom_dataset_paths(conf, cfg_path)
+
+    sky_w = int(skyimg_window_size if skyimg_window_size is not None else _req_s("skyimg_window_size"))
+    shwc = _req_s("satimg_npy_shape_hwc")
+    if not isinstance(shwc, (list, tuple)) or len(shwc) != 3:
+        raise ValueError(f"sampling.satimg_npy_shape_hwc must be [H, W, C] (in {cfg_path})")
 
     kwargs: dict[str, Any] = dict(
-        csv_interval_min=int(h["csv_interval_min"]),
-        pv_input_interval_min=int(h["pv_input_interval_min"]),
-        pv_input_len=int(h["pv_input_len"]),
-        pv_output_interval_min=int(h["pv_output_interval_min"]),
-        pv_output_len=int(h["pv_output_len"]),
-        pv_train_time_fraction=float(h["pv_train_time_fraction"]),
-        test_anchor_stride_min=int(h["test_anchor_stride_min"]),
-        val_anchor_stride_min=int(h["val_anchor_stride_min"]),
-        test_collect_time_match_tolerance_min=int(h["test_collect_time_match_tolerance_min"]),
-        skyimg_window_size=int(h["skyimg_window_size"]),
-        skyimg_time_resolution_min=int(h["skyimg_time_resolution_min"]),
-        skyimg_spatial_size=int(h["skyimg_spatial_size"]),
-        satimg_window_size=int(h["satimg_window_size"]),
-        satimg_time_resolution_min=int(h["satimg_time_resolution_min"]),
-        satimg_npy_shape_hwc=tuple(int(x) for x in h["satimg_npy_shape_hwc"]),
+        config_path=str(cfg_path),
+        pv_dir=str(pv_dir),
+        skyimg_dir=str(skyimg_dir),
+        satimg_dir=str(satimg_dir),
+        csv_interval_min=int(_req_s("csv_interval_min")),
+        pv_input_interval_min=int(_req_s("pv_input_interval_min")),
+        pv_input_len=int(_req_s("pv_input_len")),
+        pv_output_interval_min=int(_req_s("pv_output_interval_min")),
+        pv_output_len=int(_req_s("pv_output_len")),
+        pv_train_time_fraction=float(_req_s("pv_train_time_fraction")),
+        test_anchor_stride_min=int(_req_s("test_anchor_stride_min")),
+        val_anchor_stride_min=int(_req_s("val_anchor_stride_min")),
+        test_collect_time_match_tolerance_min=int(_req_s("test_collect_time_match_tolerance_min")),
+        skyimg_window_size=sky_w,
+        skyimg_time_resolution_min=int(_req_s("skyimg_time_resolution_min")),
+        skyimg_spatial_size=int(_req_s("skyimg_spatial_size")),
+        satimg_window_size=int(_req_s("satimg_window_size")),
+        satimg_time_resolution_min=int(_req_s("satimg_time_resolution_min")),
+        satimg_npy_shape_hwc=tuple(int(x) for x in shwc),
     )
-    train_ds = FolsomIrradianceDataset(pv_dir, skyimg_dir, satimg_dir, split="train", **kwargs)
-    test_ds = FolsomIrradianceDataset(pv_dir, skyimg_dir, satimg_dir, split="test", **kwargs)
+    train_ds = FolsomIrradianceDataset(split="train", **kwargs)
+    test_ds = FolsomIrradianceDataset(split="test", **kwargs)
     train_ds._train_epoch_len = max(1, int(train_epoch_len))
     return train_ds, test_ds
 
@@ -1103,7 +1159,7 @@ def _find_csv_data_row_index_for_time(
         engine="c",
         memory_map=True,
     ):
-        ts = pd.to_datetime(chunk[time_col], errors="coerce")
+        ts = pd.to_datetime(chunk[time_col], format="%Y-%m-%d %H:%M:%S", errors="coerce")
         if getattr(ts.dt, "tz", None) is not None:
             ts = ts.dt.tz_convert("UTC").dt.tz_localize(None)
         ok = ts == tgt
@@ -1157,7 +1213,8 @@ def run_smoke_cli(argv: list[str] | None = None) -> int:
     Prints anchor/time windows, irradiance I/O (first/last steps), sky stats, NWP rows, then
     batched tensor shapes (train ``__getitem__`` uses random anchors, so batch rows differ).
 
-    Loads ``--conf`` (default ``config/conf_folsom.yaml``): CSV, sky JPEG dir, and NWP paths from disk.
+    Loads ``--conf`` (default ``config/datasets/conf_folsom.yaml``): CSV, sky JPEG dir, and NWP
+    paths come from that YAML; lat/lon comes from ``<paths.data_dir>/info.yaml``.
 
     Optional ``--last-input-time`` sets the anchor (last input CSV row time); default is first valid train anchor.
     """
@@ -1165,8 +1222,8 @@ def run_smoke_cli(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--conf",
         type=Path,
-        default=_FOLSOM_CONF_PATH,
-        help="Path to YAML (paths.data_dir + pv/sky/sat, NWP, site lat/lon).",
+        default=_DEFAULT_FOLSOM_DATASET_CONFIG,
+        help="Path to YAML (paths.data_dir + pv/sky/sat, NWP).",
     )
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--train-epoch-len", type=int, default=8, help="Dataset __len__ for train split smoke.")
@@ -1190,6 +1247,7 @@ def run_smoke_cli(argv: list[str] | None = None) -> int:
         conf = load_folsom_conf(args.conf)
         train_ds, test_ds = build_folsom_irradiance_datasets_from_conf(
             conf,
+            conf_path=args.conf,
             train_epoch_len=args.train_epoch_len,
             skyimg_window_size=args.skyimg_window,
         )
@@ -1197,8 +1255,9 @@ def run_smoke_cli(argv: list[str] | None = None) -> int:
         print(f"Failed to load Folsom data from {args.conf.resolve()}:\n  {e}", file=sys.stderr)
         print(
             "Fix paths.data_dir, paths.pv_path (folder with the irradiance CSV), "
-            "paths.sky_image_path, paths.sat_path (placeholder), paths.folsom_nwp_merged_csv, "
-            "and site.latitude/longitude in that YAML so files exist on disk.",
+            "paths.sky_image_path, paths.sat_path (placeholder), paths.folsom_nwp_merged_csv "
+            "in that YAML, and ensure <data_dir>/info.yaml provides site.latitude / "
+            "site.longitude so files exist on disk.",
             file=sys.stderr,
         )
         return 1

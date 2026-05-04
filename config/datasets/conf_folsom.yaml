@@ -10,15 +10,12 @@
 
 site:
   name: "Folsom, CA"
-  latitude: 38.642
-  longitude: -121.148
 
 paths:
   data_dir: "/work/folsom_dataset"
   # PVDataset reads this Excel via train_vit_test.py main() to build dev_dn_list.
   # FolsomIrradianceDataset itself never reads it (returns dev_idx=0 for the single GHI sensor),
   # so we keep the Luoyang Excel as a placeholder; trainer's nn.Embedding lookup still works.
-  pv_device_path: dataloader/XINSHENG_power_total_devices_type1.xlsx
   # FolsomIrradianceDataset globs `pv_path` for exactly one CSV (the Folsom irradiance file).
   pv_path: irradiance
   # Sky JPEGs (YYYYMMDDHHMMSS.jpg, UTC, ~1 minute resolution).
@@ -32,7 +29,7 @@ paths:
   folsom_nwp_merged_csv: NWP/nwp_merged_averaged.csv
 
 # Hyperparameters for training/train_vit_test.py (CLI flags override these when passed)
-training:
+sampling:
   # CSV row spacing (Folsom is 1-min; Luoyang was 5-min).
   csv_interval_min: 1
   # PVDataset / FolsomIrradianceDataset input window (X) and forecast window (Y).
@@ -56,11 +53,4 @@ training:
   satimg_window_size: 24
   satimg_time_resolution_min: 10
   satimg_npy_shape_hwc: [100, 100, 3]
-  # Optimization and training loop.
-  epochs: 50
-  lr: 5e-4
-  batch_size: 32
-  save_every: 5
-  num_workers: 8
-  # null = run every batch in an epoch
-  train_max_batches_per_epoch: null
+

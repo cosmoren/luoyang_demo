@@ -26,7 +26,7 @@ _DEFAULT_TRAIN_CONF_NAME = "conf_train.yaml"
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from dataloader.luoyang_mem import PVDataset, collate_batched
-# from dataloader.folsom import FolsomIrradianceDataset
+from dataloader.folsom import FolsomIrradianceDataset
 from models.models import pv_forecasting_model_vit_imgs
 
 
@@ -104,7 +104,7 @@ def train_one_epoch(
         B = d["device_id"].size(0)
         optimizer.zero_grad()
         pv_pred = forward_vit(model, d)
-        loss = criterion( (pv_pred * d["target_mask"])[:,0:16], (d["target_pv"] * d["target_mask"])[:,0:16])
+        loss = criterion( (pv_pred * d["target_mask"])[:,0], (d["target_pv"] * d["target_mask"])[:,0])
         # loss = criterion(pv_pred, d["target_pv"])
         loss.backward()
         optimizer.step()
@@ -127,7 +127,7 @@ def evaluate(
             d = _batch_to_device(batch, device)
             B = d["device_id"].size(0)
             pv_pred = forward_vit(model, d)
-            loss = criterion( (pv_pred * d["target_mask"])[:,0:16], (d["target_pv"] * d["target_mask"])[:,0:16] )
+            loss = criterion( (pv_pred * d["target_mask"])[:,0], (d["target_pv"] * d["target_mask"])[:,0] )
             # loss = criterion(pv_pred, d["target_pv"])
             total_loss += loss.item()
             n += B
@@ -136,10 +136,10 @@ def evaluate(
                 kk = int(d["device_id"][i].item()) # the inverter ID
                 # forecast_timefeats[:, 3] == cos_zenith (see solar_features_encoder column order)
                 # RMSE/MAE aggregation: first 16 horizons only (match training loss window)
-                cos_zenith = d["forecast_timefeats"][i][:16, 3].detach().cpu().float().numpy()
+                cos_zenith = d["forecast_timefeats"][i][0, 3].detach().cpu().float().numpy()
                 night = cos_zenith < 0
-                pred_np = pv_pred[i, :16].detach().cpu().float().numpy().copy()
-                tgt_np = d["target_pv"][i, :16].detach().cpu().float().numpy().copy()
+                pred_np = pv_pred[i, 0].detach().cpu().float().numpy().copy()
+                tgt_np = d["target_pv"][i, 0].detach().cpu().float().numpy().copy()
                 pred_np[night] = 0.0
                 # tgt_np[night] = 0.0
                 discrete_pred = pred_np.tolist()
@@ -163,11 +163,11 @@ def evaluate(
             else:
                 total_target = total_target + np.asarray(target_dict[kk]).reshape(-1)
         
-        
-        mae = np.mean(np.abs(total_pred*50 - total_target*50))
-        rmse = np.sqrt(np.mean((total_pred*50 - total_target*50) ** 2))
+        scale = 1100
+        mae = np.mean(np.abs(total_pred*scale - total_target*scale))
+        rmse = np.sqrt(np.mean((total_pred*scale - total_target*scale) ** 2))
 
-        capacity = 54600
+        capacity = 1100 # 54600
         print(f"RMSE/MAE on first 16 steps (15min), ~4h. Capacity: {capacity}(KW)")
         print(f"MAE: {mae:.6f}, RMSE: {rmse:.6f}, ACC(MAE): {1.0 - mae/capacity:.6f}, ACC(RMSE): {1.0 - rmse/capacity:.6f}")
     
@@ -367,19 +367,19 @@ def main() -> None:
     # different dataset (e.g. ``conf_folsom.yaml``). The chosen YAML supplies
     # ``paths.*`` and the ``sampling:`` section consumed by ``_dataset_kwargs``.
     # =========================================================================
-    DATASET_CLS = PVDataset
-    DATASET_CONFIG = "conf_luoyang.yaml" # config file for the luoyang dataset
-
-    train_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "train"))
-    val_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "val"))
-    test_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "test"))
-
-    # DATASET_CLS = FolsomIrradianceDataset
-    # DATASET_CONFIG = "conf_folsom.yaml" # config file for the folsom dataset
+    # DATASET_CLS = PVDataset
+    # DATASET_CONFIG = "conf_luoyang.yaml" # config file for the luoyang dataset
 
     # train_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "train"))
     # val_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "val"))
     # test_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "test"))
+
+    DATASET_CLS = FolsomIrradianceDataset
+    DATASET_CONFIG = "conf_folsom.yaml" # config file for the folsom dataset
+
+    train_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "train"))
+    val_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "val"))
+    test_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "test"))
 
     # =========================================================================
 
