@@ -41,7 +41,7 @@ sampling:
   # is required by the schema but only `pv_train_time_fraction` is read for legacy parity).
   pv_train_time_fraction: 0.7
   test_anchor_stride_min: 1500
-  val_anchor_stride_min: 1800
+  val_anchor_stride_min: 7000
   test_collect_time_match_tolerance_min: 0
   # Sky stack (last N JPEGs ending at the anchor).
   skyimg_window_size: 30

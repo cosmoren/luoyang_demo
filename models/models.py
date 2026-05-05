@@ -640,6 +640,7 @@ class pv_forecasting_model_vit_imgs(nn.Module):
             sat_compressed = self.sat_two_stage_compressor(sat_patch_tokens) + self.sat_mod_embed # [B,P=48,D=64]
 
         # sky images encoder
+        skimg_tensor = None
         if skimg_tensor is None or skimg_tensor.max() == 0:
             sky_compressed = torch.zeros(B, 48, 64, device=pv.device, dtype=pv.dtype) + self.sky_mod_embed
         else:
