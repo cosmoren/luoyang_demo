@@ -1,12 +1,12 @@
 """
-Batch-crop Himawari L2 cloud NetCDF files with ``nc_crop_mask`` and save float32 arrays as ``.npy``.
+Batch-crop Himawari L2 cloud NetCDF files with ``nc_crop_mask`` and save all samples into one ``.zarr``.
 
-Default input: ``/home/hw1/data/himawari2025L2cloud_raw``. All ``.npy`` go to one folder (default
-``.../himawari2025L2cloud_npy``) as ``YYYYMMDDHHMMSS.npy``: observation time is parsed from the NetCDF
-filename (standard ``NC_H09_YYYYMMDD_HHMM_...`` pattern, or the first valid 14-digit timestamp in the
-stem). Minute-only names get ``SS=00``. Duplicate stems get ``_2``, ``_3``, … before ``.npy``.
-Unreadable or corrupt NC/HDF files are skipped with a log line. Site lat/lon from ``config/conf.yaml``
-unless overridden.
+Default input: ``/home/hw1/data/himawari2025L2cloud_raw``. Output is one Zarr store folder (default
+``.../himawari2025L2cloud_all.zarr``) containing:
+  - ``merged`` with shape ``(time, y, x, channel)``
+  - ``ts_datetime`` on the ``time`` axis (UTC+0)
+Unreadable or corrupt NC/HDF files are skipped with a log line. Site lat/lon must be provided manually
+via command-line arguments.
 """
 
 from __future__ import annotations
@@ -14,14 +14,15 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from collections import Counter
 from datetime import datetime
 from pathlib import Path
+from pvlib import solarposition
 
 import numpy as np
-import yaml
+import pandas as pd
+import xarray as xr
 
-_ROOT = Path(__file__).resolve().parent.parent
+_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
@@ -30,6 +31,19 @@ from preprocessing.nc_processing import nc_crop_mask
 
 _NETCDF_SUFFIXES = {".nc", ".nc4"}
 _RE_14 = re.compile(r"\d{14}")
+
+
+def utc_to_local_solar_time_pvlib(utc_times: pd.DatetimeIndex, longitude: float) -> pd.DatetimeIndex:
+    """Convert UTC to local (apparent) solar time using longitude and pvlib equation of time."""
+    if utc_times.tz is not None:
+        utc_naive = utc_times.tz_convert("UTC").tz_localize(None)
+    else:
+        utc_naive = utc_times
+    lmst_offset_hours = longitude / 15.0
+    dayofyear = utc_naive.dayofyear
+    eot_minutes = solarposition.equation_of_time_spencer71(dayofyear)
+    local_solar = utc_naive + pd.Timedelta(hours=lmst_offset_hours) + pd.to_timedelta(eot_minutes, unit="m")
+    return local_solar
 
 
 def observation_stem_from_nc_path(path: Path) -> str | None:
@@ -53,18 +67,6 @@ def observation_stem_from_nc_path(path: Path) -> str | None:
     return None
 
 
-def _load_site_lat_lon() -> tuple[float, float]:
-    conf_path = _ROOT / "config" / "conf.yaml"
-    with open(conf_path) as f:
-        conf = yaml.safe_load(f)
-    site = conf.get("site") or {}
-    lat = site.get("latitude")
-    lon = site.get("longitude")
-    if lat is None or lon is None:
-        raise KeyError("config/conf.yaml must define site.latitude and site.longitude")
-    return float(lat), float(lon)
-
-
 def iter_netcdf_files(root: Path) -> list[Path]:
     files: list[Path] = []
     for p in sorted(root.rglob("*")):
@@ -75,10 +77,9 @@ def iter_netcdf_files(root: Path) -> list[Path]:
 
 def main() -> None:
     default_in = Path("/media/kyber/f166835a-9fa7-4966-844b-7eb1285d3654/himawari2025L2cloud_raw")
-    default_out = Path("/media/kyber/f166835a-9fa7-4966-844b-7eb1285d3654/himawari2025L2cloud_npy")
-    lat0, lon0 = _load_site_lat_lon()
+    default_out = Path("/media/kyber/f166835a-9fa7-4966-844b-7eb1285d3654/himawari2025L2cloud_all.zarr")
 
-    parser = argparse.ArgumentParser(description="Crop L2 cloud NC to site ROI and write .npy")
+    parser = argparse.ArgumentParser(description="Crop L2 cloud NC to site ROI and write one aggregated .zarr")
     parser.add_argument(
         "--in-dir",
         type=Path,
@@ -89,10 +90,10 @@ def main() -> None:
         "--out-dir",
         type=Path,
         default=default_out,
-        help=f"Single directory for all .npy files (default: {default_out})",
+        help=f"Output Zarr store folder path (default: {default_out})",
     )
-    parser.add_argument("--lat", type=float, default=None, help="Override center latitude")
-    parser.add_argument("--lon", type=float, default=None, help="Override center longitude")
+    parser.add_argument("--lat", type=float, required=True, help="Center latitude")
+    parser.add_argument("--lon", type=float, required=True, help="Center longitude")
     parser.add_argument(
         "--size-km",
         type=float,
@@ -108,7 +109,13 @@ def main() -> None:
     parser.add_argument(
         "--skip-existing",
         action="store_true",
-        help="Skip if target .npy already exists",
+        help="Skip entire run if output Zarr store already exists",
+    )
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=100,
+        help="Log progress every N files (default: 100)",
     )
     args = parser.parse_args()
 
@@ -116,8 +123,8 @@ def main() -> None:
     if not in_dir.is_dir():
         raise FileNotFoundError(f"Input directory not found: {in_dir}")
 
-    lat = float(args.lat) if args.lat is not None else lat0
-    lon = float(args.lon) if args.lon is not None else lon0
+    lat = float(args.lat)
+    lon = float(args.lon)
 
     paths = iter_netcdf_files(in_dir)
     if not paths:
@@ -140,64 +147,92 @@ def main() -> None:
         print("No files with parseable observation time in filename.")
         return
 
-    dup_counts = Counter(st for _, st in pairs)
-    collisions = sorted(s for s, c in dup_counts.items() if c > 1)
-    if collisions:
-        print(
-            "Note: duplicate observation stems (suffix _2, _3, … in output): "
-            + ", ".join(collisions[:20])
-            + (" ..." if len(collisions) > 20 else "")
-        )
-
-    out_dir = args.out_dir.resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    per_stem_idx: dict[str, int] = {}
-    jobs: list[tuple[Path, Path]] = []
-    for nc_path, stem in pairs:
-        n = per_stem_idx.get(stem, 0)
-        per_stem_idx[stem] = n + 1
-        if n == 0:
-            out_path = out_dir / f"{stem}.npy"
-        else:
-            out_path = out_dir / f"{stem}_{n + 1}.npy"
-        jobs.append((nc_path, out_path))
+    out_store = args.out_dir.resolve()
+    out_store.parent.mkdir(parents=True, exist_ok=True)
+    if args.skip_existing and out_store.exists():
+        print(f"Output already exists, skip: {out_store}")
+        return
 
     print(f"Using lat={lat}, lon={lon}, size_km={args.size_km}, resample_size={args.resample_size}")
-    print(f"Output directory: {out_dir}")
+    print(f"Output zarr store: {out_store}")
 
     n_written = 0
-    n_skipped_exist = 0
     n_skipped_bad = 0
+    n_seen = 0
+    failed_hdf: list[str] = []
+    merged_list: list[np.ndarray] = []
+    ts_datetime_list: list[datetime] = []
 
-    for i, (nc_path, out_path) in enumerate(jobs, 1):
-        if args.skip_existing and out_path.is_file():
-            print(f"[{i}/{len(jobs)}] skip (exists): {out_path.name}")
-            n_skipped_exist += 1
-            continue
-
-        print(f"[{i}/{len(jobs)}] {nc_path.name} -> {out_path.name}")
+    for i, (nc_path, _) in enumerate(pairs, 1):
+        n_seen += 1
+        if i == 1 or i % args.log_every == 0:
+            print(f"[{i}/{len(pairs)}] process: {nc_path.name}", flush=True)
         try:
-            merged = nc_crop_mask(
+            merged, ts_datetime, ts_string = nc_crop_mask(
                 str(nc_path),
                 lat0=lat,
                 lon0=lon,
                 size_km=args.size_km,
                 resample_size=args.resample_size,
             )
-            np.save(out_path, merged)
+
+            merged_list.append(merged.astype(np.float32))
+            ts_datetime_list.append(ts_datetime)
             n_written += 1
         except OSError as e:
-            print(f"         SKIP (HDF/NetCDF read error): {e}")
+            print(f"         SKIP (HDF/NetCDF read error): {e}", flush=True)
+            failed_hdf.append(str(nc_path))
             n_skipped_bad += 1
         except Exception as e:
-            print(f"         SKIP ({type(e).__name__}): {e}")
+            print(f"         SKIP ({type(e).__name__}): {e}", flush=True)
             n_skipped_bad += 1
 
-    print(
-        f"Done. written={n_written} skipped_bad={n_skipped_bad} "
-        f"skipped_existing={n_skipped_exist} skipped_unparseable_name={n_skipped_name}"
+    if not merged_list:
+        print("No valid samples to write.")
+        return
+
+    merged_arr = np.stack(merged_list, axis=0).astype(np.float32)
+    ts_index = pd.DatetimeIndex(ts_datetime_list)
+    ts_datetime_utc = ts_index.to_numpy(dtype="datetime64[ns]")
+    local_solar = utc_to_local_solar_time_pvlib(ts_index, lon)
+    solpos = solarposition.get_solarposition(ts_index, lat, lon)
+    azimuth_arr = solpos["azimuth"].to_numpy(dtype=np.float32)
+    zenith_arr = solpos["zenith"].to_numpy(dtype=np.float32)
+    day_of_year_arr = local_solar.dayofyear.to_numpy(dtype=np.int32)
+    hour_of_day_arr = (
+        local_solar.hour
+        + local_solar.minute / 60.0
+        + local_solar.second / 3600.0
+    ).to_numpy(dtype=np.float32)
+    local_solar_time_arr = local_solar.to_numpy(dtype="datetime64[ns]")
+
+    ds_out = xr.Dataset(
+        data_vars={
+            "images": (("time_utc", "channel", "H", "W"), merged_arr.transpose(0, 3, 1, 2)),
+            "zenith": (("time_utc",), zenith_arr),
+            "azimuth": (("time_utc",), azimuth_arr),
+            "day_of_year": (("time_utc",), day_of_year_arr),
+            "hour_of_day": (("time_utc",), hour_of_day_arr),
+            "local_solar_time": (("time_utc",), local_solar_time_arr),
+        },
+        coords={
+            "time_utc": ts_datetime_utc,
+            "channel": ["CLOT", "CLOT_MASK"],
+        },
     )
+    ds_out["time_utc"].attrs["timezone"] = "UTC+0"
+    ds_out.attrs["latitude"] = lat
+    ds_out.attrs["longitude"] = lon
+    ds_out.to_zarr(str(out_store), mode="w")
+
+    print(
+        f"Done. seen={n_seen} written={n_written} skipped_bad={n_skipped_bad} "
+        f"skipped_unparseable_name={n_skipped_name} output={out_store}"
+    )
+    if failed_hdf:
+        print("HDF/NetCDF failed files:")
+        for p in failed_hdf:
+            print(f"  {p}")
 
 
 if __name__ == "__main__":
