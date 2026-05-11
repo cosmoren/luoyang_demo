@@ -324,10 +324,6 @@ def ne_total_partial_blank():
     """Running aggregate for one UTC collectTime (one row added per station file)."""
     return {
         "n": 0,
-        "lat_sum": 0.0,
-        "lat_n": 0,
-        "lon_sum": 0.0,
-        "lon_n": 0,
         "cap_sum": 0.0,
         "has_512": False,
         "eff_sum": 0.0,
@@ -347,14 +343,6 @@ def ne_total_partial_add(partials: dict, utc_key: str, row: dict) -> None:
     """Incorporate one station row into the running totals for utc_key."""
     p = partials.setdefault(utc_key, ne_total_partial_blank())
     p["n"] += 1
-    lat = parse_float(row["latitude_device"])
-    if lat != -1.0:
-        p["lat_sum"] += lat
-        p["lat_n"] += 1
-    lon = parse_float(row["longitude_device"])
-    if lon != -1.0:
-        p["lon_sum"] += lon
-        p["lon_n"] += 1
     p["cap_sum"] += parse_float(row["capacity"])
     if int(round(parse_float(row["inverter_state"]))) == 512:
         p["has_512"] = True
@@ -370,7 +358,7 @@ def ne_total_partial_add(partials: dict, utc_key: str, row: dict) -> None:
     p["mppt_tot_sum"] += parse_float(row["mppt_total_cap"])
 
 
-def ne_total_partial_finalize(p: dict, utc_key: str) -> dict:
+def ne_total_partial_finalize(p: dict, utc_key: str, lat: float, lon: float) -> dict:
     """Turn running totals into one NE=total row (same rules as former aggregate_ne_total_row)."""
     n = p["n"]
     if n == 0:
@@ -378,16 +366,14 @@ def ne_total_partial_finalize(p: dict, utc_key: str) -> dict:
         out["stationCode"] = "NE=total"
         out["devDn"] = "NE=total"
         out["collectTime"] = utc_key
+        out["latitude_device"] = fmt_number(lat)
+        out["longitude_device"] = fmt_number(lon)
         return out
     inv = 512 if p["has_512"] else 0
     return {
         "stationCode": "NE=total",
-        "latitude_device": fmt_number(
-            (p["lat_sum"] / p["lat_n"]) if p["lat_n"] else 0.0
-        ),
-        "longitude_device": fmt_number(
-            (p["lon_sum"] / p["lon_n"]) if p["lon_n"] else 0.0
-        ),
+        "latitude_device": fmt_number(lat),
+        "longitude_device": fmt_number(lon),
         "capacity": fmt_number(p["cap_sum"] / n),
         "collectTime": utc_key,
         "devDn": "NE=total",
@@ -405,10 +391,11 @@ def ne_total_partial_finalize(p: dict, utc_key: str) -> dict:
     }
 
 
-def write_ne_total(output_dir: Path):
+def write_ne_total(output_dir: Path, lat: float, lon: float):
     """Combine all per-devDn CSVs (excluding NE_total.csv) into NE_total.csv.
 
     Reads one device file at a time; peak RAM is O(number of UTC timesteps), not O(stations × timesteps).
+    Solar geometry is computed using the externally supplied ``lat``/``lon``.
     """
     dev_paths = sorted(
         p for p in output_dir.glob("*.csv") if p.name != NE_TOTAL_FILENAME
@@ -433,16 +420,7 @@ def write_ne_total(output_dir: Path):
                     continue
                 ne_total_partial_add(partials, ct, row)
 
-    # Representative (lat, lon) for solar geometry: weighted mean of valid
-    # per-timestep contributions. lat/lon are essentially constant across all
-    # devices in one plant, so a single (lat, lon) is fine for the whole file.
-    lat_sum_total = sum(p["lat_sum"] for p in partials.values())
-    lat_n_total = sum(p["lat_n"] for p in partials.values())
-    lon_sum_total = sum(p["lon_sum"] for p in partials.values())
-    lon_n_total = sum(p["lon_n"] for p in partials.values())
-    ref_lat = (lat_sum_total / lat_n_total) if lat_n_total else 0.0
-    ref_lon = (lon_sum_total / lon_n_total) if lon_n_total else 0.0
-    sun = compute_solar_arrays(utc_index_for_grid(), ref_lat, ref_lon)
+    sun = compute_solar_arrays(utc_index_for_grid(), lat, lon)
 
     keys = ordered_utc_collect_time_keys()
     out_path = output_dir / NE_TOTAL_FILENAME
@@ -464,14 +442,14 @@ def write_ne_total(output_dir: Path):
                 for _ in range(need):
                     ne_total_partial_add(partials, utc_key, z)
                 p = partials[utc_key]
-            row = ne_total_partial_finalize(p, utc_key)
+            row = ne_total_partial_finalize(p, utc_key, lat, lon)
             row.update(solar_fields_at(sun, i))
             writer.writerow(row)
 
     print(f"Wrote {out_path}")
 
 
-def main(input_dir: Path, output_dir: Path):
+def main(input_dir: Path, output_dir: Path, lat: float, lon: float):
     input_dir = input_dir.resolve()
     output_dir = output_dir.resolve()
     os.makedirs(output_dir, exist_ok=True)
@@ -504,19 +482,7 @@ def main(input_dir: Path, output_dir: Path):
                 staging_dir / safe_devdn_filename(devdn)
             )
 
-            # Pick a stable (lat, lon) for this device for solar geometry. Prefer
-            # first_row, but fall back to scanning rows if it's missing/sentinel.
-            dev_lat = parse_float(first_row.get("latitude_device", ""))
-            dev_lon = parse_float(first_row.get("longitude_device", ""))
-            if dev_lat in (0.0, -1.0) or dev_lon in (0.0, -1.0):
-                for r in time_to_row.values():
-                    lat_v = parse_float(r.get("latitude_device", ""))
-                    lon_v = parse_float(r.get("longitude_device", ""))
-                    if lat_v not in (0.0, -1.0) and lon_v not in (0.0, -1.0):
-                        dev_lat, dev_lon = lat_v, lon_v
-                        break
-
-            sun = compute_solar_arrays(utc_idx, dev_lat, dev_lon)
+            sun = compute_solar_arrays(utc_idx, lat, lon)
 
             out_path = output_dir / safe_devdn_filename(devdn)
             with open(out_path, "w", encoding="utf-8", newline="") as out:
@@ -531,14 +497,14 @@ def main(input_dir: Path, output_dir: Path):
                         row["collectTime"] = ts_str
                         row["stationCode"] = first_row.get("stationCode") or ""
                         row["devDn"] = devdn
-                        row["latitude_device"] = first_row.get("latitude_device") or "0"
-                        row["longitude_device"] = first_row.get("longitude_device") or "0"
+                        row["latitude_device"] = fmt_number(lat)
+                        row["longitude_device"] = fmt_number(lon)
                     row.update(solar_fields_at(sun, i))
                     writer.writerow(row)
     finally:
         shutil.rmtree(staging_dir, ignore_errors=True)
 
-    write_ne_total(output_dir)
+    write_ne_total(output_dir, lat, lon)
 
     print(f"Done. Output directory: {output_dir}")
     print(f"Per-devDn files: {len(unique_devdns)}, plus {NE_TOTAL_FILENAME}")
@@ -559,13 +525,25 @@ def parse_args():
         "-o",
         "--output",
         type=Path,
-        default='/data/data/luoayng_data_626',
+        default='/data/data/luoyang_data_626',
         help="Directory for per-devDn CSVs and NE_total.csv (default: <input>/aggregated_by_devDn).",
+    )
+    p.add_argument(
+        "--lat",
+        type=float,
+        default=34.69984,
+        help="Site latitude (decimal degrees) used for solar geometry of all devices (default: 34.68).",
+    )
+    p.add_argument(
+        "--lon",
+        type=float,
+        default=112.28440,
+        help="Site longitude (decimal degrees) used for solar geometry of all devices (default: 112.45).",
     )
     args = p.parse_args()
     input_dir = args.input.expanduser()
     output_dir = args.output.expanduser() if args.output is not None else input_dir / "aggregated_by_devDn"
-    return input_dir, output_dir
+    return input_dir, output_dir, args.lat, args.lon
 
 
 if __name__ == "__main__":

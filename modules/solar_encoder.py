@@ -17,18 +17,42 @@ def utc_to_local_solar_time_pvlib(utc_times: pd.DatetimeIndex, longitude: float)
     return local_solar
 
 
+def extract_solar_features(df) -> dict[str, np.ndarray]:
+    """Return per-timestep solar features as a dict of ``np.ndarray``s (length T)."""
+    local_solar_parsed = pd.to_datetime(
+        df["local_solar_time"], format="%Y-%m-%d %H:%M:%S", errors="coerce"
+    )
+    local_solar_parsed_us = pd.to_datetime(
+        df["local_solar_time"], format="%Y-%m-%d %H:%M:%S.%f", errors="coerce"
+    )
+    local_solar = local_solar_parsed.fillna(local_solar_parsed_us).values
+
+    azimuth = pd.to_numeric(df["solar_azimuth"], errors="coerce").fillna(0).values.astype(np.float32)
+    zenith = pd.to_numeric(df["solar_zenith"], errors="coerce").fillna(0).values.astype(np.float32)
+    day_of_year = pd.to_numeric(df["day_of_year"], errors="coerce").fillna(0).values.astype(np.int32)
+    hour_of_day = pd.to_numeric(df["hour_of_day"], errors="coerce").fillna(0).values.astype(np.float32)
+
+    return {
+        "local_solar_time": local_solar,
+        "azimuth": azimuth,
+        "zenith": zenith,
+        "day_of_year": day_of_year,
+        "hour_of_day": hour_of_day,
+    }
+
+
+
 def compute_solar_features(
     forecast_timestamps_utc, latitude: float, longitude: float
-) -> list[dict]:
+) -> dict[str, np.ndarray]:
     """
     From UTC forecast times and site lat/lon, compute per timestep:
-    - local_solar_time: apparent solar time at the site (naive datetime)
+    - local_solar_time: apparent solar time at the site (naive datetime64[ns])
     - azimuth: sun azimuth (degrees)
-    - sin_azimuth, cos_azimuth: sin and cos of azimuth (radians)
     - zenith: sun zenith angle (degrees)
     - day_of_year: 1-366
     - hour_of_day: hour in local solar time (0-24, decimal)
-    Returns a list of dicts, one per timestep.
+    Returns a dict of length-T ``np.ndarray``s (one entry per field).
     """
     times_utc = pd.to_datetime(forecast_timestamps_utc)
     if times_utc.tz is None:
@@ -36,49 +60,57 @@ def compute_solar_features(
     else:
         times_utc = times_utc.tz_convert("UTC")
 
-    # Local solar time (naive)
     local_solar = utc_to_local_solar_time_pvlib(times_utc, longitude)
 
-    # Sun position (pvlib expects localized times; uses UTC)
     solpos = solarposition.get_solarposition(times_utc, latitude, longitude)
-    azimuth = solpos["azimuth"].values
-    zenith = solpos["zenith"].values
+    azimuth = solpos["azimuth"].values.astype(np.float32)
+    zenith = solpos["zenith"].values.astype(np.float32)
 
-    day_of_year = local_solar.dayofyear.values
+    day_of_year = local_solar.dayofyear.values.astype(np.int32)
     hour_of_day = (
         local_solar.hour.values
         + local_solar.minute.values / 60.0
         + local_solar.second.values / 3600.0
-    )
+    ).astype(np.float32)
 
-    return [
-        {
-            "local_solar_time": local_solar[i].floor("us").to_pydatetime(),
-            "azimuth": float(azimuth[i]),
-            "zenith": float(zenith[i]),
-            "day_of_year": int(day_of_year[i]),
-            "hour_of_day": float(hour_of_day[i]),
-        }
-        for i in range(len(times_utc))
-    ]
+    return {
+        "local_solar_time": local_solar.values,
+        "azimuth": azimuth,
+        "zenith": zenith,
+        "day_of_year": day_of_year,
+        "hour_of_day": hour_of_day,
+    }
 
-def solar_features_encoder(solar_features):
-    solar_features_array = []
-    for solar_feature in solar_features:
-        azimuth_rad = np.deg2rad(solar_feature['azimuth'])
-        sin_azimuth = np.sin(azimuth_rad)
-        cos_azimuth = np.cos(azimuth_rad)
-        zenith_rad = np.deg2rad(solar_feature['zenith'])
-        sin_zenith = np.sin(zenith_rad)
-        cos_zenith = np.cos(zenith_rad)
-        cos_hod = np.cos(2*np.pi*solar_feature['hour_of_day']/24)
-        sin_hod = np.sin(2*np.pi*solar_feature['hour_of_day']/24)
-        cos_dofy = np.cos(2*np.pi*solar_feature['day_of_year']/366)
-        sin_dofy = np.sin(2*np.pi*solar_feature['day_of_year']/366)
-        solar_features_array.append(np.array([sin_azimuth, cos_azimuth, sin_zenith, cos_zenith, sin_dofy, cos_dofy, sin_hod, cos_hod]))
-    solar_features_array = np.asarray(solar_features_array).astype(np.float32)
-    solar_features_tensor = torch.from_numpy(solar_features_array)
-    return solar_features_tensor
+def solar_features_encoder(solar_features: dict[str, np.ndarray]) -> torch.Tensor:
+    """Vectorized encoder. ``solar_features`` is a dict of length-T arrays:
+    ``azimuth`` / ``zenith`` (deg), ``hour_of_day`` (0-24), ``day_of_year`` (1-366).
+    Returns a ``[T, 8]`` float32 tensor with columns
+    ``[sin_az, cos_az, sin_ze, cos_ze, sin_doy, cos_doy, sin_hod, cos_hod]``.
+    """
+    azimuth = np.asarray(solar_features["azimuth"], dtype=np.float32)
+    zenith = np.asarray(solar_features["zenith"], dtype=np.float32)
+    hour_of_day = np.asarray(solar_features["hour_of_day"], dtype=np.float32)
+    day_of_year = np.asarray(solar_features["day_of_year"], dtype=np.float32)
+
+    azimuth_rad = np.deg2rad(azimuth)
+    zenith_rad = np.deg2rad(zenith)
+    hod_rad = (2.0 * np.pi / 24.0) * hour_of_day
+    doy_rad = (2.0 * np.pi / 366.0) * day_of_year
+
+    feats = np.stack(
+        [
+            np.sin(azimuth_rad),
+            np.cos(azimuth_rad),
+            np.sin(zenith_rad),
+            np.cos(zenith_rad),
+            np.sin(doy_rad),
+            np.cos(doy_rad),
+            np.sin(hod_rad),
+            np.cos(hod_rad),
+        ],
+        axis=-1,
+    ).astype(np.float32, copy=False)
+    return torch.from_numpy(feats)
 
 def _as_utc_naive_pd(ts) -> pd.Timestamp:
     """Normalize to UTC wall-clock as tz-naive so deltas are well-defined across mixed inputs."""

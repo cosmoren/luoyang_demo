@@ -543,7 +543,7 @@ class pv_forecasting_model_vit_imgs(nn.Module):
                            529, 532, 535, 538, 541, 544, 547, 550, 553, 556, 559, 562, 565, 568, 571, 574]
         self.learnable_pv_queries = nn.Parameter(torch.randn(1, 48, 64))
         self.cross_attention_pv_compression = CrossAttention(query_dim=64, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)        
-        self.query_mlp = MLP(in_dim=12, hidden_dims=(64, 64), out_dim=64, dropout=0.0)
+        self.query_mlp = MLP(in_dim=11, hidden_dims=(64, 64), out_dim=64, dropout=0.0)
 
         self.sat_embed_dim = 64
         self.sat_patch_embed = VideoPatchSpatiotemporalEmbed(
@@ -616,13 +616,17 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         ssrd_normalized = (nwp_tensor[:,:,0]/1000 - 0.5)*2
         # msl_normalized = (nwp_tensor[:,:,1]-101325)/1000
         t2m_normalized = (nwp_tensor[:,:,2]-288.15)/10
-        forecast_ssrd_timefeats = torch.cat([forecast_timefeats, ssrd_normalized.unsqueeze(2), t2m_normalized.unsqueeze(2), nwp_tensor[:,:,-1].unsqueeze(2)], dim=2)
+        forecast_ssrd_timefeats = torch.cat([forecast_timefeats, ssrd_normalized.unsqueeze(2), t2m_normalized.unsqueeze(2)], dim=2)
         forecast_query = self.query_mlp(forecast_ssrd_timefeats)
 
         # satellite images encoder
         B, T_out, _ = forecast_query.shape
+        pv_mask = torch.ones(B, 48, device=pv.device, dtype=pv.dtype)
+
+        sat_tensor = None
         if sat_tensor is None or sat_tensor.max() == 0:
             sat_compressed = torch.zeros(B, 48, 64, device=pv.device, dtype=pv.dtype) + self.sat_mod_embed
+            sat_mask = torch.zeros(B, 48, device=pv.device, dtype=pv.dtype)
         else:
             B_sat, T_sat, C_sat, H_sat, W_sat = sat_tensor.shape
             if C_sat != 3:
@@ -638,11 +642,13 @@ class pv_forecasting_model_vit_imgs(nn.Module):
             sat_patch_tokens = self.sat_alt_attn(sat_patch_tokens)  # [B,T=24,P=196,D=64]
 
             sat_compressed = self.sat_two_stage_compressor(sat_patch_tokens) + self.sat_mod_embed # [B,P=48,D=64]
+            sat_mask = torch.ones(B, 48, device=pv.device, dtype=pv.dtype)
 
         # sky images encoder
         skimg_tensor = None
         if skimg_tensor is None or skimg_tensor.max() == 0:
             sky_compressed = torch.zeros(B, 48, 64, device=pv.device, dtype=pv.dtype) + self.sky_mod_embed
+            sky_mask = torch.zeros(B, 48, device=pv.device, dtype=pv.dtype)
         else:
             B_sky, T_sky, C_sky, H_sky, W_sky = skimg_tensor.shape
             if C_sky != 3:
@@ -661,9 +667,12 @@ class pv_forecasting_model_vit_imgs(nn.Module):
             )
             sky_patch_tokens = self.sky_alt_attn(sky_patch_tokens)
             sky_compressed = self.sky_two_stage_compressor(sky_patch_tokens) + self.sky_mod_embed
+            sky_mask = torch.ones(B, 48, device=pv.device, dtype=pv.dtype)
 
         hist_mem_compressed = torch.cat([KV_hist_mem_compressed, sat_compressed, sky_compressed], dim=1)
-        forecast_pv_features = self.cross_attention_pv(query=forecast_query, key=hist_mem_compressed, value=hist_mem_compressed)
+        key_value_mask = torch.cat([pv_mask, sat_mask, sky_mask], dim=1)
+
+        forecast_pv_features = self.cross_attention_pv(query=forecast_query, key=hist_mem_compressed, value=hist_mem_compressed, key_value_mask=key_value_mask)
 
         # Inverter features (embeddings)
         inverter_features = self.inverter_embedding(device_id).unsqueeze(1).repeat(1, forecast_pv_features.shape[1], 1)

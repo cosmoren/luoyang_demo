@@ -223,6 +223,7 @@ def main() -> None:
     ds_out["time_utc"].attrs["timezone"] = "UTC+0"
     ds_out.attrs["latitude"] = lat
     ds_out.attrs["longitude"] = lon
+    ds_out = ds_out.chunk({"time_utc": 24, "channel": 2, "H": 100, "W": 100})
     ds_out.to_zarr(str(out_store), mode="w")
 
     print(
