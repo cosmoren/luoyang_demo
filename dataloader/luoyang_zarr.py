@@ -808,25 +808,13 @@ class PVDataset(Dataset):
         sat_tensor = torch.from_numpy(
             np.asarray(sat_data['images'].values, dtype=np.float32)
         )
-        ones_channel = torch.ones(
-            (sat_tensor.shape[0], 1, sat_tensor.shape[2], sat_tensor.shape[3]),
-            dtype=sat_tensor.dtype,
-        )
-        sat_tensor = torch.cat([sat_tensor, ones_channel], dim=1)
 
-        if sat_timefeats.shape[0]>=self.satimg_window_size:
-            sat_timefeats = sat_timefeats[-self.satimg_window_size:, :]
+        if sat_tensor.shape[0]>24:
+            sat_tensor = sat_tensor[-24:, :, :, :]
+            sat_timefeats = sat_timefeats[-24:, :]
         else:
-            sat_timefeats = torch.cat([torch.zeros(self.satimg_window_size-sat_timefeats.shape[0], sat_timefeats.shape[1]), sat_timefeats], dim=0)
-
-        if sat_tensor.shape[0] >= self.satimg_window_size:
-            sat_tensor = sat_tensor[-self.satimg_window_size:]
-        else:
-            pad = torch.zeros(
-                (self.satimg_window_size - sat_tensor.shape[0],) + tuple(sat_tensor.shape[1:]),
-                dtype=sat_tensor.dtype,
-            )
-            sat_tensor = torch.cat([pad, sat_tensor], dim=0)
+            sat_tensor = torch.cat([torch.zeros(24-sat_tensor.shape[0], sat_tensor.shape[1], sat_tensor.shape[2], sat_tensor.shape[3]), sat_tensor], dim=0)
+            sat_timefeats = torch.cat([torch.zeros(24-sat_timefeats.shape[0], sat_timefeats.shape[1]), sat_timefeats], dim=0)
 
         # Select sky images from the window
         sky_t0 = time0_utc - timedelta(minutes=(30))

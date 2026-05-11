@@ -10,7 +10,7 @@ paths:
   # Training / eval data (single folder each under data_dir; train and test use the same roots)
   sky_image_path: skimg_zarr
   pv_path: pv_sf1
-  sat_path: sat_himawari_zarr
+  sat_path: sat_himawari_zarr1
   nwp_path: NWP
 
 # Hyperparameters for training/train.py (CLI flags override these when passed)

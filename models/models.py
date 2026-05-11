@@ -623,7 +623,6 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         B, T_out, _ = forecast_query.shape
         pv_mask = torch.ones(B, 48, device=pv.device, dtype=pv.dtype)
 
-        sat_tensor = None
         if sat_tensor is None or sat_tensor.max() == 0:
             sat_compressed = torch.zeros(B, 48, 64, device=pv.device, dtype=pv.dtype) + self.sat_mod_embed
             sat_mask = torch.zeros(B, 48, device=pv.device, dtype=pv.dtype)
