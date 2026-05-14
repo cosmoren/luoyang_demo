@@ -637,11 +637,15 @@ class pv_forecasting_model_vit_imgs(nn.Module):
                 align_corners=False,
             ).view(B_sat, T_sat, 3, 112, 112)
 
-            sat_patch_tokens = patchify_spatiotemporal_images(sat_hr, self.sat_patch_embed, timefeats=sat_timefeats)
-            sat_patch_tokens = self.sat_alt_attn(sat_patch_tokens)  # [B,T=24,P=196,D=64]
-
-            sat_compressed = self.sat_two_stage_compressor(sat_patch_tokens) + self.sat_mod_embed # [B,P=48,D=64]
-            sat_mask = torch.ones(B, 48, device=pv.device, dtype=pv.dtype)
+            sat_patch_tokens = patchify_spatiotemporal_images(sat_hr, self.sat_patch_embed, timefeats=sat_timefeats[:,:,-1].unsqueeze(2))
+            sat_patch_tokens = self.sat_alt_attn(sat_patch_tokens)  # [B,T=24,P=49,D=64]
+            sat_start = sat_timefeats[:, 0, -1]   # [B]
+            sat_end   = sat_timefeats[:, -1, -1]  # [B]
+            sat_steps = torch.linspace(0, 1, 48, device=sat_patch_tokens.device)
+            sat_query_times = sat_start[:, None] + (sat_end - sat_start)[:, None] * sat_steps  # [B, 48]
+            sat_compressed = self.sat_two_stage_compressor(sat_patch_tokens, sat_query_times) + self.sat_mod_embed  # [B,P=48,D=64]
+            # print('sat_patch_tokens: ', sat_patch_tokens.shape, sat_compressed.shape)
+            sat_mask = torch.ones(B, sat_compressed.shape[1], device=pv.device, dtype=pv.dtype)
 
         # sky images encoder
         skimg_tensor = None

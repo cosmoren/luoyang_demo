@@ -17,6 +17,24 @@ def build_1d_sincos_pos_embed(length: int, dim: int, device=None) -> torch.Tenso
     return emb
 
 
+def build_continuous_time_embed(times: torch.Tensor, dim: int) -> torch.Tensor:
+    """Sinusoidal embedding for arbitrary continuous time values.
+
+    Args:
+        times: float tensor of shape ``[Qs]`` or ``[B, Qs]``, delta_t values
+               (e.g. hours relative to t0, can be negative / non-integer).
+        dim:   embedding dimension (must be even).
+
+    Returns:
+        Tensor of shape ``[..., Qs, dim]`` matching the leading dims of ``times``.
+    """
+    assert dim % 2 == 0
+    omega = torch.arange(dim // 2, device=times.device, dtype=torch.float32)
+    omega = 1.0 / (10000 ** (omega / (dim // 2)))  # [D/2]
+    out = times.unsqueeze(-1).float() * omega  # [..., Qs, D/2]
+    return torch.cat([torch.sin(out), torch.cos(out)], dim=-1)
+
+
 def build_2d_sincos_pos_embed(h: int, w: int, dim: int, device=None) -> torch.Tensor:
     """
     Return: [h*w, dim]
@@ -212,12 +230,7 @@ class SatelliteTwoStageCompressor(nn.Module):
         # stage 2 global queries
         self.sat_queries = nn.Parameter(torch.randn(1, num_sat_queries, dim) * 0.02)
 
-        # coarse time prior for final sat queries
-        # Here: 24 frames covering past 5h; you can customize these centers
-        # Example: 48 query centers from -5h to 0h
-        coarse_t = torch.linspace(-5.0, 0.0, num_sat_queries)
-        coarse_t_embed = build_1d_sincos_pos_embed(num_sat_queries, dim)  # default order embedding
-        # You can replace above with MLP(real_times). Here I keep it simple.
+        coarse_t_embed = build_1d_sincos_pos_embed(num_sat_queries, dim)
         self.register_buffer("coarse_time_embed", coarse_t_embed.unsqueeze(0), persistent=False)
 
         # optional coarse spatial prior for final sat queries
@@ -237,10 +250,16 @@ class SatelliteTwoStageCompressor(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        query_times: torch.Tensor | None = None,
         return_stage1: bool = False,
     ):
         """
-        x: [B, T, P, D]
+        Args:
+            x:           ``[B, T, P, D]`` satellite patch tokens.
+            query_times: optional float tensor of shape ``[B, Qs]`` or ``[Qs]``,
+                         delta_t of each sat query relative to t0 (e.g. in hours).
+                         When provided, replaces the fixed ``coarse_time_embed``.
+            return_stage1: if True also return per-frame tokens ``[B, T, Qf, D]``.
         """
         b, t, p, d = x.shape
         assert t == self.num_frames
@@ -256,7 +275,16 @@ class SatelliteTwoStageCompressor(nn.Module):
 
         # ---- stage 2 queries
         q = self.sat_queries.expand(b, -1, -1)  # [B,Qs,D]
-        q = q + self.coarse_time_embed[:, : self.num_sat_queries]
+
+        if query_times is not None:
+            # dynamic time embedding from real delta_t values
+            # query_times: [Qs] or [B, Qs]  ->  time_embed: [B, Qs, D]
+            if query_times.dim() == 1:
+                query_times = query_times.unsqueeze(0).expand(b, -1)  # [B, Qs]
+            time_embed = build_continuous_time_embed(query_times, d)   # [B, Qs, D]
+            q = q + time_embed
+        else:
+            q = q + self.coarse_time_embed[:, : self.num_sat_queries]
 
         if self.use_coarse_spatial and self.coarse_spatial_embed is not None:
             q = q + self.coarse_spatial_embed[:, : self.num_sat_queries]

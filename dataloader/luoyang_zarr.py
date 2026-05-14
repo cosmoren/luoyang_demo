@@ -272,8 +272,13 @@ class PVDataset(Dataset):
         satimg_window_size: int,
         satimg_time_resolution_min: int,
         satimg_npy_shape_hwc: tuple[int, int, int],
+        train_samples_per_csv: int = 1,
     ):
         self._config_path = Path(config_path).resolve()
+        tspc = int(train_samples_per_csv)
+        if tspc < 1:
+            raise ValueError(f"train_samples_per_csv must be >= 1 (got {tspc})")
+        self._train_samples_per_csv = tspc
         if not self._config_path.is_file():
             raise FileNotFoundError(f"PVDataset config_path not found: {self._config_path}")
         if split not in ("train", "val", "test"):
@@ -528,7 +533,7 @@ class PVDataset(Dataset):
 
     def __len__(self):
         if self.split == "train":
-            return len(self.sample_files)
+            return len(self.sample_files) * self._train_samples_per_csv
         if self.split == "val":
             return len(self.sample_files) * self._num_val_windows
         return len(self.sample_files) * self._num_test_windows
@@ -815,7 +820,37 @@ class PVDataset(Dataset):
         else:
             sat_tensor = torch.cat([torch.zeros(24-sat_tensor.shape[0], sat_tensor.shape[1], sat_tensor.shape[2], sat_tensor.shape[3]), sat_tensor], dim=0)
             sat_timefeats = torch.cat([torch.zeros(24-sat_timefeats.shape[0], sat_timefeats.shape[1]), sat_timefeats], dim=0)
+        
 
+        '''
+        import matplotlib.pyplot as plt
+        plot_tensor = sat_tensor.detach().cpu().clamp(0.0, 1.0)
+        num_plot = min(24, plot_tensor.shape[0])
+        channel_ids = [0, 1, 2]
+        rows, cols = len(channel_ids), 24
+        fig, axes = plt.subplots(rows, cols, figsize=(36, 6), squeeze=False)
+        for row, ch in enumerate(channel_ids):
+            for col in range(cols):
+                ax = axes[row, col]
+                ax.axis("off")
+                if col >= num_plot:
+                    continue
+                if plot_tensor.ndim != 4 or ch >= plot_tensor.shape[1]:
+                    continue
+                img = plot_tensor[col, ch, :, :]
+                ax.imshow(img.numpy(), cmap="gray", vmin=0.0, vmax=1.0)
+                if row == 0:
+                    ax.set_title(f"t{col}", fontsize=8)
+            axes[row, 0].set_ylabel(f"ch{ch}", fontsize=10)
+        plt.tight_layout()
+        plot_out_dir = Path("/mnt/nfs/slurm/home/yuan/workspace/luoyang_demo_4h_pv_parallel")
+        plot_out_dir.mkdir(parents=True, exist_ok=True)
+        plot_name = f"my_plot_dev{int(dev_idx.item())}_r{int(r)}_{pd.Timestamp(time0_utc).strftime('%Y%m%d_%H%M%S')}.jpg"
+        plt.savefig(plot_out_dir / plot_name, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        '''
+
+        '''
         # Select sky images from the window
         sky_t0 = time0_utc - timedelta(minutes=(30))
         sky_t1 = time0_utc - timedelta(minutes=0)
@@ -835,6 +870,7 @@ class PVDataset(Dataset):
         sky_tensor = torch.from_numpy(
             np.asarray(sky_data['images'].values, dtype=np.float32)
         )
+        '''
 
         return {
             "dev_idx": dev_idx,
@@ -854,7 +890,7 @@ class PVDataset(Dataset):
 
     def __getitem__(self, idx):
         if self.split == "train":
-            sample_path = self.sample_files[idx]
+            sample_path = self.sample_files[idx % len(self.sample_files)]
             r_fixed: int | None = None
         elif self.split == "val":
             nw = self._num_val_windows

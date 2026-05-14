@@ -6,9 +6,12 @@ Uses the same Luoyang CSV / sky / sat DataLoader as train.py.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import sys
 from pathlib import Path
+
+from torch.utils.tensorboard import SummaryWriter
 
 import numpy as np
 import torch
@@ -85,6 +88,47 @@ def forward_vit(model: nn.Module, d: dict) -> torch.Tensor:
     )
 
 
+class ModelEMA:
+    """Exponential Moving Average of model weights.
+
+    Maintains a shadow copy of floating-point parameters updated as:
+        shadow = decay * shadow + (1 - decay) * param
+    Use ``ema.apply(model)`` as a context manager to temporarily swap the
+    model weights to EMA weights for evaluation, then restore originals.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
+        self.decay = decay
+        self.shadow: dict[str, torch.Tensor] = {
+            k: v.detach().clone().float()
+            for k, v in model.state_dict().items()
+            if v.is_floating_point()
+        }
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        for k, v in model.state_dict().items():
+            if k in self.shadow:
+                self.shadow[k].mul_(self.decay).add_(v.detach().float(), alpha=1.0 - self.decay)
+
+    @contextlib.contextmanager
+    def apply(self, model: nn.Module):
+        """Temporarily load EMA weights into *model* for eval, then restore."""
+        msd = model.state_dict()
+        backup = {k: msd[k].clone() for k in self.shadow}
+        for k, v in self.shadow.items():
+            msd[k].copy_(v.to(msd[k].dtype))
+        try:
+            yield
+        finally:
+            msd = model.state_dict()
+            for k, v in backup.items():
+                msd[k].copy_(v)
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return self.shadow
+
+
 def train_one_epoch(
     model: nn.Module,
     device: torch.device,
@@ -92,6 +136,7 @@ def train_one_epoch(
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     max_batches: int | None = None,
+    ema: ModelEMA | None = None,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -108,6 +153,8 @@ def train_one_epoch(
         # loss = criterion(pv_pred, d["target_pv"])
         loss.backward()
         optimizer.step()
+        if ema is not None:
+            ema.update(model)
         total_loss += loss.item()
         n += B
     print()
@@ -257,7 +304,7 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--warmup-epochs",
         type=int,
-        default=3,
+        default=5,
         help="Linear LR warmup in epoch units before cosine decay (0 = no warmup).",
     )
     parser.add_argument(
@@ -265,6 +312,32 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
         type=float,
         default=1e-6,
         help="Minimum learning rate for cosine tail (default 1e-6).",
+    )
+    parser.add_argument(
+        "--use-ema",
+        dest="use_ema",
+        action="store_true",
+        help="Enable Exponential Moving Average of model weights.",
+    )
+    parser.add_argument(
+        "--no-ema",
+        dest="use_ema",
+        action="store_false",
+        help="Disable EMA (default).",
+    )
+    parser.set_defaults(use_ema=False)
+    parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.99,
+        help="EMA decay (default 0.99). Lower decay catches up faster.",
+    )
+    parser.add_argument(
+        "--ema-warmup-epochs",
+        type=int,
+        default=5,
+        help="Skip EMA updates and use raw model weights for the first N epochs "
+             "so EMA doesn't lag while model is far from convergence.",
     )
     parser.add_argument("--batch_size", type=int, default=int(h["batch_size"]))
     parser.add_argument("--checkpoint_dir", type=str, default=None)
@@ -344,6 +417,7 @@ def _dataset_kwargs(dataset_config_name: str, split: str) -> dict:
         satimg_window_size=int(_req_sampling("satimg_window_size")),
         satimg_time_resolution_min=int(_req_sampling("satimg_time_resolution_min")),
         satimg_npy_shape_hwc=tuple(int(x) for x in shwc),
+        train_samples_per_csv=int(sampling_cfg.get("train_samples_per_csv", 1)),
     )
 
 
@@ -368,7 +442,7 @@ def main() -> None:
     # ``paths.*`` and the ``sampling:`` section consumed by ``_dataset_kwargs``.
     # =========================================================================
     DATASET_CLS = PVDataset
-    DATASET_CONFIG = "conf_luoyang.yaml" # config file for the luoyang dataset
+    DATASET_CONFIG = "conf_luoyang_shm.yaml"  # sat/sky read from /dev/shm (RAM); see scripts/vit_test.sh
 
     train_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "train"))
     val_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "val"))
@@ -401,6 +475,9 @@ def main() -> None:
         lr_min=args.lr_min,
     )
     criterion = nn.HuberLoss(delta=1.0)  # nn.MSELoss()
+    ema: ModelEMA | None = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
+    print(f"EMA: {'enabled' if args.use_ema else 'disabled'}"
+          + (f" (decay={args.ema_decay}, warmup={args.ema_warmup_epochs} epoch)" if args.use_ema else ""))
 
     train_loader = DataLoader(
         train_dataset,
@@ -439,12 +516,21 @@ def main() -> None:
         _ckpt_suffix = "cpu"
     best_ckpt_path = checkpoint_dir / f"pv_forecast_vit_best_{_ckpt_suffix}.pt"
 
+    tb_log_dir = _PROJECT_ROOT / "runs" / _ckpt_suffix
+    writer = SummaryWriter(log_dir=str(tb_log_dir))
+    print(f"TensorBoard log dir: {tb_log_dir}")
+
     initial_test_loss, _, _ = evaluate(model, device, test_loader, criterion)
     print(f"Initial test loss: {initial_test_loss:.6f}")
 
     rmse_min = 1e8
     for epoch in range(1, args.epochs + 1):
         cur_lr = optimizer.param_groups[0]["lr"]
+        ema_active = ema is not None and epoch > args.ema_warmup_epochs
+        if ema is not None and not ema_active:
+            for k, v in model.state_dict().items():
+                if k in ema.shadow:
+                    ema.shadow[k].copy_(v.detach().float())
         avg_loss = train_one_epoch(
             model,
             device,
@@ -452,12 +538,22 @@ def main() -> None:
             criterion,
             optimizer,
             max_batches=args.train_max_batches_per_epoch,
+            ema=ema if ema_active else None,
         )
-        val_loss, val_rmse, _ = evaluate(model, device, val_loader, criterion)
+        if ema_active:
+            with ema.apply(model):
+                val_loss, val_rmse, val_mae = evaluate(model, device, val_loader, criterion)
+        else:
+            val_loss, val_rmse, val_mae = evaluate(model, device, val_loader, criterion)
         print(
             f"Epoch {epoch}/{args.epochs}  lr={cur_lr:.2e}  "
             f"train_loss={avg_loss:.6f}  val_loss={val_loss:.6f}"
         )
+        writer.add_scalar("loss/train", avg_loss, epoch)
+        writer.add_scalar("loss/val", val_loss, epoch)
+        writer.add_scalar("metric/val_rmse", val_rmse, epoch)
+        writer.add_scalar("metric/val_mae", val_mae, epoch)
+        writer.add_scalar("lr", cur_lr, epoch)
         scheduler.step()
 
         if args.save_every and epoch % args.save_every == 0:
@@ -477,26 +573,30 @@ def main() -> None:
         
         if val_rmse < rmse_min:
             rmse_min = val_rmse
+            best_state = ema.state_dict() if ema_active else model.state_dict()
             torch.save(
                 {
                     "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": best_state,
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
                     "loss": avg_loss,
                     "dev_dn_list": dev_dn_list,
+                    "ema": ema_active,
                 },
                 best_ckpt_path,
             )
 
     final_path = checkpoint_dir / f"pv_forecast_vit_final_{_ckpt_suffix}.pt"
+    final_state = ema.state_dict() if ema is not None else model.state_dict()
     torch.save(
         {
             "epoch": args.epochs,
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": final_state,
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "dev_dn_list": dev_dn_list,
+            "ema": ema is not None,
         },
         final_path,
     )
@@ -510,6 +610,21 @@ def main() -> None:
             f"Test set with best val-RMSE checkpoint ({best_ckpt_path.name}, epoch={ckpt.get('epoch', '?')}): "
             f"loss={test_loss_best:.6f}, RMSE={test_rmse_best:.6f}, MAE={test_mae_best:.6f}"
         )
+        writer.add_scalar("metric/test_rmse", test_rmse_best, args.epochs)
+        writer.add_scalar("metric/test_mae", test_mae_best, args.epochs)
+        writer.add_hparams(
+            {
+                "lr": args.lr,
+                "batch_size": args.batch_size,
+                "epochs": args.epochs,
+                "warmup_epochs": args.warmup_epochs,
+                "weight_decay": args.weight_decay,
+            },
+            {
+                "hparam/test_rmse": test_rmse_best,
+                "hparam/test_mae": test_mae_best,
+            },
+        )
         metrics_log = checkpoint_dir / f"pv_forecast_4h_pv_sat_{_ckpt_suffix}.txt"
         with open(metrics_log, "a", encoding="utf-8") as mf:
             mf.write(
@@ -518,6 +633,8 @@ def main() -> None:
         print(f"Appended best-test metrics to {metrics_log}")
     else:
         print(f"No {best_ckpt_path.name} on disk; skip test evaluation with best checkpoint.")
+
+    writer.close()
 
 
 

@@ -6,6 +6,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+from modules.SatCompressor import build_continuous_time_embed
+
 class VideoPatchSpatiotemporalEmbed(nn.Module):
     """
     Patchify ``[B, T, 3, H, W]`` (default ``H=W=112``, ``patch_size=16`` → 196 patches/frame),
@@ -28,11 +30,6 @@ class VideoPatchSpatiotemporalEmbed(nn.Module):
         self.spatial_pos_embed = nn.Parameter(torch.zeros(1, 1, self.num_patches, embed_dim))
         nn.init.trunc_normal_(self.spatial_pos_embed, std=0.02)
 
-        self.timefeats_mlp = nn.Sequential(
-            nn.Linear(9, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, embed_dim),
-        )
 
     def forward(self, x: torch.Tensor, timefeats: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -55,7 +52,8 @@ class VideoPatchSpatiotemporalEmbed(nn.Module):
         tok = tok.flatten(2).transpose(1, 2)  # [B*T, P, D]
         tok = tok.view(B, T, self.num_patches, self.embed_dim)
         tok = tok + self.spatial_pos_embed
-        time_tok = self.timefeats_mlp(timefeats.to(dtype=tok.dtype)).unsqueeze(2)  # [B, T, 1, D]
+        # timefeats: [B, T, 1] -> squeeze to [B, T] -> build_continuous_time_embed -> [B, T, D] -> unsqueeze -> [B, T, 1, D]
+        time_tok = build_continuous_time_embed(timefeats.squeeze(-1).to(dtype=torch.float32), self.embed_dim).to(dtype=tok.dtype).unsqueeze(2)
         tok = tok + time_tok
 
         return tok

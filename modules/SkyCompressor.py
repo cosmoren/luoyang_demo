@@ -14,6 +14,25 @@ def build_1d_sincos_pos_embed(length: int, dim: int, device=None) -> torch.Tenso
     return torch.cat([torch.sin(out), torch.cos(out)], dim=1)
 
 
+def build_continuous_time_embed(times: torch.Tensor, dim: int) -> torch.Tensor:
+    """Sinusoidal embedding for arbitrary continuous time values.
+
+    Args:
+        times: float tensor of shape ``[Qs]`` or ``[B, Qs]``, delta_t values
+               (e.g. hours relative to t0, can be negative / non-integer).
+        dim:   embedding dimension (must be even).
+
+    Returns:
+        Tensor of shape ``[..., Qs, dim]`` matching the leading dims of ``times``.
+    """
+    assert dim % 2 == 0
+    omega = torch.arange(dim // 2, device=times.device, dtype=torch.float32)
+    omega = 1.0 / (10000 ** (omega / (dim // 2)))  # [D/2]
+    # times: [..., Qs], omega: [D/2]  ->  out: [..., Qs, D/2]
+    out = times.unsqueeze(-1).float() * omega  # broadcast
+    return torch.cat([torch.sin(out), torch.cos(out)], dim=-1)
+
+
 def build_2d_sincos_pos_embed(h: int, w: int, dim: int, device=None) -> torch.Tensor:
     """Return sinusoidal 2D positional embedding with shape ``[h*w, dim]``."""
     assert dim % 4 == 0
@@ -219,7 +238,20 @@ class SkyTwoStageCompressor(nn.Module):
         self.global_cross = CrossAttnBlock(dim, num_heads=num_heads)
         self.post_block = SelfAttnBlock(dim, num_heads=num_heads)
 
-    def forward(self, x: torch.Tensor, return_stage1: bool = False):
+    def forward(
+        self,
+        x: torch.Tensor,
+        query_times: torch.Tensor | None = None,
+        return_stage1: bool = False,
+    ):
+        """
+        Args:
+            x:           ``[B, T, P, D]`` sky-camera patch tokens.
+            query_times: optional float tensor of shape ``[B, Qs]`` or ``[Qs]``,
+                         delta_t of each sky query relative to t0 (e.g. in hours).
+                         When provided, replaces the fixed ``coarse_time_embed``.
+            return_stage1: if True also return per-frame tokens ``[B, T, Qf, D]``.
+        """
         bsz, num_frames, _, dim = x.shape
         assert num_frames == self.num_frames
 
@@ -230,7 +262,17 @@ class SkyTwoStageCompressor(nn.Module):
         memory = frame_tokens.reshape(bsz, num_frames * self.num_frame_queries, dim)
 
         q = self.sky_queries.expand(bsz, -1, -1)
-        q = q + self.coarse_time_embed[:, : self.num_sky_queries]
+
+        if query_times is not None:
+            # dynamic time embedding from real delta_t values
+            # query_times: [Qs] or [B, Qs]  ->  time_embed: [B, Qs, D]
+            if query_times.dim() == 1:
+                query_times = query_times.unsqueeze(0).expand(bsz, -1)  # [B, Qs]
+            time_embed = build_continuous_time_embed(query_times, dim)   # [B, Qs, D]
+            q = q + time_embed
+        else:
+            q = q + self.coarse_time_embed[:, : self.num_sky_queries]
+
         if self.use_coarse_spatial and self.coarse_spatial_embed is not None:
             q = q + self.coarse_spatial_embed[:, : self.num_sky_queries]
 

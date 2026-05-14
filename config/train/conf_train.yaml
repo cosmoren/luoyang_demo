@@ -1,8 +1,8 @@
 training:
-  epochs: 20
-  lr: 5e-4
-  batch_size: 32
+  epochs: 40
+  lr: 2e-3
+  batch_size: 64
   save_every: 5
-  num_workers: 48
+  num_workers: 8
   # null = run every batch in an epoch
   train_max_batches_per_epoch: null

@@ -1,0 +1,35 @@
+# Same as conf_luoyang.yaml but sat/sky/NWP are read from /dev/shm (RAM).
+# pv_sf1 stays on /work because it is only read once at __init__ time.
+# Run scripts/vit_test.sh which rsyncs the hot data to /dev/shm automatically.
+
+site:
+  name: Luoyang
+
+paths:
+  data_dir: "/dev/shm/luoyang_SPMF"
+  pv_device_path: dataloader/XINSHENG_power_total_devices_type1.xlsx
+  # pv_sf1 is ~3.4 GB and only read once at dataset init, keep it on /work
+  pv_path: "/work/datasets/luoyang_SPMF/pv_sf1"
+  sky_image_path: skimg_zarr
+  sat_path: sat_himawari_zarr1
+  nwp_path: NWP
+
+sampling:
+  # How many random training samples to draw from each CSV per epoch.
+  # __len__(train) = len(sample_files) * train_samples_per_csv
+  train_samples_per_csv: 10
+  csv_interval_min: 5
+  pv_input_interval_min: 5
+  pv_input_len: 576
+  pv_output_interval_min: 15
+  pv_output_len: 192
+  pv_train_time_fraction: 0.7
+  test_anchor_stride_min: 600
+  val_anchor_stride_min: 600
+  test_collect_time_match_tolerance_min: 0
+  skyimg_window_size: 30
+  skyimg_time_resolution_min: 1
+  skyimg_spatial_size: 224
+  satimg_window_size: 24
+  satimg_time_resolution_min: 10
+  satimg_npy_shape_hwc: [100, 100, 3]
