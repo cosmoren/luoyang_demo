@@ -1,4 +1,4 @@
-# Folsom, CA — single irradiance CSV + sky JPEGs + (optional) merged NWP CSV.
+# Folsom, CA — irradiance CSV + sky Zarr + (optional) merged NWP CSV.
 # -----------------------------------------------------------------------------
 # Same schema as config/conf_train.yaml (PVDataset / Luoyang `pv_*` keys, no `irr_*`,
 # no `dataset_profile: folsom`), so dataloader/folsom.py and training/train_vit_test.py
@@ -18,8 +18,8 @@ paths:
   # so we keep the Luoyang Excel as a placeholder; trainer's nn.Embedding lookup still works.
   # FolsomIrradianceDataset globs `pv_path` for exactly one CSV (the Folsom irradiance file).
   pv_path: irradiance
-  # Sky JPEGs (YYYYMMDDHHMMSS.jpg, UTC, ~1 minute resolution).
-  sky_image_path: sky
+  sky_format: zarr
+  sky_image_path: sky_zarr
   # FolsomIrradianceDataset stores `satimg_dir` but never reads from it; placeholder is fine.
   sat_path: sat
   # PVDataset uses `paths.nwp_path` (folder with solar.csv / wind.csv); placeholder for Folsom.
@@ -43,7 +43,7 @@ sampling:
   test_anchor_stride_min: 1500
   val_anchor_stride_min: 7000
   test_collect_time_match_tolerance_min: 0
-  # Sky stack (last N JPEGs ending at the anchor).
+  # Sky stack (last N frames ending at the anchor; zarr time series).
   skyimg_window_size: 30
   skyimg_time_resolution_min: 1
   skyimg_spatial_size: 224

@@ -1,6 +1,9 @@
 """
 Train ``pv_forecasting_model_vit_imgs`` on Folsom (irradiance CSV + sky Zarr or JPEG + merged NWP).
 
+**Prefer** ``training/train_vit_test_folsom2.py`` for parity with ``train_vit_test.py`` (TensorBoard + EMA).
+This file stays as a lighter Folsom-only trainer for quick experiments.
+
 If the dataset YAML omits ``paths.sky_format``, this entrypoint injects **``zarr``** (see
 ``_folsom_pv_dataset_config_path``). For JPEG skies set ``paths.sky_format: jpg`` explicitly.
 
