@@ -648,7 +648,6 @@ class pv_forecasting_model_vit_imgs(nn.Module):
             sat_mask = torch.ones(B, sat_compressed.shape[1], device=pv.device, dtype=pv.dtype)
 
         # sky images encoder
-        skimg_tensor = None
         if skimg_tensor is None or skimg_tensor.max() == 0:
             sky_compressed = torch.zeros(B, 48, 64, device=pv.device, dtype=pv.dtype) + self.sky_mod_embed
             sky_mask = torch.zeros(B, 48, device=pv.device, dtype=pv.dtype)

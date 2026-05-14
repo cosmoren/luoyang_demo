@@ -19,6 +19,7 @@ Quick comparison
 | Eval batch cap       | none                      | --eval_max_batches            | same                           |
 | NWP                  | Luoyang interp            | zero default; --use-nwp      | same                           |
 | NWP remap            | n/a                       | remap_nwp_tensor_for_pv_vit  | same                           |
+| Sky blackout         | n/a                       | n/a                          | optional ``--zero-sky``        |
 | Sky backend          | zarr in current dataloader| YAML + zarr inject default   | same                           |
 | TB / EMA             | yes                       | no                           | yes (aligned with Luoyang)     |
 +----------------------+---------------------------+------------------------------+-------------------------------+
@@ -27,6 +28,9 @@ Local smoke (1 logical GPU, tiny run):
 
   python training/train_vit_test_folsom2.py --epochs 1 --train_max_batches_per_epoch 3 \\
     --eval_max_batches 20 --num_workers 0 --batch_size 1
+
+  # Manager-style PV+NWP (real NWP, sky tensors zeroed after load; dataloader still reads Zarr):
+  python training/train_vit_test_folsom2.py --use-nwp --zero-sky  # add your usual epoch/batch flags
 
 Training hyperparameters: ``config/train/conf_train.yaml`` (``--config``). Dataset paths:
 ``config/datasets/conf_folsom.yaml`` (``--dataset-config``).
@@ -151,6 +155,21 @@ def _prepare_nwp_for_vit(d: dict, *, use_nwp: bool) -> dict:
     return d
 
 
+def _prepare_sky_for_vit(d: dict, *, zero_sky: bool) -> dict:
+    """
+    Optionally zero sky tensors after ``_batch_to_device`` so the ViT sees no sky signal while the
+    dataloader still loads real Zarr/JPEG (avoids bogus paths). Matches the model branch for
+    ``skimg_tensor.max() == 0`` (see ``pv_forecasting_model_vit_imgs``).
+    """
+    if not zero_sky:
+        return d
+    for key in ("skimg_tensor", "skimg_timefeats"):
+        t = d.get(key)
+        if t is not None:
+            d[key] = torch.zeros_like(t)
+    return d
+
+
 def forward_vit(model: nn.Module, d: dict) -> torch.Tensor:
     return model(
         d["device_id"],
@@ -210,6 +229,7 @@ def train_one_epoch(
     ema: ModelEMA | None = None,
     *,
     use_nwp: bool = False,
+    zero_sky: bool = False,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -220,6 +240,7 @@ def train_one_epoch(
             break
         d = _batch_to_device(batch, device)
         _prepare_nwp_for_vit(d, use_nwp=use_nwp)
+        _prepare_sky_for_vit(d, zero_sky=zero_sky)
         B = d["device_id"].size(0)
         optimizer.zero_grad()
         pv_pred = forward_vit(model, d)
@@ -249,6 +270,7 @@ def evaluate(
     *,
     max_batches: int | None = None,
     use_nwp: bool = False,
+    zero_sky: bool = False,
 ) -> tuple[float, float, float]:
     """Returns mean Huber loss (first ``_LOSS_METRIC_HORIZON`` steps, masked like train), RMSE and
     MAE in **normalized** GHI space over the same slice (``target_mask``; predictions at night
@@ -269,6 +291,7 @@ def evaluate(
                 break
             d = _batch_to_device(batch, device)
             _prepare_nwp_for_vit(d, use_nwp=use_nwp)
+            _prepare_sky_for_vit(d, zero_sky=zero_sky)
             pv_pred = forward_vit(model, d)
             t_out = int(pv_pred.shape[1])
             h = min(_LOSS_METRIC_HORIZON, t_out)
@@ -480,6 +503,15 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
             "Default is OFF: the NWP tensor is replaced with zeros (blacked-out baseline)."
         ),
     )
+    parser.add_argument(
+        "--zero-sky",
+        action="store_true",
+        help=(
+            "After each batch is on device, replace sky image tensors (and sky time features) with "
+            "zeros so the ViT uses the empty-sky branch while the dataset still loads real Zarr/JPEG. "
+            "Use with --use-nwp for PV+NWP vs PV+NWP+sky comparisons."
+        ),
+    )
     return parser
 
 
@@ -631,9 +663,17 @@ def main() -> None:
 
     eval_cap = args.eval_max_batches
     use_nwp = bool(args.use_nwp)
+    zero_sky = bool(args.zero_sky)
     print(f"NWP input: {'REAL (remapped)' if use_nwp else 'ZEROED-OUT (baseline)'}")
+    print(f"Sky images: {'ZEROED (--zero-sky; PV+NWP-style ablation)' if zero_sky else 'REAL from dataset'}")
     initial_test_loss, _, _ = evaluate(
-        model, device, test_loader, criterion, max_batches=eval_cap, use_nwp=use_nwp
+        model,
+        device,
+        test_loader,
+        criterion,
+        max_batches=eval_cap,
+        use_nwp=use_nwp,
+        zero_sky=zero_sky,
     )
     print(f"Initial test loss: {initial_test_loss:.6f}")
 
@@ -654,16 +694,29 @@ def main() -> None:
             max_batches,
             ema=ema if ema_active else None,
             use_nwp=use_nwp,
+            zero_sky=zero_sky,
         )
         if ema_active:
             assert ema is not None
             with ema.apply(model):
                 val_loss, val_rmse, val_mae = evaluate(
-                    model, device, val_loader, criterion, max_batches=eval_cap, use_nwp=use_nwp
+                    model,
+                    device,
+                    val_loader,
+                    criterion,
+                    max_batches=eval_cap,
+                    use_nwp=use_nwp,
+                    zero_sky=zero_sky,
                 )
         else:
             val_loss, val_rmse, val_mae = evaluate(
-                model, device, val_loader, criterion, max_batches=eval_cap, use_nwp=use_nwp
+                model,
+                device,
+                val_loader,
+                criterion,
+                max_batches=eval_cap,
+                use_nwp=use_nwp,
+                zero_sky=zero_sky,
             )
         print(
             f"Epoch {epoch}/{args.epochs}  lr={cur_lr:.2e}  "
@@ -688,6 +741,8 @@ def main() -> None:
                     "dev_dn_list": dev_dn_list,
                     "dataset_config": dataset_cfg,
                     "ema": ema_active,
+                    "zero_sky": zero_sky,
+                    "use_nwp": use_nwp,
                 },
                 path,
             )
@@ -706,6 +761,8 @@ def main() -> None:
                     "dev_dn_list": dev_dn_list,
                     "dataset_config": dataset_cfg,
                     "ema": ema_active,
+                    "zero_sky": zero_sky,
+                    "use_nwp": use_nwp,
                 },
                 best_ckpt_path,
             )
@@ -721,6 +778,8 @@ def main() -> None:
             "dev_dn_list": dev_dn_list,
             "dataset_config": dataset_cfg,
             "ema": ema is not None,
+            "zero_sky": zero_sky,
+            "use_nwp": use_nwp,
         },
         final_path,
     )
@@ -730,7 +789,13 @@ def main() -> None:
         ckpt = torch.load(best_ckpt_path, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"])
         test_loss_best, test_rmse_best, test_mae_best = evaluate(
-            model, device, test_loader, criterion, max_batches=eval_cap, use_nwp=use_nwp
+            model,
+            device,
+            test_loader,
+            criterion,
+            max_batches=eval_cap,
+            use_nwp=use_nwp,
+            zero_sky=zero_sky,
         )
         print(
             f"Test set with best val-RMSE checkpoint ({best_ckpt_path.name}, epoch={ckpt.get('epoch', '?')}): "
@@ -746,6 +811,7 @@ def main() -> None:
                 "warmup_epochs": args.warmup_epochs,
                 "weight_decay": args.weight_decay,
                 "use_nwp": int(use_nwp),
+                "zero_sky": int(zero_sky),
                 "dataset_config": dataset_cfg,
                 "eval_max_batches": -1 if eval_cap is None else int(eval_cap),
                 "use_ema": int(args.use_ema),
