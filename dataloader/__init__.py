@@ -7,7 +7,7 @@ Example (Luoyang PV):
 
 Other datasets can add ``dataloader/foo.py`` and use ``from dataloader.foo import ...``.
 
-Folsom (GHI / DNI / DHI CSV):
+Folsom (GHI / DNI / DHI CSV, sky JPEG or Zarr, merged NWP):
 
     from dataloader.folsom import (
         FolsomIrradianceDataset,

@@ -2,7 +2,7 @@
 Training script for pv_forecasting_model_vit (sat + sky TimeSformer + PV TCN).
 Uses the same Luoyang CSV / sky / sat DataLoader as train.py.
 
-Folsom PV ViT: use ``training/train_vit_test.py`` with ``FolsomIrradianceDataset`` / ``config/datasets/conf_folsom.yaml``.
+Folsom PV ViT: use ``training/train_vit_test_folsom.py`` with ``config/datasets/conf_folsom.yaml``.
 """
 
 from __future__ import annotations

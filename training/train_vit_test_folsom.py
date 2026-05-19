@@ -1,35 +1,31 @@
 """
-Train ``pv_forecasting_model_vit_imgs`` on Folsom (irradiance CSV + sky Zarr or JPEG + merged NWP).
+Canonical **Folsom** trainer for ``pv_forecasting_model_vit_imgs`` (long-lived entrypoint).
 
-**Prefer** ``training/train_vit_test_folsom2.py`` for parity with ``train_vit_test.py`` (TensorBoard + EMA).
-This file stays as a lighter Folsom-only trainer for quick experiments.
+Uses ``dataloader.folsom.FolsomIrradianceDataset`` (zarr/JPEG skies, merged NWP, Luoyang-shaped
+``collate_batched`` batches). If ``paths.sky_format`` is omitted in the dataset YAML, this script
+injects **zarr** (see ``_folsom_pv_dataset_config_path``).
 
-If the dataset YAML omits ``paths.sky_format``, this entrypoint injects **``zarr``** (see
-``_folsom_pv_dataset_config_path``). For JPEG skies set ``paths.sky_format: jpg`` explicitly.
+Compared to ``training/train_vit_test.py`` (Luoyang), this file adds Folsom semantics (NWP remap /
+zero baseline, ``--eval_max_batches``, GHI-scale metrics, optional ``--zero-sky``) while keeping
+TensorBoard logging and optional EMA (same pattern as ``train_vit_test.py``).
 
-Mirrors ``training/train_vit_test.py`` (loop, scheduler, checkpoints) but:
-  - ``FolsomIrradianceDataset`` + ``config/datasets/conf_folsom.yaml`` (Luoyang-shaped batches).
-  - NWP **defaults to a blacked-out (all-zero) tensor** so the ViT trains as an NWP-free baseline.
-    Pass ``--use-nwp`` to feed the real Folsom merged NWP; in that case the tensor is remapped so
-    ``pv_forecasting_model_vit_imgs`` slot 0 = ``dwsw``, slot 2 = ``temperature`` (K); see
-    ``remap_nwp_tensor_for_pv_vit_imgs`` (must match ``dataloader.folsom2._FOLSOM_NWP_FEATURE_COLS``).
-  - Train/eval Huber loss on the **first 16 forecast steps** only (same window as ``train_vit_test.py``).
-    ``evaluate`` MAE/RMSE use the same slice, ``target_mask`` weighting, and a **night mask** on
-    predictions where ``forecast_timefeats[:, :16, 3]`` (cos zenith) is negative (pred set to 0).
-  - Prints an ACC line with capacity **1100** (GHI W/m² scale matching normalization), not Luoyang kW.
+Local smoke (1 logical GPU, tiny run):
 
-Run (example, from repo root, with conda env that has PyTorch):
+  python training/train_vit_test_folsom.py --epochs 1 --train_max_batches_per_epoch 3 \\
+    --eval_max_batches 20 --num_workers 0 --batch_size 1
 
-  python training/train_vit_test_folsom.py --epochs 1 --train_max_batches_per_epoch 3 --eval_max_batches 20 --num_workers 0 --batch_size 1
+  # Manager-style PV+NWP (real NWP, sky tensors zeroed after load; dataloader still reads Zarr):
+  python training/train_vit_test_folsom.py --use-nwp --zero-sky  # add your usual epoch/batch flags
 
-Training hyperparameters default from ``config/train/conf_train.yaml`` (``--config conf_train.yaml``).
-Dataset paths from ``config/datasets/conf_folsom.yaml`` (override with ``--dataset-config other.yaml``).
+Training hyperparameters: ``config/train/conf_train.yaml`` (``--config``). Dataset paths:
+``config/datasets/conf_folsom.yaml`` (``--dataset-config``).
 """
 
 from __future__ import annotations
 
 import argparse
 import atexit
+import contextlib
 import copy
 import os
 import shutil
@@ -43,6 +39,7 @@ import torch.optim.lr_scheduler as lr_scheduler
 import yaml
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CONFIG_DIR = _PROJECT_ROOT / "config"
@@ -50,13 +47,13 @@ _TRAIN_CONFIG_DIR = _CONFIG_DIR / "train"
 _DATASETS_CONFIG_DIR = _CONFIG_DIR / "datasets"
 _DEFAULT_TRAIN_CONF_NAME = "conf_train.yaml"
 _DEFAULT_FOLSOM_DATASET_CONFIG = "conf_folsom.yaml"
-# When the dataset YAML omits ``paths.sky_format``, ``dataloader.folsom2`` would default to jpg;
+# When the dataset YAML omits ``paths.sky_format``, ``dataloader.folsom`` would default to jpg;
 # this trainer injects ``zarr`` instead (JPEG users must set ``paths.sky_format: jpg``).
 _DEFAULT_SKY_FORMAT_FOR_PV_TRAINER = "zarr"
 _FOLSOM_PV_TEMP_CFG_DIRS: list[Path] = []
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from dataloader.folsom2 import FolsomIrradianceDataset, _FOLSOM_NWP_FEATURE_COLS  # noqa: E402
+from dataloader.folsom import FolsomIrradianceDataset, _FOLSOM_NWP_FEATURE_COLS  # noqa: E402
 from dataloader.luoyang_zarr import collate_batched  # noqa: E402
 from models.models import pv_forecasting_model_vit_imgs  # noqa: E402
 
@@ -143,6 +140,21 @@ def _prepare_nwp_for_vit(d: dict, *, use_nwp: bool) -> dict:
     return d
 
 
+def _prepare_sky_for_vit(d: dict, *, zero_sky: bool) -> dict:
+    """
+    Optionally zero sky tensors after ``_batch_to_device`` so the ViT sees no sky signal while the
+    dataloader still loads real Zarr/JPEG (avoids bogus paths). Matches the model branch for
+    ``skimg_tensor.max() == 0`` (see ``pv_forecasting_model_vit_imgs``).
+    """
+    if not zero_sky:
+        return d
+    for key in ("skimg_tensor", "skimg_timefeats"):
+        t = d.get(key)
+        if t is not None:
+            d[key] = torch.zeros_like(t)
+    return d
+
+
 def forward_vit(model: nn.Module, d: dict) -> torch.Tensor:
     return model(
         d["device_id"],
@@ -158,6 +170,40 @@ def forward_vit(model: nn.Module, d: dict) -> torch.Tensor:
     )
 
 
+class ModelEMA:
+    """Exponential Moving Average of model weights (same idea as ``training/train_vit_test.py``)."""
+
+    def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
+        self.decay = decay
+        self.shadow: dict[str, torch.Tensor] = {
+            k: v.detach().clone().float()
+            for k, v in model.state_dict().items()
+            if v.is_floating_point()
+        }
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        for k, v in model.state_dict().items():
+            if k in self.shadow:
+                self.shadow[k].mul_(self.decay).add_(v.detach().float(), alpha=1.0 - self.decay)
+
+    @contextlib.contextmanager
+    def apply(self, model: nn.Module):
+        msd = model.state_dict()
+        backup = {k: msd[k].clone() for k in self.shadow}
+        for k, v in self.shadow.items():
+            msd[k].copy_(v.to(msd[k].dtype))
+        try:
+            yield
+        finally:
+            msd = model.state_dict()
+            for k, v in backup.items():
+                msd[k].copy_(v)
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return self.shadow
+
+
 def train_one_epoch(
     model: nn.Module,
     device: torch.device,
@@ -165,17 +211,21 @@ def train_one_epoch(
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     max_batches: int | None = None,
+    ema: ModelEMA | None = None,
     *,
     use_nwp: bool = False,
+    zero_sky: bool = False,
 ) -> float:
     model.train()
     total_loss = 0.0
     n = 0
+    print("number of batches: ", len(loader))
     for batch_idx, batch in enumerate(loader):
         if max_batches is not None and batch_idx >= max_batches:
             break
         d = _batch_to_device(batch, device)
         _prepare_nwp_for_vit(d, use_nwp=use_nwp)
+        _prepare_sky_for_vit(d, zero_sky=zero_sky)
         B = d["device_id"].size(0)
         optimizer.zero_grad()
         pv_pred = forward_vit(model, d)
@@ -189,8 +239,11 @@ def train_one_epoch(
         )
         loss.backward()
         optimizer.step()
+        if ema is not None:
+            ema.update(model)
         total_loss += loss.item()
         n += B
+    print()
     return total_loss / max(n, 1)
 
 
@@ -202,6 +255,7 @@ def evaluate(
     *,
     max_batches: int | None = None,
     use_nwp: bool = False,
+    zero_sky: bool = False,
 ) -> tuple[float, float, float]:
     """Returns mean Huber loss (first ``_LOSS_METRIC_HORIZON`` steps, masked like train), RMSE and
     MAE in **normalized** GHI space over the same slice (``target_mask``; predictions at night
@@ -222,6 +276,7 @@ def evaluate(
                 break
             d = _batch_to_device(batch, device)
             _prepare_nwp_for_vit(d, use_nwp=use_nwp)
+            _prepare_sky_for_vit(d, zero_sky=zero_sky)
             pv_pred = forward_vit(model, d)
             t_out = int(pv_pred.shape[1])
             h = min(_LOSS_METRIC_HORIZON, t_out)
@@ -364,9 +419,49 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
     )
     parser.add_argument("--epochs", type=int, default=int(h["epochs"]))
     parser.add_argument("--lr", type=float, default=float(h["lr"]))
-    parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--warmup-epochs", type=int, default=3)
-    parser.add_argument("--lr-min", type=float, default=1e-6)
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=0.01,
+        help="AdamW weight decay (default 0.01).",
+    )
+    parser.add_argument(
+        "--warmup-epochs",
+        type=int,
+        default=5,
+        help="Linear LR warmup in epoch units before cosine decay (0 = no warmup).",
+    )
+    parser.add_argument(
+        "--lr-min",
+        type=float,
+        default=1e-6,
+        help="Minimum learning rate for cosine tail (default 1e-6).",
+    )
+    parser.add_argument(
+        "--use-ema",
+        dest="use_ema",
+        action="store_true",
+        help="Enable Exponential Moving Average of model weights.",
+    )
+    parser.add_argument(
+        "--no-ema",
+        dest="use_ema",
+        action="store_false",
+        help="Disable EMA (default).",
+    )
+    parser.set_defaults(use_ema=False)
+    parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.99,
+        help="EMA decay (default 0.99). Lower decay catches up faster.",
+    )
+    parser.add_argument(
+        "--ema-warmup-epochs",
+        type=int,
+        default=5,
+        help="Skip EMA updates for the first N epochs (default 5).",
+    )
     parser.add_argument("--batch_size", type=int, default=int(h["batch_size"]))
     parser.add_argument("--checkpoint_dir", type=str, default=None)
     parser.add_argument("--save_every", type=int, default=int(h["save_every"]))
@@ -391,6 +486,15 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
         help=(
             "Feed the real Folsom merged-NWP tensor to the ViT (channels remapped). "
             "Default is OFF: the NWP tensor is replaced with zeros (blacked-out baseline)."
+        ),
+    )
+    parser.add_argument(
+        "--zero-sky",
+        action="store_true",
+        help=(
+            "After each batch is on device, replace sky image tensors (and sky time features) with "
+            "zeros so the ViT uses the empty-sky branch while the dataset still loads real Zarr/JPEG. "
+            "Use with --use-nwp for PV+NWP vs PV+NWP+sky comparisons."
         ),
     )
     return parser
@@ -489,6 +593,11 @@ def main() -> None:
         lr_min=args.lr_min,
     )
     criterion = nn.HuberLoss(delta=1.0)
+    ema: ModelEMA | None = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
+    print(
+        f"EMA: {'enabled' if args.use_ema else 'disabled'}"
+        + (f" (decay={args.ema_decay}, warmup={args.ema_warmup_epochs} epoch)" if args.use_ema else "")
+    )
 
     nw = int(args.num_workers)
     pin = torch.cuda.is_available()
@@ -529,37 +638,80 @@ def main() -> None:
         _ckpt_suffix = "cpu"
     best_ckpt_path = checkpoint_dir / f"folsom_pv_forecast_vit_best_{_ckpt_suffix}.pt"
 
+    tb_log_dir = _PROJECT_ROOT / "runs" / f"folsom_pv_{_ckpt_suffix}"
+    writer = SummaryWriter(log_dir=str(tb_log_dir))
+    print(f"TensorBoard log dir: {tb_log_dir}")
+
     max_batches = args.train_max_batches_per_epoch
     if max_batches is not None and max_batches < 0:
         max_batches = None
 
     eval_cap = args.eval_max_batches
     use_nwp = bool(args.use_nwp)
+    zero_sky = bool(args.zero_sky)
     print(f"NWP input: {'REAL (remapped)' if use_nwp else 'ZEROED-OUT (baseline)'}")
+    print(f"Sky images: {'ZEROED (--zero-sky; PV+NWP-style ablation)' if zero_sky else 'REAL from dataset'}")
     initial_test_loss, _, _ = evaluate(
-        model, device, test_loader, criterion, max_batches=eval_cap, use_nwp=use_nwp
+        model,
+        device,
+        test_loader,
+        criterion,
+        max_batches=eval_cap,
+        use_nwp=use_nwp,
+        zero_sky=zero_sky,
     )
     print(f"Initial test loss: {initial_test_loss:.6f}")
 
     rmse_min = 1e8
     for epoch in range(1, args.epochs + 1):
         cur_lr = optimizer.param_groups[0]["lr"]
+        ema_active = ema is not None and epoch > args.ema_warmup_epochs
+        if ema is not None and not ema_active:
+            for k, v in model.state_dict().items():
+                if k in ema.shadow:
+                    ema.shadow[k].copy_(v.detach().float())
         avg_loss = train_one_epoch(
             model,
             device,
             train_loader,
             criterion,
             optimizer,
-            max_batches=max_batches,
+            max_batches,
+            ema=ema if ema_active else None,
             use_nwp=use_nwp,
+            zero_sky=zero_sky,
         )
-        val_loss, val_rmse, _ = evaluate(
-            model, device, val_loader, criterion, max_batches=eval_cap, use_nwp=use_nwp
-        )
+        if ema_active:
+            assert ema is not None
+            with ema.apply(model):
+                val_loss, val_rmse, val_mae = evaluate(
+                    model,
+                    device,
+                    val_loader,
+                    criterion,
+                    max_batches=eval_cap,
+                    use_nwp=use_nwp,
+                    zero_sky=zero_sky,
+                )
+        else:
+            val_loss, val_rmse, val_mae = evaluate(
+                model,
+                device,
+                val_loader,
+                criterion,
+                max_batches=eval_cap,
+                use_nwp=use_nwp,
+                zero_sky=zero_sky,
+            )
         print(
             f"Epoch {epoch}/{args.epochs}  lr={cur_lr:.2e}  "
             f"train_loss={avg_loss:.6f}  val_loss={val_loss:.6f}  val_RMSE(norm)={val_rmse:.6f}"
         )
+        writer.add_scalar("loss/train", avg_loss, epoch)
+        writer.add_scalar("loss/val", val_loss, epoch)
+        writer.add_scalar("metric/val_rmse", val_rmse, epoch)
+        writer.add_scalar("metric/val_mae", val_mae, epoch)
+        writer.add_scalar("lr", cur_lr, epoch)
         scheduler.step()
 
         if args.save_every and epoch % args.save_every == 0:
@@ -573,6 +725,9 @@ def main() -> None:
                     "loss": avg_loss,
                     "dev_dn_list": dev_dn_list,
                     "dataset_config": dataset_cfg,
+                    "ema": ema_active,
+                    "zero_sky": zero_sky,
+                    "use_nwp": use_nwp,
                 },
                 path,
             )
@@ -580,28 +735,36 @@ def main() -> None:
 
         if val_rmse < rmse_min:
             rmse_min = val_rmse
+            best_state = ema.state_dict() if ema_active else model.state_dict()
             torch.save(
                 {
                     "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": best_state,
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
                     "loss": avg_loss,
                     "dev_dn_list": dev_dn_list,
                     "dataset_config": dataset_cfg,
+                    "ema": ema_active,
+                    "zero_sky": zero_sky,
+                    "use_nwp": use_nwp,
                 },
                 best_ckpt_path,
             )
 
     final_path = checkpoint_dir / f"folsom_pv_forecast_vit_final_{_ckpt_suffix}.pt"
+    final_state = ema.state_dict() if ema is not None else model.state_dict()
     torch.save(
         {
             "epoch": args.epochs,
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": final_state,
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "dev_dn_list": dev_dn_list,
             "dataset_config": dataset_cfg,
+            "ema": ema is not None,
+            "zero_sky": zero_sky,
+            "use_nwp": use_nwp,
         },
         final_path,
     )
@@ -611,11 +774,37 @@ def main() -> None:
         ckpt = torch.load(best_ckpt_path, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"])
         test_loss_best, test_rmse_best, test_mae_best = evaluate(
-            model, device, test_loader, criterion, max_batches=eval_cap, use_nwp=use_nwp
+            model,
+            device,
+            test_loader,
+            criterion,
+            max_batches=eval_cap,
+            use_nwp=use_nwp,
+            zero_sky=zero_sky,
         )
         print(
             f"Test set with best val-RMSE checkpoint ({best_ckpt_path.name}, epoch={ckpt.get('epoch', '?')}): "
             f"loss={test_loss_best:.6f}, RMSE(norm)={test_rmse_best:.6f}, MAE(norm)={test_mae_best:.6f}"
+        )
+        writer.add_scalar("metric/test_rmse", test_rmse_best, args.epochs)
+        writer.add_scalar("metric/test_mae", test_mae_best, args.epochs)
+        writer.add_hparams(
+            {
+                "lr": args.lr,
+                "batch_size": args.batch_size,
+                "epochs": args.epochs,
+                "warmup_epochs": args.warmup_epochs,
+                "weight_decay": args.weight_decay,
+                "use_nwp": int(use_nwp),
+                "zero_sky": int(zero_sky),
+                "dataset_config": dataset_cfg,
+                "eval_max_batches": -1 if eval_cap is None else int(eval_cap),
+                "use_ema": int(args.use_ema),
+            },
+            {
+                "hparam/test_rmse": test_rmse_best,
+                "hparam/test_mae": test_mae_best,
+            },
         )
         metrics_log = checkpoint_dir / f"folsom_pv_forecast_metrics_{_ckpt_suffix}.txt"
         with open(metrics_log, "a", encoding="utf-8") as mf:
@@ -625,6 +814,8 @@ def main() -> None:
         print(f"Appended best-test metrics to {metrics_log}")
     else:
         print(f"No {best_ckpt_path.name} on disk; skip test evaluation with best checkpoint.")
+
+    writer.close()
 
 
 if __name__ == "__main__":

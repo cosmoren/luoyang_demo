@@ -29,7 +29,6 @@ _DEFAULT_TRAIN_CONF_NAME = "conf_train.yaml"
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from dataloader.luoyang_zarr import PVDataset, collate_batched
-from dataloader.folsom import FolsomIrradianceDataset
 from models.models import pv_forecasting_model_vit_imgs
 
 
@@ -448,12 +447,7 @@ def main() -> None:
     val_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "val"))
     test_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "test"))
 
-    # DATASET_CLS = FolsomIrradianceDataset
-    # DATASET_CONFIG = "conf_folsom.yaml" # config file for the folsom dataset
-
-    # train_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "train"))
-    # val_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "val"))
-    # test_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "test"))
+    # Folsom: use training/train_vit_test_folsom.py with config/datasets/conf_folsom.yaml
 
     # =========================================================================
 

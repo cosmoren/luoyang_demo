@@ -1,11 +1,10 @@
 # Folsom, CA — irradiance CSV + sky Zarr + (optional) merged NWP CSV.
 # -----------------------------------------------------------------------------
-# Same schema as config/conf_train.yaml (PVDataset / Luoyang `pv_*` keys, no `irr_*`,
-# no `dataset_profile: folsom`), so dataloader/folsom.py and training/train_vit_test.py
-# read this file with the exact same code path that's used for Luoyang training.
+# Same schema as Luoyang `pv_*` keys (no `irr_*`, no `dataset_profile: folsom`).
+# Used by ``dataloader.folsom`` and ``training/train_vit_test_folsom.py``.
 #
 # Run Folsom training:
-#   python training/train_vit_test.py --config conf_folsom.yaml
+#   python training/train_vit_test_folsom.py --dataset-config conf_folsom.yaml
 # -----------------------------------------------------------------------------
 
 site:
@@ -28,7 +27,7 @@ paths:
   # If missing or unreadable, FolsomIrradianceDataset falls back to zero NWP + per-step invalid mask.
   folsom_nwp_merged_csv: NWP/nwp_merged_averaged.csv
 
-# Hyperparameters for training/train_vit_test.py (CLI flags override these when passed)
+# Sampling / window keys for ``dataloader.folsom`` and ``training/train_vit_test_folsom.py``
 sampling:
   # CSV row spacing (Folsom is 1-min; Luoyang was 5-min).
   csv_interval_min: 1

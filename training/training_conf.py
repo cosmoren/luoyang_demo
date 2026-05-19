@@ -10,7 +10,7 @@ from config_utils import get_resolved_paths
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONF_PATH = PROJECT_ROOT / "config" / "conf.yaml"
-FOLSOM_CONF_PATH = PROJECT_ROOT / "config" / "conf_folsom.yaml"
+FOLSOM_CONF_PATH = PROJECT_ROOT / "config" / "datasets" / "conf_folsom.yaml"
 
 TRAINING_HPARAM_KEYS = frozenset({
     "csv_interval_min",
