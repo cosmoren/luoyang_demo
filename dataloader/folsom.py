@@ -1,9 +1,11 @@
 """
 Folsom dataset: one CSV with time + GHI, DNI, DHI (and optional header aliases).
 
-Designed for multi-million-row files: never loads the full table into RAM.
-Each sample reads one contiguous row block (length set by ``pv_input_len`` / ``pv_output_len`` —
-:class:`FolsomIrradianceDataset` mirrors :class:`dataloader.luoyang_mem.PVDataset`'s constructor).
+The irradiance CSV is loaded once in :class:`FolsomIrradianceDataset.__init__` (``self._df``,
+Luoyang-style in-memory cache; ~80–150 MiB for the typical 1.5M-row / 4-column file).
+Each sample uses ``iloc`` on that table (no per-sample ``read_csv`` + ``skiprows``).
+
+:class:`FolsomIrradianceDataset` mirrors :class:`dataloader.luoyang_mem.PVDataset`'s constructor.
 
 Horizon math matches Luoyang anchor conventions (anchor = last input row index).
 
@@ -208,6 +210,31 @@ def _count_newlines(path: Path) -> int:
 def _read_header_line(path: Path) -> str:
     with path.open("r", encoding="utf-8", errors="replace") as f:
         return f.readline().rstrip("\n\r")
+
+
+def _load_folsom_irradiance_csv(path: Path) -> tuple[pd.DataFrame, str, list[str]]:
+    """
+    Load the single Folsom irradiance CSV into memory with parsed time + float irradiance columns.
+
+    Returns ``(df, time_col, ghi_dni_dhi_cols)`` where ``df`` has columns
+    ``[time_col, ghi, dni, dhi]`` (names auto-detected from the header).
+    """
+    p = path.resolve()
+    _folsom_progress(f"loading irradiance CSV {p.name} into memory ...")
+    raw = pd.read_csv(p, engine="c")
+    time_col, _order, _all_cols = _pick_time_and_ghi_dni_dhi_columns(list(raw.columns))
+    ghi_dni_dhi_cols = _order[1:]
+    df = raw[[time_col, *ghi_dni_dhi_cols]].copy()
+    df[time_col] = pd.to_datetime(df[time_col], format="%Y-%m-%d %H:%M:%S", errors="coerce")
+    if bool(df[time_col].isna().any()):
+        raise ValueError(f"{p.name}: NaT in {time_col!r} after parsing")
+    for c in ghi_dni_dhi_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    _folsom_progress(
+        f"irradiance CSV ready: {len(df):,} rows in RAM "
+        f"({time_col!r}, {', '.join(ghi_dni_dhi_cols)})"
+    )
+    return df, time_col, ghi_dni_dhi_cols
 
 
 def _resolve_folsom_csv_path(conf: dict, project_root: Path | None = None) -> Path:
@@ -620,20 +647,11 @@ class FolsomIrradianceDataset(Dataset):
                     f"sky index (cached): {len(self._sky_times):,} JPGs under {self._skyimg_dir}"
                 )
 
-        # CSV header & row count.
-        header_line = _read_header_line(self._csv_path)
-        reader = csv.reader([header_line])
-        header_cells = next(reader)
-        self._time_col, _order, self._file_columns = _pick_time_and_ghi_dni_dhi_columns(header_cells)
-        self._ghi_dni_dhi_cols = _order[1:]
-        _folsom_progress(
-            f"counting lines in irradiance CSV {self._csv_path.name} (large files can take a bit) ..."
-        )
-        total_lines = _count_newlines(self._csv_path)
-        _folsom_progress(f"irradiance CSV: {total_lines - 1:,} data rows (+ header)")
-        if total_lines < 2:
-            raise RuntimeError(f"{self._csv_path.name}: expected header + at least one data row")
-        self._n = int(total_lines - 1)
+        # Irradiance CSV: one in-memory table (Luoyang ``_csv_cache`` style).
+        self._df, self._time_col, self._ghi_dni_dhi_cols = _load_folsom_irradiance_csv(self._csv_path)
+        self._n = int(len(self._df))
+        if self._n < 1:
+            raise RuntimeError(f"{self._csv_path.name}: expected at least one data row")
 
         # Anchor bookkeeping.
         n = self._n
@@ -704,8 +722,6 @@ class FolsomIrradianceDataset(Dataset):
 
         # Internal: train epoch length (random anchors per epoch). Builders may override.
         self._train_epoch_len = _DEFAULT_FOLSOM_TRAIN_EPOCH_LEN
-        # Contiguous data rows from first X row through last Y row (inclusive).
-        self._block_nrows = int((lx - 1) * sx + ly * sy + 1)
 
         # Train anchor validity filter: keep only anchors whose Y window has at least one
         # row with finite GHI > _FOLSOM_TRAIN_GHI_DAYTIME_THRESHOLD (avoid all-night windows).
@@ -728,20 +744,7 @@ class FolsomIrradianceDataset(Dataset):
         _folsom_progress(
             f"train anchor filter: scanning {ghi_col} column for daytime Y windows ..."
         )
-        # Read just the GHI column (full file). Use str + to_numeric to tolerate non-numeric tokens.
-        ghi_series = pd.read_csv(
-            self._csv_path,
-            usecols=[ghi_col],
-            engine="c",
-            memory_map=True,
-            dtype={ghi_col: str},
-        )[ghi_col]
-        ghi_full = pd.to_numeric(ghi_series, errors="coerce").to_numpy(dtype=np.float32)
-        if ghi_full.size != self._n:
-            raise RuntimeError(
-                f"{self._csv_path.name}: expected {self._n} GHI rows, got {ghi_full.size}"
-            )
-        # Replace NaN/inf with 0 so the threshold check excludes them.
+        ghi_full = self._df[ghi_col].to_numpy(dtype=np.float32, copy=False)
         ghi_full = np.where(np.isfinite(ghi_full), ghi_full, 0.0)
 
         train_anchor_rows = self._anchors[self._train_anchor_positions]  # [N_train]
@@ -1011,20 +1014,6 @@ class FolsomIrradianceDataset(Dataset):
         clean, bad_mask = _sanitize_nwp_interp(nwp_interp)
         return torch.from_numpy(np.concatenate([clean, bad_mask], axis=1))
 
-    def _read_block(self, first_data_row: int) -> pd.DataFrame:
-        """Read ``self._block_nrows`` data rows starting at data-row index ``first_data_row``."""
-        skiprows = int(first_data_row + 1)
-        return pd.read_csv(
-            self._csv_path,
-            skiprows=skiprows,
-            nrows=self._block_nrows,
-            header=None,
-            names=self._file_columns,
-            dtype=str,
-            engine="c",
-            memory_map=True,
-        )
-
     def __len__(self) -> int:
         if self.split == "train":
             return self._train_epoch_len
@@ -1038,12 +1027,8 @@ class FolsomIrradianceDataset(Dataset):
 
         JPEG mode: per-frame paths. Zarr mode: nominal UTC grid and row count inside the Zarr slice.
         """
-        first = int(anchor - (self._lx - 1) * self._sx)
-        block = self._read_block(first)
-        if len(block) < self._block_nrows:
-            raise RuntimeError("short read in sky_inspect")
-        x_rel = anchor + self._x_tail_1d - first
-        sub_x = block.iloc[x_rel]
+        x_idx = anchor + self._x_tail_1d
+        sub_x = self._df.iloc[x_idx]
         t_x_end = sub_x[self._time_col].iloc[-1]
         if self._sky_format == "zarr":
             nominal = self._nominal_sky_frame_times(t_x_end)
@@ -1082,37 +1067,23 @@ class FolsomIrradianceDataset(Dataset):
         }
 
     def _build_tensors(self, anchor: int) -> dict[str, Any]:
-        first = int(anchor - (self._lx - 1) * self._sx)
-        block = self._read_block(first)
-        if len(block) < self._block_nrows:
-            raise RuntimeError(
-                f"{self._csv_path.name}: short read at anchor={anchor} "
-                f"(got {len(block)} rows, need {self._block_nrows}); file truncated?"
-            )
+        x_idx = anchor + self._x_tail_1d
+        y_idx = anchor + self._y_off_1d
+        sub_x = self._df.iloc[x_idx]
+        sub_y = self._df.iloc[y_idx]
 
-        # iloc into ``block``: absolute data row index minus ``first`` (block row 0 = ``first``).
-        # ``_x_tail_1d`` / ``_y_off_1d`` are offsets from ``anchor``, not absolute indices.
-        x_rel = anchor + self._x_tail_1d - first
-        y_rel = anchor + self._y_off_1d - first
-        sub_x = block.iloc[x_rel]
-        sub_y = block.iloc[y_rel]
-
-        for name in self._ghi_dni_dhi_cols:
-            if name not in sub_x.columns:
-                raise KeyError(f"missing column {name!r}")
-
-        gx = pd.to_numeric(sub_x[self._ghi_dni_dhi_cols[0]], errors="coerce")
-        dx = pd.to_numeric(sub_x[self._ghi_dni_dhi_cols[1]], errors="coerce")
-        hx = pd.to_numeric(sub_x[self._ghi_dni_dhi_cols[2]], errors="coerce")
+        gx = sub_x[self._ghi_dni_dhi_cols[0]]
+        dx = sub_x[self._ghi_dni_dhi_cols[1]]
+        hx = sub_x[self._ghi_dni_dhi_cols[2]]
         x_stack = np.stack([gx.to_numpy(), dx.to_numpy(), hx.to_numpy()], axis=0).astype(np.float32)
         x_stack = np.nan_to_num(x_stack, nan=0.0, posinf=0.0, neginf=0.0)
         # Mask depends on GHI only; DNI/DHI validity is intentionally ignored (PV ViT trains on GHI).
         valid_in = np.isfinite(gx.to_numpy())
         input_mask = torch.from_numpy(valid_in.astype(np.float32)).unsqueeze(0)
 
-        gy = pd.to_numeric(sub_y[self._ghi_dni_dhi_cols[0]], errors="coerce")
-        dy = pd.to_numeric(sub_y[self._ghi_dni_dhi_cols[1]], errors="coerce")
-        hy = pd.to_numeric(sub_y[self._ghi_dni_dhi_cols[2]], errors="coerce")
+        gy = sub_y[self._ghi_dni_dhi_cols[0]]
+        dy = sub_y[self._ghi_dni_dhi_cols[1]]
+        hy = sub_y[self._ghi_dni_dhi_cols[2]]
         y_raw = np.stack([gy.to_numpy(), dy.to_numpy(), hy.to_numpy()], axis=0).astype(np.float32)
         # Mask depends on GHI only (row 0 of y_raw); DNI/DHI validity is intentionally ignored.
         valid_out = np.isfinite(y_raw[0])
@@ -1122,14 +1093,10 @@ class FolsomIrradianceDataset(Dataset):
         ghi, dni, dhi = x_stack[0], x_stack[1], x_stack[2]
         tg, td, th = y_stack[0], y_stack[1], y_stack[2]
 
-        # Explicit format keeps __getitem__ on pandas's vectorized C path (instead of the
-        # per-element ``dateutil`` fallback, which warns and is ~50-100x slower).
-        x_times = pd.to_datetime(
-            sub_x[self._time_col], format="%Y-%m-%d %H:%M:%S", errors="coerce"
-        )
+        x_times = sub_x[self._time_col]
         if bool(x_times.isna().any()):
             raise ValueError(f"NaT in {self._time_col!r} for input window")
-        timestamps = _folsom_to_timestamps(list(x_times))
+        timestamps = _folsom_to_timestamps(x_times.tolist())
         time0 = timestamps[-1]
         forecast_timestamps = [
             time0 + pd.Timedelta(minutes=self.pv_output_interval_min * (i + 1))
@@ -1396,39 +1363,28 @@ def _smoke_sky_stem_lines(sk_ts: list) -> list[str]:
 
 
 def _find_csv_data_row_index_for_time(
-    csv_path: Path,
+    df: pd.DataFrame,
     time_col: str,
     target: pd.Timestamp,
 ) -> int:
     """
-    Scan irradiance CSV for the first data row whose ``time_col`` **exactly** matches ``target`` after parsing.
+    Return the first data row index whose ``time_col`` **exactly** matches ``target``.
 
-    Returns **0-based data row index** (row 0 = first line after the header), matching ``anchor_row`` in the dataset.
+    ``df`` is the in-memory irradiance table (``FolsomIrradianceDataset._df``).
     """
     tgt = pd.Timestamp(target)
     if tgt.tzinfo is not None:
         tgt = tgt.tz_convert("UTC").tz_localize(None)
-    offset = 0
-    for chunk in pd.read_csv(
-        csv_path,
-        usecols=[time_col],
-        chunksize=300_000,
-        dtype={time_col: str},
-        engine="c",
-        memory_map=True,
-    ):
-        ts = pd.to_datetime(chunk[time_col], format="%Y-%m-%d %H:%M:%S", errors="coerce")
-        if getattr(ts.dt, "tz", None) is not None:
-            ts = ts.dt.tz_convert("UTC").dt.tz_localize(None)
-        ok = ts == tgt
-        if ok.any():
-            pos = int(np.flatnonzero(ok.to_numpy())[0])
-            return offset + pos
-        offset += len(chunk)
-    raise ValueError(
-        f"No CSV row with {time_col!r} exactly equal to {tgt} after parsing. "
-        "Use the same string as in the file (minute-aligned for 1-minute CSV)."
-    )
+    ts = df[time_col]
+    if getattr(ts.dt, "tz", None) is not None:
+        ts = ts.dt.tz_convert("UTC").dt.tz_localize(None)
+    ok = ts == tgt
+    if not bool(ok.any()):
+        raise ValueError(
+            f"No CSV row with {time_col!r} exactly equal to {tgt}. "
+            "Use the same string as in the file (minute-aligned for 1-minute CSV)."
+        )
+    return int(np.flatnonzero(ok.to_numpy())[0])
 
 
 def _validate_smoke_anchor_train(ds: FolsomIrradianceDataset, anchor: int) -> None:
@@ -1479,9 +1435,11 @@ def run_smoke_cli(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Smoke-test Folsom DataLoader (reads paths from YAML)")
     p.add_argument(
         "--conf",
+        "--config",
         type=Path,
         default=_DEFAULT_FOLSOM_DATASET_CONFIG,
-        help="Path to YAML (paths.data_dir + pv/sky/sat, NWP).",
+        dest="conf",
+        help="Path to dataset YAML (paths.data_dir + pv/sky/sat, NWP).",
     )
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--train-epoch-len", type=int, default=8, help="Dataset __len__ for train split smoke.")
@@ -1525,7 +1483,7 @@ def run_smoke_cli(argv: list[str] | None = None) -> int:
 
     if args.last_input_time:
         anchor0 = _find_csv_data_row_index_for_time(
-            ds._csv_path,
+            ds._df,
             ds._time_col,
             pd.to_datetime(args.last_input_time),
         )
