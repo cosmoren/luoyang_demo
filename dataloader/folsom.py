@@ -18,11 +18,11 @@ Training usage (same two-step pattern as ``dataloader.luoyang``):
 ``T_out`` = ``pv_output_len``, ``T_sky`` = ``skyimg_window_size``, ``C_nwp`` = NWP feature count + 1 mask channel):
 
 - ``ghi``, ``dni``, ``dhi``: ``[B, T_in]``
-- ``input_mask``: ``[B, 1, T_in]`` (valid input timesteps; leading ``1`` matches Luoyang-style mask layout)
+- ``input_mask``: ``[B, 1, T_in]`` (valid **GHI** input timesteps; leading ``1`` matches Luoyang-style mask layout)
 - ``irr_timefeats``: ``[B, T_in, 9]`` (solar + delta-time encoding on input window)
 - ``forecast_timefeats``: ``[B, T_out, 9]`` (same on forecast timesteps)
 - ``target_ghi``, ``target_dni``, ``target_dhi``: ``[B, T_out]``
-- ``target_mask``: ``[B, T_out]``
+- ``target_mask``: ``[B, T_out]`` (valid **GHI** forecast timesteps; DNI/DHI validity does not affect this mask)
 - ``skimg_tensor``: ``[B, T_sky, 3, H, W]`` with ``H=W=skyimg_spatial_size``
 - ``skimg_timefeats``: ``[B, T_sky, feat_dim]``
 - ``nwp_tensor``: ``[B, T_out, C_nwp]`` (zeros + invalid mask if NWP file missing)
@@ -34,7 +34,8 @@ Training usage (same two-step pattern as ``dataloader.luoyang``):
 Optional keys ``skimg_tensor``, ``skimg_timefeats``, ``nwp_tensor`` may be stacked as ``None`` if a future
 sample path omits them — same guard pattern as :func:`dataloader.luoyang.collate_batched`.
 
-JPEG stems ``YYYYMMDDHHMMSS.jpg`` use **UTC**; naive CSV times are read as **UTC**.
+Sky imagery: ``paths.sky_format`` is ``jpg`` (default; ``YYYYMMDDHHMMSS.jpg`` under ``paths.sky_image_path``)
+or ``zarr`` (``xr.open_zarr`` on that path; see ``config/datasets/conf_folsom.yaml``). Naive CSV times are read as **UTC**.
 """
 
 import argparse
@@ -49,9 +50,18 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 import yaml
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
+
+try:
+    import xarray as xr
+except ImportError:  # pragma: no cover - optional until sky_format=zarr
+    xr = None  # type: ignore[assignment]
+
+# One open handle per Zarr path (train/val/test share the same store path in typical runs).
+_ZARR_SKY_DS_CACHE: dict[str, Any] = {}
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -107,6 +117,73 @@ _DEFAULT_FOLSOM_TRAIN_EPOCH_LEN = 50_000
 # threshold (W/m^2). Mirrors PVDataset's "any inverter_state == VALID_STATE" filter so we
 # avoid sampling all-night windows where target_pv is uniformly 0.
 _FOLSOM_TRAIN_GHI_DAYTIME_THRESHOLD = 10.0
+
+
+def _folsom_parse_zarr_utc_naive(raw: Any) -> pd.DatetimeIndex:
+    """Parse Zarr time values to naive UTC :class:`pandas.DatetimeIndex` (Luoyang / Folsom convention)."""
+    return pd.DatetimeIndex(
+        pd.to_datetime(np.asarray(raw), utc=True)
+    ).tz_convert("UTC").tz_localize(None)
+
+
+def _folsom_sky_zarr_time_dim_and_values(ds: Any, img: Any) -> tuple[str, np.ndarray]:
+    """
+    Return ``(time_dim_name_on_images, time_values_raw)`` so ``len(values) == images.sizes[dim]``.
+
+    Supports:
+
+    * ``images`` with a ``time_utc`` dimension and coordinate (typical ``Dataset.to_zarr``), or
+    * ``images`` with some time-like dimension whose length matches the 1D ``time_utc`` array
+      (stores with separate Zarr groups ``time_utc/`` and ``images/``, e.g. ``sky_xr_120.zarr``).
+    """
+    if "images" not in ds.data_vars:
+        raise KeyError("Folsom sky Zarr must define data variable ``images``.")
+    if "time_utc" in img.dims:
+        if "time_utc" in img.coords:
+            return "time_utc", np.asarray(img.coords["time_utc"].values)
+        if "time_utc" in ds.variables:
+            t1 = np.asarray(ds["time_utc"].values)
+            if int(t1.shape[0]) != int(img.sizes["time_utc"]):
+                raise ValueError(
+                    f"``time_utc`` length {int(t1.shape[0])} != images time axis "
+                    f"{int(img.sizes['time_utc'])}"
+                )
+            return "time_utc", t1
+        raise KeyError(
+            "``images`` has dimension ``time_utc`` but no coordinate or ``time_utc`` variable was found."
+        )
+    if "time_utc" not in ds.variables:
+        raise KeyError(
+            "Folsom sky Zarr needs ``time_utc`` on the ``images`` dimension or as a 1D ``time_utc`` "
+            "variable aligned with one dimension of ``images`` (see config/datasets/conf_folsom.yaml)."
+        )
+    tda = ds["time_utc"]
+    if int(getattr(tda, "ndim", 0) or 0) != 1:
+        raise ValueError(f"``time_utc`` must be 1D, got shape {getattr(tda, 'shape', None)}")
+    n = int(tda.shape[0])
+    tvals = np.asarray(tda.values)
+    for dim_name, sz in img.sizes.items():
+        if int(sz) == n:
+            return str(dim_name), tvals
+    raise KeyError(
+        f"No ``images`` dimension has length {n} (len(time_utc)); image dims/sizes={dict(img.sizes)}"
+    )
+
+
+def _folsom_sky_zarr_len_time_utc(ds: Any) -> int:
+    """Number of sky timesteps (for progress logging)."""
+    img = ds["images"]
+    _, raw = _folsom_sky_zarr_time_dim_and_values(ds, img)
+    return int(np.asarray(raw).shape[0])
+
+
+def _folsom_sky_zarr_count_in_time_range(ds: Any, t0: Any, t1: Any) -> int:
+    """Count Zarr timesteps with naive UTC in ``[t0, t1]`` inclusive."""
+    img = ds["images"]
+    _, raw = _folsom_sky_zarr_time_dim_and_values(ds, img)
+    zt = _folsom_parse_zarr_utc_naive(raw)
+    a0, a1 = pd.Timestamp(t0), pd.Timestamp(t1)
+    return int(np.count_nonzero((zt >= a0) & (zt <= a1)))
 
 
 def _folsom_progress(msg: str) -> None:
@@ -243,7 +320,7 @@ def load_folsom_conf(path: Path | str) -> dict:
 
     Caller must supply the path explicitly; this module never reads a hardcoded canonical
     config file. The expected schema mirrors ``config/datasets/conf_luoyang.yaml``:
-    ``paths.{data_dir, pv_path, sky_image_path, sat_path, ...}`` plus a ``sampling:``
+    ``paths.{data_dir, pv_path, sky_image_path, sat_path, sky_format, ...}`` plus a ``sampling:``
     section with the PVDataset-style window / stride / image-shape fields.
     """
     if path is None:
@@ -339,9 +416,10 @@ class FolsomIrradianceDataset(Dataset):
     ``_DEFAULT_FOLSOM_TRAIN_EPOCH_LEN``; settable via ``self._train_epoch_len``); val/test use the
     respective ``*_anchor_stride_min`` strides over their bands.
 
-    ``skyimg_window_size`` is the count of sky JPEGs ending at the last input timestep (anchor),
-    spaced by ``skyimg_time_resolution_min`` (oldest first in ``skimg_tensor``). All timestamps
-    are UTC.
+    ``skyimg_window_size`` is the count of sky frames ending at the last input timestep (anchor),
+    spaced by ``skyimg_time_resolution_min`` (oldest first in ``skimg_tensor``). With
+    ``paths.sky_format: zarr``, frames are read from a Zarr ``images(time_utc, ...)`` store; with
+    ``jpg``, from timestamped JPEG files. All timestamps are UTC.
     """
 
     def __init__(
@@ -468,6 +546,14 @@ class FolsomIrradianceDataset(Dataset):
         self.latitude = float(lat)
         self.longitude = float(lon)
 
+        raw_sf = paths_cfg.get("sky_format", "jpg")
+        sky_fmt = str(raw_sf).strip().lower()
+        if sky_fmt not in ("jpg", "zarr"):
+            raise ValueError(
+                f"paths.sky_format must be 'jpg' or 'zarr' (got {raw_sf!r}) in {self._config_path}"
+            )
+        self._sky_format = sky_fmt
+
         self._nwp_feature_cols = tuple(_FOLSOM_NWP_FEATURE_COLS)
         nwp_rel = paths_cfg.get("folsom_nwp_merged_csv")
         self._nwp_merged_df = None
@@ -480,7 +566,7 @@ class FolsomIrradianceDataset(Dataset):
 
         # API parity with PVDataset: trainer reads ``train_dataset.devDn_list`` to size the
         # device-id embedding. Folsom is a single-sensor station, so a length-1 list is fine
-        # (paired with ``dev_idx=0`` returned by ``_build_tensors``).
+        # (paired with ``dev_idx=700`` returned by ``_build_tensors``).
         self.devDn_list = [0]
 
         # CSV: glob ``pv_dir`` for *.csv (PVDataset convention); Folsom expects exactly one.
@@ -496,21 +582,43 @@ class FolsomIrradianceDataset(Dataset):
         self._csv_path = self.sample_files[0].resolve()
         _folsom_progress(f"dataset split={split!r}: preparing {self._csv_path.name} ...")
 
-        # Sky index (cached across instances sharing skyimg_dir).
-        cache_key = str(self._skyimg_dir)
-        cached = _SKY_INDEX_CACHE.get(cache_key)
-        if cached is None:
-            sky_times, sky_paths = self._scan_sky_index()
-            sky_times_ns = [int(t.value) for t in sky_times]
-            _SKY_INDEX_CACHE[cache_key] = (sky_times, sky_paths, sky_times_ns)
-            self._sky_times, self._sky_paths, self._sky_times_ns = sky_times, sky_paths, sky_times_ns
-        else:
-            self._sky_times, self._sky_paths, self._sky_times_ns = cached
-            _folsom_progress(
-                f"sky index (cached): {len(self._sky_times):,} JPGs under {self._skyimg_dir}"
-            )
+        # Sky: JPEG directory index, or Zarr store (``paths.sky_format``).
         self._sky_gap_threshold = pd.Timedelta(minutes=5)
         self._sky_anchor_max_lag = pd.Timedelta(minutes=5)
+        if self._sky_format == "zarr":
+            if xr is None:
+                raise ImportError(
+                    "paths.sky_format=zarr requires ``xarray`` (and a Zarr backend such as ``zarr``). "
+                    "Install them or set paths.sky_format to 'jpg'."
+                )
+            zp = self._skyimg_dir
+            if not zp.exists():
+                raise FileNotFoundError(f"sky Zarr path not found: {zp}")
+            zkey = zp.resolve().as_posix()
+            if zkey not in _ZARR_SKY_DS_CACHE:
+                _ZARR_SKY_DS_CACHE[zkey] = xr.open_zarr(zp)
+            self._skyimg_ds = _ZARR_SKY_DS_CACHE[zkey]
+            self._validate_sky_zarr_schema(self._skyimg_ds)
+            self._sky_times, self._sky_paths, self._sky_times_ns = [], [], []
+            try:
+                nt = _folsom_sky_zarr_len_time_utc(self._skyimg_ds)
+            except Exception:
+                nt = 0
+            _folsom_progress(f"sky Zarr: {zp}  (time steps ≈ {nt:,})")
+        else:
+            self._skyimg_ds = None
+            cache_key = f"{self._skyimg_dir}|jpg"
+            cached = _SKY_INDEX_CACHE.get(cache_key)
+            if cached is None:
+                sky_times, sky_paths = self._scan_sky_index()
+                sky_times_ns = [int(t.value) for t in sky_times]
+                _SKY_INDEX_CACHE[cache_key] = (sky_times, sky_paths, sky_times_ns)
+                self._sky_times, self._sky_paths, self._sky_times_ns = sky_times, sky_paths, sky_times_ns
+            else:
+                self._sky_times, self._sky_paths, self._sky_times_ns = cached
+                _folsom_progress(
+                    f"sky index (cached): {len(self._sky_times):,} JPGs under {self._skyimg_dir}"
+                )
 
         # CSV header & row count.
         header_line = _read_header_line(self._csv_path)
@@ -699,6 +807,112 @@ class FolsomIrradianceDataset(Dataset):
         s = self._skyimg_spatial_size
         return torch.zeros((3, s, s), dtype=torch.float32)
 
+    @staticmethod
+    def _sky_filename_ts(ts_raw) -> pd.Timestamp:
+        """Naive UTC timestamp for sky frame alignment; seconds floored to 0 (Luoyang convention)."""
+        ts = pd.Timestamp(ts_raw)
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert("UTC").tz_localize(None)
+        return ts.replace(second=0, microsecond=0, nanosecond=0)
+
+    def _validate_sky_zarr_schema(self, ds: Any) -> None:
+        """
+        Require ``images`` plus an alignable ``time_utc`` timeline.
+
+        Extra arrays (e.g. ``azimuth``, ``zenith``, ``day_of_year``) are ignored; ``skimg_timefeats``
+        still comes from ``compute_solar_features`` on nominal UTC frame times.
+        """
+        if "images" not in ds.data_vars:
+            raise KeyError(
+                "Folsom sky Zarr must define data variable ``images`` "
+                "(see config/datasets/conf_folsom.yaml)."
+            )
+        _folsom_sky_zarr_time_dim_and_values(ds, ds["images"])
+
+    def _nominal_sky_frame_times(self, t_end_wall: Any) -> list[pd.Timestamp]:
+        """Oldest→newest ``skyimg_window_size`` timestamps spaced by ``_skyimg_dt_min`` ending at anchor."""
+        t_end = self._sky_filename_ts(t_end_wall)
+        w = self.skyimg_window_size
+        dt = self._skyimg_dt_min
+        return [t_end - timedelta(minutes=(w - 1 - i) * dt) for i in range(w)]
+
+    def _resize_sky_chw(self, chw: torch.Tensor) -> torch.Tensor:
+        """``[3,H,W]`` float32 → ``[3,s,s]`` bilinear (matches JPEG resize target size)."""
+        s = self._skyimg_spatial_size
+        if chw.shape[-2:] == (s, s):
+            return chw
+        x = chw.unsqueeze(0)
+        y = F.interpolate(x, size=(s, s), mode="bilinear", align_corners=False)
+        return y.squeeze(0)
+
+    def _tensor_from_zarr_image_tile(self, tile: np.ndarray) -> torch.Tensor:
+        """One timestep tile: HWC or CHW → ``[3,s,s]`` float32 in ``[0, 1]``."""
+        t = torch.from_numpy(np.asarray(tile, dtype=np.float32))
+        if t.ndim != 3:
+            raise ValueError(f"sky Zarr ``images`` tile must be 3D, got shape {tuple(tile.shape)}")
+        if t.shape[-1] == 3 and t.shape[0] != 3:
+            t = t.permute(2, 0, 1).contiguous()
+        elif t.shape[0] != 3:
+            raise ValueError(
+                f"sky Zarr ``images`` must be HWC or CHW with 3 channels; got {tuple(t.shape)}"
+            )
+        mx = float(t.detach().max().item()) if t.numel() else 0.0
+        if mx > 1.5:
+            t = (t / 255.0).clamp(0.0, 1.0)
+        else:
+            t = t.clamp(0.0, 1.0)
+        return self._resize_sky_chw(t)
+
+    def _stack_sky_from_zarr(self, t_end_wall: Any) -> torch.Tensor:
+        """
+        Stack ``[W, 3, H, W]`` from Zarr using the same nominal UTC grid as the JPEG loader.
+
+        Selects rows whose ``time_utc`` falls in ``[nominal[0], nominal[-1]]`` (index-based, so it
+        works for ``sky_xr_120.zarr``-style stores with a separate ``time_utc`` array), then
+        nearest-neighbour per nominal step (90 s tolerance). If the newest kept row is too far
+        before the anchor (``_sky_anchor_max_lag``), returns black frames (same spirit as JPEG).
+        """
+        w = self.skyimg_window_size
+        nominal = self._nominal_sky_frame_times(t_end_wall)
+        black = torch.stack([self._black_sky_tensor()] * w, dim=0)
+        if self._skyimg_ds is None:
+            return black
+        ds = self._skyimg_ds
+        img = ds["images"]
+        time_dim, raw_t = _folsom_sky_zarr_time_dim_and_values(ds, img)
+        z_times = _folsom_parse_zarr_utc_naive(raw_t)
+        t_lo, t_hi = pd.Timestamp(nominal[0]), pd.Timestamp(nominal[-1])
+        mask = (z_times >= t_lo) & (z_times <= t_hi)
+        idx = np.nonzero(np.asarray(mask, dtype=bool))[0]
+        if idx.size == 0:
+            return black
+        sub = img.isel({time_dim: idx})
+        z_sub = z_times[idx]
+        z_np = np.asarray(sub.values, dtype=np.float32)
+        ta = int(sub.get_axis_num(time_dim))
+        if ta != 0:
+            z_np = np.moveaxis(z_np, ta, 0)
+        if z_np.shape[0] != len(z_sub):
+            raise RuntimeError(
+                f"sky Zarr internal mismatch: time len {len(z_sub)} vs stacked dim 0 {z_np.shape[0]}"
+            )
+        t_end = pd.Timestamp(self._sky_filename_ts(nominal[-1]))
+        newest = z_sub[-1]
+        if t_end - newest > self._sky_anchor_max_lag:
+            return black
+        z_ns = z_sub.asi8.astype(np.int64)
+        max_delta = int(pd.Timedelta(seconds=90).value)
+        frames: list[torch.Tensor] = []
+        for want in nominal:
+            wn = self._sky_filename_ts(want)
+            want_ns = int(wn.value)
+            j = int(np.argmin(np.abs(z_ns - want_ns)))
+            if abs(int(z_ns[j]) - want_ns) > max_delta:
+                frames.append(self._black_sky_tensor())
+            else:
+                frames.append(self._tensor_from_zarr_image_tile(z_np[j]))
+        return torch.stack(frames, dim=0)
+
     def _load_sky_tensor(self, path: Path) -> torch.Tensor:
         """Return ``[3, s, s]`` float32 in ``[0, 1]`` (matches PVDataset)."""
         try:
@@ -820,10 +1034,9 @@ class FolsomIrradianceDataset(Dataset):
 
     def sky_inspect(self, anchor: int) -> dict:
         """
-        Resolve last-N sky JPEG records for ``anchor`` without building full tensors.
+        Resolve last-N sky records for ``anchor`` without building full tensors.
 
-        Returns keys: ``anchor_row``, ``last_input_time_utc_naive``, ``n_frames``,
-        ``utc_times``, ``paths``, ``n_files_found``, ``skyimg_dir``.
+        JPEG mode: per-frame paths. Zarr mode: nominal UTC grid and row count inside the Zarr slice.
         """
         first = int(anchor - (self._lx - 1) * self._sx)
         block = self._read_block(first)
@@ -832,6 +1045,28 @@ class FolsomIrradianceDataset(Dataset):
         x_rel = anchor + self._x_tail_1d - first
         sub_x = block.iloc[x_rel]
         t_x_end = sub_x[self._time_col].iloc[-1]
+        if self._sky_format == "zarr":
+            nominal = self._nominal_sky_frame_times(t_x_end)
+            t_last_n = pd.Timestamp(nominal[-1])
+            n_z = 0
+            if self._skyimg_ds is not None and len(nominal) > 0:
+                try:
+                    n_z = _folsom_sky_zarr_count_in_time_range(
+                        self._skyimg_ds, nominal[0], nominal[-1]
+                    )
+                except Exception:
+                    n_z = 0
+            return {
+                "anchor_row": int(anchor),
+                "last_input_time_utc_naive": str(t_last_n),
+                "n_frames": len(nominal),
+                "utc_times": [str(pd.Timestamp(t)) for t in nominal],
+                "paths": [],
+                "n_files_found": n_z,
+                "skyimg_dir": self._skyimg_dir,
+                "sky_format": "zarr",
+                "zarr_slice_timesteps": n_z,
+            }
         sk_times, sk_paths = self._history_sky_frame_records(t_x_end)
         n_found = sum(1 for p in sk_paths if p is not None)
         t_last_n = pd.Timestamp(sk_times[-1])
@@ -843,6 +1078,7 @@ class FolsomIrradianceDataset(Dataset):
             "paths": [p if p is not None else Path("<black>") for p in sk_paths],
             "n_files_found": n_found,
             "skyimg_dir": self._skyimg_dir,
+            "sky_format": "jpg",
         }
 
     def _build_tensors(self, anchor: int) -> dict[str, Any]:
@@ -870,14 +1106,16 @@ class FolsomIrradianceDataset(Dataset):
         hx = pd.to_numeric(sub_x[self._ghi_dni_dhi_cols[2]], errors="coerce")
         x_stack = np.stack([gx.to_numpy(), dx.to_numpy(), hx.to_numpy()], axis=0).astype(np.float32)
         x_stack = np.nan_to_num(x_stack, nan=0.0, posinf=0.0, neginf=0.0)
-        valid_in = np.isfinite(np.stack([gx.to_numpy(), dx.to_numpy(), hx.to_numpy()], axis=0)).all(axis=0)
+        # Mask depends on GHI only; DNI/DHI validity is intentionally ignored (PV ViT trains on GHI).
+        valid_in = np.isfinite(gx.to_numpy())
         input_mask = torch.from_numpy(valid_in.astype(np.float32)).unsqueeze(0)
 
         gy = pd.to_numeric(sub_y[self._ghi_dni_dhi_cols[0]], errors="coerce")
         dy = pd.to_numeric(sub_y[self._ghi_dni_dhi_cols[1]], errors="coerce")
         hy = pd.to_numeric(sub_y[self._ghi_dni_dhi_cols[2]], errors="coerce")
         y_raw = np.stack([gy.to_numpy(), dy.to_numpy(), hy.to_numpy()], axis=0).astype(np.float32)
-        valid_out = np.isfinite(y_raw).all(axis=0)
+        # Mask depends on GHI only (row 0 of y_raw); DNI/DHI validity is intentionally ignored.
+        valid_out = np.isfinite(y_raw[0])
         target_mask = torch.from_numpy(valid_out.astype(np.float32))
         y_stack = np.nan_to_num(y_raw, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -910,18 +1148,27 @@ class FolsomIrradianceDataset(Dataset):
         forecast_timefeats = torch.cat([f_tf, f_dtf.unsqueeze(1)], dim=1)
 
         t_x_end = sub_x[self._time_col].iloc[-1]
-        skimg_timestamps, skimg_paths = self._history_sky_frame_records(t_x_end)
-        skimg_solar_features = compute_solar_features(
-            skimg_timestamps, self.latitude, self.longitude
-        )
-        skimg_tf = solar_features_encoder(skimg_solar_features)
-        skimg_dtf = delta_time_encoder(skimg_timestamps, time0)
-        skimg_timefeats = torch.cat([skimg_tf, skimg_dtf.unsqueeze(1)], dim=1)
-        skimg_tensor = self._stack_sky_frames(skimg_paths)
-        skimg_timestamps = [
-            (None if p is None else pd.Timestamp(t).strftime("%Y%m%d%H%M%S"))
-            for t, p in zip(skimg_timestamps, skimg_paths)
-        ]
+        if self._sky_format == "zarr":
+            nominal = self._nominal_sky_frame_times(t_x_end)
+            skimg_tensor = self._stack_sky_from_zarr(t_x_end)
+            skimg_solar_features = compute_solar_features(nominal, self.latitude, self.longitude)
+            skimg_tf = solar_features_encoder(skimg_solar_features)
+            skimg_dtf = delta_time_encoder(nominal, time0)
+            skimg_timefeats = torch.cat([skimg_tf, skimg_dtf.unsqueeze(1)], dim=1)
+            skimg_timestamps = [t.strftime("%Y%m%d%H%M%S") for t in nominal]
+        else:
+            skimg_timestamps, skimg_paths = self._history_sky_frame_records(t_x_end)
+            skimg_solar_features = compute_solar_features(
+                skimg_timestamps, self.latitude, self.longitude
+            )
+            skimg_tf = solar_features_encoder(skimg_solar_features)
+            skimg_dtf = delta_time_encoder(skimg_timestamps, time0)
+            skimg_timefeats = torch.cat([skimg_tf, skimg_dtf.unsqueeze(1)], dim=1)
+            skimg_tensor = self._stack_sky_frames(skimg_paths)
+            skimg_timestamps = [
+                (None if p is None else pd.Timestamp(t).strftime("%Y%m%d%H%M%S"))
+                for t, p in zip(skimg_timestamps, skimg_paths)
+            ]
 
         input_timestamps_utc = [str(pd.Timestamp(t)) for t in timestamps]
         forecast_timestamps_utc = [str(pd.Timestamp(t)) for t in forecast_timestamps]
@@ -936,7 +1183,15 @@ class FolsomIrradianceDataset(Dataset):
             "pv": pv_tensor,
             "pv_mask": input_mask,
             "pv_timefeats": irr_timefeats,
+            "ghi": torch.from_numpy(ghi.astype(np.float32)),
+            "dni": torch.from_numpy(dni.astype(np.float32)),
+            "dhi": torch.from_numpy(dhi.astype(np.float32)),
+            "input_mask": input_mask,
+            "irr_timefeats": irr_timefeats,
             "forecast_timefeats": forecast_timefeats,
+            "target_ghi": torch.from_numpy(tg.astype(np.float32)),
+            "target_dni": torch.from_numpy(td.astype(np.float32)),
+            "target_dhi": torch.from_numpy(th.astype(np.float32)),
             "target_pv": target_pv_tensor,
             "target_mask": target_mask,
             "sat_tensor": None,
@@ -944,6 +1199,9 @@ class FolsomIrradianceDataset(Dataset):
             "skimg_tensor": skimg_tensor,
             "skimg_timefeats": skimg_timefeats,
             "nwp_tensor": nwp_tensor,
+            "input_timestamps_utc": input_timestamps_utc,
+            "forecast_timestamps_utc": forecast_timestamps_utc,
+            "skimg_timestamps": skimg_timestamps,
         }
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
@@ -1018,7 +1276,7 @@ def build_folsom_irradiance_datasets_from_conf(
     Build train/test :class:`FolsomIrradianceDataset` from a Folsom dataset YAML (new schema:
     ``config/datasets/conf_folsom.yaml``).
 
-    Reads ``paths.{data_dir, pv_path, sky_image_path, sat_path}`` and the ``sampling:`` section
+    Reads ``paths.{data_dir, pv_path, sky_image_path, sat_path, sky_format}`` and the ``sampling:`` section
     (PVDataset-style window / stride / image-shape fields). Lat/lon comes from
     ``<paths.data_dir>/info.yaml`` and the optional NWP merged CSV from
     ``paths.folsom_nwp_merged_csv`` — both read inside the dataset constructor.
@@ -1307,7 +1565,12 @@ def run_smoke_cli(argv: list[str] | None = None) -> int:
         f"input window:      {tin[0]}  →  {tin[-1]}",
         f"forecast window:   {tout[0]}  →  {tout[-1]}",
         f"skyimg_dir={sky['skyimg_dir']}",
-        f"jpeg_files_found (on disk vs window slots): {sky['n_files_found']}/{sky['n_frames']}",
+        (
+            f"zarr: slice rows in [oldest,nominal-newest] time range ≈ {sky['n_files_found']} / "
+            f"nominal_slots={sky['n_frames']}  (paths.sky_format=zarr)"
+            if sky.get("sky_format") == "zarr"
+            else f"jpeg_files_found (on disk vs window slots): {sky['n_files_found']}/{sky['n_frames']}"
+        ),
     ])
 
     in_lines = _smoke_irradiance_lines(tin, g, dn, dh)
