@@ -1,6 +1,5 @@
-# Same as conf_luoyang.yaml but sat/sky/NWP are read from /dev/shm (RAM).
-# pv_sf1 stays on /work because it is only read once at __init__ time.
-# Run scripts/vit_test.sh which rsyncs the hot data to /dev/shm automatically.
+# Same as conf_luoyang.yaml but paths.data_dir points at /dev/shm (RAM).
+# Run scripts/vit_test.sh which rsyncs the full /work/datasets/luoyang_SPMF tree there.
 
 site:
   name: Luoyang
@@ -8,10 +7,9 @@ site:
 paths:
   data_dir: "/dev/shm/luoyang_SPMF"
   pv_device_path: dataloader/XINSHENG_power_total_devices_type1.xlsx
-  # pv_sf1 is ~3.4 GB and only read once at dataset init, keep it on /work
-  pv_path: "/work/datasets/luoyang_SPMF/pv_sf1"
+  pv_path: pv
   sky_image_path: skimg_zarr
-  sat_path: sat_himawari_zarr1
+  sat_path: sat_himawari_zarr_500km
   nwp_path: NWP
 
 sampling:

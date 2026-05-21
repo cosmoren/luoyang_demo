@@ -2,10 +2,10 @@
 # Run train_vit_test.py TOTAL times across multiple GPUs in parallel.
 # Each GPU gets its own checkpoint / metrics file (gpu{N} suffix).
 #
-# Before launching training, satellite and sky zarr stores are rsynced from
-# /work to /dev/shm (RAM-backed tmpfs) so all parallel runs share one fast
-# in-memory copy with no NFS contention.  Only the first invocation does the
-# rsync; subsequent calls (or parallel script launches) skip it via a done-flag
+# Before launching training, the full luoyang_SPMF tree is rsynced from /work
+# to /dev/shm (RAM-backed tmpfs) so all parallel runs share one fast in-memory
+# copy with no NFS contention.  Only the first invocation does the rsync;
+# subsequent calls (or parallel script launches) skip it via a done-flag
 # protected by flock.
 #
 # Tunables: override via env, e.g. `GPUS="0 1" TOTAL=10 bash scripts/vit_test.sh`
@@ -27,12 +27,9 @@ echo "[shm] Checking /dev/shm cache ..."
 (
     flock -x 9
     if [ ! -f "${DONE}" ]; then
-        echo "[shm] Copying hot data to /dev/shm (~1 GB, one-time) ..."
+        echo "[shm] Copying ${SRC} -> ${DST} (full tree, one-time) ..."
         mkdir -p "${DST}"
-        rsync -a --info=progress2 "${SRC}/sat_himawari_zarr1" "${DST}/"
-        rsync -a --info=progress2 "${SRC}/skimg_zarr"         "${DST}/"
-        rsync -a                  "${SRC}/NWP"                "${DST}/"
-        rsync -a                  "${SRC}/info.yaml"          "${DST}/"
+        rsync -a --info=progress2 "${SRC}/" "${DST}/"
         touch "${DONE}"
         echo "[shm] Done. $(du -sh ${DST} | cut -f1) in /dev/shm."
     else
