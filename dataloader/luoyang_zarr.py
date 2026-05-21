@@ -1,5 +1,8 @@
 """Luoyang PV dataset and loader utilities for training."""
+import os
 import sys
+import time
+from collections import defaultdict
 from datetime import timedelta
 from pathlib import Path
 import numpy as np
@@ -10,7 +13,6 @@ from PIL import Image
 from pvlib import solarposition
 from torch.utils.data import Dataset
 from modules.solar_encoder import compute_solar_features, solar_features_encoder, delta_time_encoder, extract_solar_features
-import time
 import xarray as xr
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -18,6 +20,77 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from config_utils import get_resolved_paths
+
+
+class _DatasetProfiler:
+    """
+    Lightweight per-section timer for ``PVDataset.__getitem__`` / ``_build_sample``.
+
+    Enable:  ``PV_DATASET_PROFILE=1``
+    Report every N samples (per DataLoader worker): ``PV_DATASET_PROFILE_EVERY=50`` (default 100)
+    """
+
+    def __init__(self, enabled: bool, report_every: int) -> None:
+        self.enabled = enabled
+        self.report_every = max(1, int(report_every))
+        self._sample_count = 0
+        self._totals: dict[str, float] = defaultdict(float)
+        self._t0: float | None = None
+        self._last: float | None = None
+
+    @classmethod
+    def from_env(cls) -> "_DatasetProfiler":
+        raw = os.environ.get("PV_DATASET_PROFILE", "0").strip().lower()
+        enabled = raw not in ("0", "", "false", "no", "off")
+        every = int(os.environ.get("PV_DATASET_PROFILE_EVERY", "100"))
+        return cls(enabled=enabled, report_every=every)
+
+    def begin_sample(self) -> None:
+        if not self.enabled:
+            return
+        self._t0 = time.perf_counter()
+        self._last = self._t0
+
+    def mark(self, section: str) -> None:
+        if not self.enabled or self._last is None:
+            return
+        now = time.perf_counter()
+        self._totals[section] += now - self._last
+        self._last = now
+
+    def end_sample(self) -> None:
+        if not self.enabled or self._t0 is None:
+            return
+        now = time.perf_counter()
+        self._totals["total"] += now - self._t0
+        self._sample_count += 1
+        self._t0 = None
+        self._last = None
+        if self._sample_count % self.report_every == 0:
+            self._print_report()
+
+    def _print_report(self) -> None:
+        try:
+            from torch.utils.data import get_worker_info
+            wi = get_worker_info()
+            wid = wi.id if wi is not None else "main"
+        except Exception:
+            wid = "?"
+        n = self._sample_count
+        total_ms = self._totals.get("total", 0.0) * 1000.0 / n
+        lines = [
+            f"[PVDataset profile worker={wid}] last {self.report_every} samples "
+            f"(cumulative n={n}), avg total={total_ms:.2f} ms/sample"
+        ]
+        keys = [k for k in self._totals if k != "total"]
+        keys.sort(key=lambda k: self._totals[k], reverse=True)
+        for k in keys:
+            ms = self._totals[k] * 1000.0 / n
+            pct = 100.0 * self._totals[k] / max(self._totals["total"], 1e-12)
+            lines.append(f"  {k:28s} {ms:8.2f} ms  ({pct:5.1f}%)")
+        print("\n".join(lines), flush=True)
+        self._totals.clear()
+
 
 # --- PV per-station CSV helpers (5-minute rows, ``collectTime`` sorted) ---
 
@@ -216,7 +289,8 @@ class PVDataset(Dataset):
     for these boundaries (splits are fixed at 60% / 10% / 30%).
 
     Train: ``__len__`` = number of CSVs; ``__getitem__`` picks a **random** train-segment anchor where Y has at
-    least one ``inverter_state == VALID_STATE``.
+    least one ``inverter_state == VALID_STATE``. Valid anchor indices per CSV are **precomputed in ``__init__``**
+    (``_valid_anchor_rows``) so ``__getitem__`` only does ``np.random.choice`` — no repeated full-column scan.
 
     Val (``split="val"``): anchors in the val row band are taken every ``val_anchor_stride_min`` (CSV row axis,
     no Y validity filter). Test (``split="test"``): same idea with ``test_anchor_stride_min``.
@@ -492,6 +566,7 @@ class PVDataset(Dataset):
 
         valid_files: list[Path] = []
         self._csv_cache: dict[str, pd.DataFrame] = {}
+        self._valid_anchor_rows: dict[str, np.ndarray] = {}
         for i, p in enumerate(self.sample_files):
             print(f"Processing file {i+1} of {len(self.sample_files)}: {p.name}")
             df = ref_df if i == 0 else load_csv(p)
@@ -505,10 +580,11 @@ class PVDataset(Dataset):
                     pd.to_numeric(df[INVERTER_STATE_COL], errors="coerce").fillna(0).astype(int).values
                     == VALID_STATE
                 )
-                ok = inv[self._y_idx_per_anchor].any(axis=1) & self._train_anchor_mask
-                if ok.any():
+                valid_rows = self._valid_train_anchor_rows(inv)
+                if valid_rows.size > 0:
                     valid_files.append(p)
                     self._csv_cache[cache_key] = df
+                    self._valid_anchor_rows[cache_key] = valid_rows
             else:
                 valid_files.append(p)
                 self._csv_cache[cache_key] = df
@@ -531,12 +607,25 @@ class PVDataset(Dataset):
                 )
             )
 
+        self._profiler = _DatasetProfiler.from_env()
+        if self._profiler.enabled:
+            print(
+                f"[PVDataset] profiling ON (report every {self._profiler.report_every} samples/worker); "
+                f"set PV_DATASET_PROFILE=0 to disable",
+                flush=True,
+            )
+
     def __len__(self):
         if self.split == "train":
             return len(self.sample_files) * self._train_samples_per_csv
         if self.split == "val":
             return len(self.sample_files) * self._num_val_windows
         return len(self.sample_files) * self._num_test_windows
+
+    def _valid_train_anchor_rows(self, inv: np.ndarray) -> np.ndarray:
+        """Anchor indices where at least one forecast Y row has ``inverter_state == VALID_STATE``."""
+        valid_mask = inv[self._y_idx_per_anchor].any(axis=1) & self._train_anchor_mask
+        return np.nonzero(valid_mask)[0].astype(np.intp, copy=False)
 
     def _row_index_for_collect_time_match(
         self,
@@ -741,7 +830,7 @@ class PVDataset(Dataset):
         *,
         anchor_last_row: int | None = None,
     ) -> dict:
-        t0 = time.time()
+        prof = self._profiler
         if anchor_last_row is not None:
             j = int(anchor_last_row)
             x_idx = j + self._x_tail_1d
@@ -756,8 +845,9 @@ class PVDataset(Dataset):
             y_idx_1d = self._y_idx_per_anchor[r]
         sub_x = df.iloc[x_idx]
         sub_y = df.iloc[y_idx_1d]
+        prof.mark("build.iloc_sub_xy")
 
-        # Same as forecast_timestamps_utc / sat_timestamps_utc / skimg_timestamps_utc: UTC-aware pd.Timestamp
+        # Same as forecast_timestamps_utc
         timestamps = self._to_utc_timestamps(list(sub_x["collectTime"]))
         time0_utc = timestamps[-1]
 
@@ -765,12 +855,14 @@ class PVDataset(Dataset):
         pow_x = pd.to_numeric(sub_x["active_power"], errors="coerce").fillna(0).values.astype(np.float32) / 50.0
         pv_mask = torch.from_numpy((inv_x == VALID_STATE).astype(np.float32)).unsqueeze(0)
         pv = torch.from_numpy(pow_x.astype(np.float32)).unsqueeze(0)
+        prof.mark("build.pv_history_tensors")
 
         pv_solar_features = extract_solar_features(sub_x)
         # pv_solar_features = compute_solar_features(timestamps, self.latitude, self.longitude)
         pv_timefeats = solar_features_encoder(pv_solar_features)
         pv_dtimefeats = delta_time_encoder(timestamps, time0_utc)
         pv_timefeats = torch.cat([pv_timefeats, pv_dtimefeats.unsqueeze(1)], dim=1)
+        prof.mark("build.pv_timefeats")
 
         forecast_timestamps_utc = self._to_utc_timestamps(list(sub_y["collectTime"]))
         # forecast_timestamps_utc = [
@@ -782,6 +874,7 @@ class PVDataset(Dataset):
         forecast_timefeats = solar_features_encoder(forecast_solar_features)
         forecast_dtimefeats = delta_time_encoder(forecast_timestamps_utc, time0_utc)
         forecast_timefeats = torch.cat([forecast_timefeats, forecast_dtimefeats.unsqueeze(1)], dim=1)
+        prof.mark("build.forecast_timefeats")
 
         # Interpolate NWP features on forecast_timestamps_utc → [T_out, 7] (ssrd + wind scalars)
         nwp_out = interpolate_nwp_features(self._nwp_solar_blocks, self._nwp_wind_blocks, forecast_timestamps_utc)
@@ -789,11 +882,13 @@ class PVDataset(Dataset):
             nwp_tensor = None
         else:
             nwp_tensor = torch.from_numpy(np.asarray(nwp_out, dtype=np.float32))
+        prof.mark("build.nwp_interp")
 
         inv_y = pd.to_numeric(sub_y[INVERTER_STATE_COL], errors="coerce").fillna(0).astype(np.int32).values
         pow_y = pd.to_numeric(sub_y["active_power"], errors="coerce").fillna(0).values.astype(np.float32)
         target_pv = torch.from_numpy((pow_y / 50.0).astype(np.float32))
         target_mask = torch.from_numpy((inv_y == VALID_STATE).astype(np.float32))
+        prof.mark("build.targets")
 
         # Select satellite images from the window
         sat_t0 = time0_utc - timedelta(minutes=(245+30))
@@ -801,18 +896,24 @@ class PVDataset(Dataset):
         sat_t0 = pd.Timestamp(sat_t0).tz_convert("UTC").tz_localize(None)
         sat_t1 = pd.Timestamp(sat_t1).tz_convert("UTC").tz_localize(None)
         sat_data = self.satimg_ds.sel(time_utc=slice(sat_t0, sat_t1))
+        prof.mark("build.sat_zarr_sel")
+
         sat_solar_features = {'azimuth': sat_data['azimuth'].values, 
                               'zenith': sat_data['zenith'].values, 
                               'day_of_year': sat_data['day_of_year'].values, 
                               'hour_of_day': sat_data['hour_of_day'].values}
         sat_timestamps_utc = sat_data['time_utc'].values
+        prof.mark("build.sat_meta_values")
 
         sat_timefeats = solar_features_encoder(sat_solar_features)
         sat_dtimefeats = delta_time_encoder(sat_timestamps_utc, time0_utc)
         sat_timefeats = torch.cat([sat_timefeats, sat_dtimefeats.unsqueeze(1)], dim=1)
+        prof.mark("build.sat_timefeats")
+
         sat_tensor = torch.from_numpy(
             np.asarray(sat_data['images'].values, dtype=np.float32)
         )
+        prof.mark("build.sat_images_values")
 
         if sat_tensor.shape[0]>24:
             sat_tensor = sat_tensor[-24:, :, :, :]
@@ -820,7 +921,7 @@ class PVDataset(Dataset):
         else:
             sat_tensor = torch.cat([torch.zeros(24-sat_tensor.shape[0], sat_tensor.shape[1], sat_tensor.shape[2], sat_tensor.shape[3]), sat_tensor], dim=0)
             sat_timefeats = torch.cat([torch.zeros(24-sat_timefeats.shape[0], sat_timefeats.shape[1]), sat_timefeats], dim=0)
-        
+        prof.mark("build.sat_pad_trim")
 
         '''
         import matplotlib.pyplot as plt
@@ -889,6 +990,9 @@ class PVDataset(Dataset):
 
 
     def __getitem__(self, idx):
+        prof = self._profiler
+        prof.begin_sample()
+
         if self.split == "train":
             sample_path = self.sample_files[idx % len(self.sample_files)]
             r_fixed: int | None = None
@@ -900,6 +1004,7 @@ class PVDataset(Dataset):
             nw = self._num_test_windows
             sample_path = self.sample_files[idx // nw]
             r_fixed = int(self._test_r_indices[idx % nw])
+        prof.mark("getitem.resolve_idx")
 
         devDn = sample_path.stem.replace("_", "=")
         try:
@@ -915,6 +1020,8 @@ class PVDataset(Dataset):
                 f"CSV not in in-memory cache for {sample_path.name!r} (key={cache_key!r}); "
                 "this path must be in PVDataset.sample_files from __init__"
             ) from e
+        prof.mark("getitem.cache_lookup")
+
         if INVERTER_STATE_COL not in df.columns:
             raise ValueError(f"missing {INVERTER_STATE_COL} in {sample_path}")
 
@@ -925,18 +1032,15 @@ class PVDataset(Dataset):
             )
 
         if self.split == "train":
-            inv = (
-                pd.to_numeric(df[INVERTER_STATE_COL], errors="coerce").fillna(0).astype(int).values
-                == VALID_STATE
-            )
-            valid_mask = inv[self._y_idx_per_anchor].any(axis=1) & self._train_anchor_mask
-            valid_rows = np.nonzero(valid_mask)[0]
-            if valid_rows.size == 0:
+            try:
+                valid_rows = self._valid_anchor_rows[cache_key]
+            except KeyError as e:
                 raise RuntimeError(
-                    f"{sample_path.name}: no anchor with at least one Y row where "
-                    f"{INVERTER_STATE_COL}=={VALID_STATE}"
-                )
+                    f"no precomputed valid anchors for {sample_path.name!r} (key={cache_key!r})"
+                ) from e
             r = int(np.random.choice(valid_rows))
+            prof.mark("getitem.train_anchor_pick")
+            out = self._build_sample(df, dev_idx, r)
         else:
             assert r_fixed is not None
             if self.split == "val":
@@ -950,9 +1054,11 @@ class PVDataset(Dataset):
             k = idx % nw
             T_ref = time_ref_list[k]
             j = self._row_index_for_collect_time_match(df["collectTime"], T_ref, sample_path.name)
-            return self._build_sample(df, dev_idx, r_fixed, anchor_last_row=j)
+            prof.mark("getitem.time_match")
+            out = self._build_sample(df, dev_idx, r_fixed, anchor_last_row=j)
 
-        return self._build_sample(df, dev_idx, r)
+        prof.end_sample()
+        return out
 
 
 def collate_batched(batch):

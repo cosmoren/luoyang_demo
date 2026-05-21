@@ -520,8 +520,8 @@ def main() -> None:
     writer = SummaryWriter(log_dir=str(tb_log_dir))
     print(f"TensorBoard log dir: {tb_log_dir}")
 
-    initial_test_loss, _, _ = evaluate(model, device, test_loader, criterion)
-    print(f"Initial test loss: {initial_test_loss:.6f}")
+    # initial_test_loss, _, _ = evaluate(model, device, test_loader, criterion)
+    # print(f"Initial test loss: {initial_test_loss:.6f}")
 
     rmse_min = 1e8
     for epoch in range(1, args.epochs + 1):

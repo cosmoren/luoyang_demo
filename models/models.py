@@ -6,6 +6,7 @@ Input shape: (batch, in_channels, seq_len). Optional mask: (batch, seq_len).
 import torch
 import torch.nn as nn
 from typing import Optional
+import torch.nn.functional as F
 
 from modules.SatEncoder import (
     AlternatingIntraInterFrameAttention,
@@ -644,6 +645,17 @@ class pv_forecasting_model_vit_imgs(nn.Module):
             sat_steps = torch.linspace(0, 1, 48, device=sat_patch_tokens.device)
             sat_query_times = sat_start[:, None] + (sat_end - sat_start)[:, None] * sat_steps  # [B, 48]
             sat_compressed = self.sat_two_stage_compressor(sat_patch_tokens, sat_query_times) + self.sat_mod_embed  # [B,P=48,D=64]
+
+            sat_timefeats_48 = F.interpolate(
+                    sat_timefeats.transpose(1, 2),       # -> [B, F=9, T=24]  (interp 要求 [N, C, L])
+                    size=48,
+                    mode="linear",
+                    align_corners=True,                  # 头尾对齐 -> 保留首末时刻原值
+                ).transpose(1, 2)
+
+            sat_timefeats_48_hd = self.time_mlp(sat_timefeats_48)
+            sat_compressed = sat_compressed + sat_timefeats_48_hd
+            
             # print('sat_patch_tokens: ', sat_patch_tokens.shape, sat_compressed.shape)
             sat_mask = torch.ones(B, sat_compressed.shape[1], device=pv.device, dtype=pv.dtype)
 

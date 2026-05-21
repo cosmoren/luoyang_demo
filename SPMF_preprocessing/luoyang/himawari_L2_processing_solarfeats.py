@@ -125,6 +125,7 @@ def main() -> None:
 
     lat = float(args.lat)
     lon = float(args.lon)
+    resample_size = int(args.resample_size)
 
     paths = iter_netcdf_files(in_dir)
     if not paths:
@@ -153,7 +154,7 @@ def main() -> None:
         print(f"Output already exists, skip: {out_store}")
         return
 
-    print(f"Using lat={lat}, lon={lon}, size_km={args.size_km}, resample_size={args.resample_size}")
+    print(f"Using lat={lat}, lon={lon}, size_km={args.size_km}, resample_size={resample_size}")
     print(f"Output zarr store: {out_store}")
 
     n_written = 0
@@ -173,8 +174,15 @@ def main() -> None:
                 lat0=lat,
                 lon0=lon,
                 size_km=args.size_km,
-                resample_size=args.resample_size,
+                resample_size=resample_size,
             )
+
+            if len(ts_datetime_list) > 0:
+                ts_gap = (ts_datetime - ts_datetime_list[-1])/pd.Timedelta(minutes=10)
+                if ts_gap > 1:
+                    for j in range(1, int(ts_gap)):
+                        ts_datetime_list.append(ts_datetime_list[-1] + pd.Timedelta(minutes=10))
+                        merged_list.append(np.zeros_like(merged, dtype=np.float32))
 
             merged_list.append(merged.astype(np.float32))
             ts_datetime_list.append(ts_datetime)
@@ -217,13 +225,14 @@ def main() -> None:
         },
         coords={
             "time_utc": ts_datetime_utc,
-            "channel": ["CLOT", "CLOT_MASK"],
+            "channel": ["CLOT", "CLOT_MASK", "FRAM_MASK"],
         },
     )
     ds_out["time_utc"].attrs["timezone"] = "UTC+0"
     ds_out.attrs["latitude"] = lat
     ds_out.attrs["longitude"] = lon
-    ds_out = ds_out.chunk({"time_utc": 24, "channel": 2, "H": 100, "W": 100})
+    _, img_h, img_w, n_ch = merged_arr.shape
+    ds_out = ds_out.chunk({"time_utc": 24, "channel": n_ch, "H": img_h, "W": img_w})
     ds_out.to_zarr(str(out_store), mode="w")
 
     print(
