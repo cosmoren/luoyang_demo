@@ -3,6 +3,9 @@ YLJ matrix Parquet training entrypoint.
 
 Uses ``dataloader/ylj_zarr.py`` and the shared loop in ``training/train.py``.
 Requires ``--config config/datasets/conf_ylj.yaml`` and ``--ylj_raw_parquet``.
+
+Training uses kt from the solar features CSV (Luoyang yr pattern): model input ``kt/20``,
+loss on reconstructed kW ``kt_pred * target_p_cs * p_mean``.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ import json
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 from config_utils import get_resolved_paths
@@ -35,6 +39,96 @@ from dataloader.ylj_zarr import (
     ylj_raw_parquet_matrix_config_from_conf,
 )
 import training.train as base_train
+
+# Luoyang yr ``train_vit_test.py``: model input kt/KT_INPUT_SCALE, output * scale, power = kt * p_cs * p_mean.
+KT_INPUT_SCALE = 20.0
+
+
+def _ylj_require_kt_batch(batch: dict) -> None:
+    for key in ("kt", "kt_mask", "p_mean", "target_p_cs"):
+        if key not in batch:
+            raise RuntimeError(
+                f"YLJ kt training requires batch['{key}']; set ylj_raw_parquet.solar_features_csv "
+                "and rebuild solar_features CSV."
+            )
+
+
+def _ylj_forward_kt(
+    model: nn.Module,
+    batch: dict,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run model on kt/KT_INPUT_SCALE; return (kt_pred, pv_pred_kw)."""
+    _ylj_require_kt_batch(batch)
+    device_id = batch["dev_idx"].to(device)
+    kt_in = batch["kt"].to(device) / KT_INPUT_SCALE
+    kt_mask = batch["kt_mask"].to(device)
+    pv_timefeats = batch["pv_timefeats"].to(device)
+    forecast_timefeats = batch["forecast_timefeats"].to(device)
+    model_kw = base_train._batch_model_kwargs(batch, device)
+    kt_raw = model(
+        device_id,
+        kt_in,
+        kt_mask,
+        pv_timefeats,
+        forecast_timefeats,
+        **model_kw,
+    )
+    kt_pred = kt_raw * KT_INPUT_SCALE
+    p_mean = batch["p_mean"].to(device)
+    target_p_cs = batch["target_p_cs"].to(device)
+    pv_pred = kt_pred * target_p_cs * p_mean.unsqueeze(1)
+    return kt_pred, pv_pred
+
+
+def _ylj_train_one_epoch(
+    model: nn.Module,
+    device: torch.device,
+    loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    max_batches: int | None = None,
+    *,
+    epoch: int | None = None,
+    log_every: int = 50,
+) -> float:
+    model.train()
+    total_loss = 0.0
+    n = 0
+    num_batches = len(loader)
+    if max_batches is not None:
+        num_batches = min(num_batches, max_batches)
+    ep = "" if epoch is None else f"epoch {epoch} "
+    print(f"{ep}number of batches: {len(loader)}" + (f" (capped at {max_batches})" if max_batches is not None else ""))
+    print(f"[train_ylj] kt training: input kt/{KT_INPUT_SCALE}, loss on reconstructed kW power")
+    running_loss = 0.0
+    running_batches = 0
+    log_every = max(1, int(log_every))
+    for batch_idx, batch in enumerate(loader):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
+        B = batch["dev_idx"].size(0)
+        optimizer.zero_grad()
+        _, pv_pred = _ylj_forward_kt(model, batch, device)
+        target_pv = batch["target_pv"].to(device)
+        loss = criterion(pv_pred, target_pv)
+        loss.backward()
+        optimizer.step()
+        loss_b = float(loss.item())
+        total_loss += loss_b
+        n += B
+        running_loss += loss_b
+        running_batches += 1
+        done = batch_idx + 1
+        if done == 1 or done % log_every == 0 or done == num_batches:
+            avg_running = running_loss / max(running_batches, 1)
+            print(
+                f"  [train] {ep}batch {done}/{num_batches}  "
+                f"loss_batch={loss_b:.6f}  loss_avg_running={avg_running:.6f}"
+            )
+    avg_loss = total_loss / max(n, 1)
+    print(f"  [train] {ep}end  mean_loss_returned={avg_loss:.6f} (sum_batch_loss / n_samples={n})")
+    return avg_loss
 
 
 def _is_ylj_mode() -> bool:
@@ -130,24 +224,9 @@ def _build_pv_dataset(
         use_nwp=_use_ylj_parquet_nwp(args),
         use_sat_zarr=_use_ylj_sat_zarr(args),
         sat_zarr_dir=sat_zarr_dir,
-        pv_value_column=str(hp["pv_value_column"]),
-        training_pv_value_scale=float(hp["pv_value_scale"]),
-        clear_sky_ratio_max_valid=float(hp["clear_sky_ratio_max_valid"]),
+        pv_value_scale=float(hp["pv_value_scale"]),
         include_export_metadata=include_export,
     )
-
-
-def _ratio_export_triple(
-    ratio_v: float,
-    mask: float,
-    gt_power: float,
-    ghi: float,
-) -> list[float]:
-    """Build [gt_active_power, pred_active_power, predicted_ratio]; invalid mask -> [-1, -1, -1]."""
-    if mask <= 0.0:
-        return [-1.0, -1.0, -1.0]
-    pred_ap = ratio_v * ghi if ghi > 0.0 else 0.0
-    return [float(gt_power), float(pred_ap), float(ratio_v)]
 
 
 def _export_parquet_test_sequence_pairs_csv(
@@ -156,17 +235,12 @@ def _export_parquet_test_sequence_pairs_csv(
     loader: DataLoader,
     out_path: Path,
 ) -> int:
-    """YLJ Parquet test export: ``collectTime`` = ``timestamp_win`` as UTC ``YYYY-MM-DD HH:MM:SS``.
-
-    ``active_power``: ``gt_pred_pairs`` = ``[[gt_power, pred_power], ...]``.
-    ``clear_sky_ratio``: ``[[gt_active_power, pred_active_power, predicted_ratio], ...]``.
-    """
+    """YLJ Parquet test export: ``collectTime`` = anchor UTC; ``gt_pred_pairs`` = ``[[gt_kw, pred_kw], ...]``."""
     model.eval()
     ds = loader.dataset
     if not isinstance(ds, YljRawParquetDataset):
         raise TypeError(f"expected YljRawParquetDataset, got {type(ds).__name__}")
     pv_scale = float(ds._pv_value_scale)
-    use_ratio = getattr(ds, "_ratio_mode", False)
     total = len(ds)
     rows: list[dict] = []
     processed = 0
@@ -178,57 +252,15 @@ def _export_parquet_test_sequence_pairs_csv(
                     "Parquet test export requires csv_collect_time_utc on each batch; "
                     "ensure collate_ylj_batched is used and YljRawParquetDataset is current."
                 )
-            device_id = batch["dev_idx"].to(device)
-            pv = batch["pv"].to(device)
-            mask = batch["pv_mask"].to(device)
-            pv_timefeats = batch["pv_timefeats"].to(device)
-            forecast_timefeats = batch["forecast_timefeats"].to(device)
-            target_pv = batch["target_pv"].to(device)
-            model_kw = base_train._batch_model_kwargs(batch, device)
-            pv_pred = model(
-                device_id,
-                pv,
-                mask,
-                pv_timefeats,
-                forecast_timefeats,
-                **model_kw,
-            )
-            ratio_pred = pv_pred.detach().cpu().float().numpy()
-            pred_np = ratio_pred * pv_scale
-            gt_np = (target_pv.detach().cpu().float().numpy() * pv_scale)
-            tgt_mask_np = batch["target_mask"].detach().cpu().float().numpy()
-            tgt_power_np = (
-                batch["target_power"].detach().cpu().float().numpy()
-                if "target_power" in batch
-                else None
-            )
-            y_ghi_np = batch["y_ghi"].detach().cpu().float().numpy() if "y_ghi" in batch else None
+            _, pv_pred_t = _ylj_forward_kt(model, batch, device)
+            pred_np = pv_pred_t.detach().cpu().float().numpy()
+            gt_np = batch["target_pv"].detach().cpu().float().numpy() * pv_scale
             collect_list = batch["csv_collect_time_utc"]
             B = int(pred_np.shape[0])
             for i in range(B):
-                if use_ratio:
-                    if "target_timestamps_local" not in batch:
-                        raise RuntimeError("clear_sky_ratio export requires target_timestamps_local")
-                    ts_list = batch["target_timestamps_local"][i]
-                    pairs: list[list[float]] = []
-                    for k, ts_s in enumerate(ts_list):
-                        ratio_v = float(ratio_pred[i, k]) * pv_scale
-                        m = float(tgt_mask_np[i, k])
-                        if tgt_power_np is not None:
-                            gt_ap = float(tgt_power_np[i, k])
-                        else:
-                            pw = ds._power_at(pd.Timestamp(ts_s))
-                            gt_ap = float(pw) if pw is not None else 0.0
-                        if y_ghi_np is not None:
-                            ghi_f = float(y_ghi_np[i, k])
-                        else:
-                            ghi = ds._ghi_at(pd.Timestamp(ts_s))
-                            ghi_f = float(ghi) if ghi is not None and np.isfinite(ghi) else 0.0
-                        pairs.append(_ratio_export_triple(ratio_v, m, gt_ap, ghi_f))
-                else:
-                    pairs = [
-                        [float(gt_np[i, k]), float(pred_np[i, k])] for k in range(pred_np.shape[1])
-                    ]
+                pairs = [
+                    [float(gt_np[i, k]), float(pred_np[i, k])] for k in range(pred_np.shape[1])
+                ]
                 rows.append(
                     {
                         "collectTime": str(collect_list[i]),
@@ -255,16 +287,7 @@ def _export_test_sequence_pairs_csv(
     loader: DataLoader,
     out_path: Path,
 ) -> int:
-    """YLJ test export: one row per anchor with a JSON list per horizon step.
-
-    When training.pv_value_column == "clear_sky_ratio", each entry is
-    ``[gt_active_power, pred_active_power, predicted_clear_sky_ratio]`` where
-    ``pred_active_power = predicted_clear_sky_ratio * clear_sky`` at that timestamp.
-    Otherwise each entry is ``[gt, pred]`` in the configured pv_value_column units.
-
-    For ``YljRawParquetDataset`` (``--ylj_raw_parquet``), uses :func:`_export_parquet_test_sequence_pairs_csv`
-    instead (no CSV ``sample_files``).
-    """
+    """YLJ test export: one row per anchor; each horizon step is ``[gt_kw, pred_kw]``."""
     ds = loader.dataset
     if isinstance(ds, YljRawParquetDataset):
         return _export_parquet_test_sequence_pairs_csv(model, device, loader, out_path)
@@ -614,6 +637,7 @@ def main() -> None:
             return float("nan"), float("nan")
 
         base_train.evaluate = _eval_skip
+        base_train.train_one_epoch = _ylj_train_one_epoch
     base_train.main()
 
 

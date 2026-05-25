@@ -4,8 +4,10 @@ YLJ dataloader: Parquet PV matrices + optional Himawari Zarr (``dataloader/ylj_z
 PV from fixed-length matrix columns (``observe_power`` / ``observe_power_future``).
 Opt-in via ``--ylj_raw_parquet`` in training. Optional NWP: ``--ylj_parquet_nwp``.
 Optional satellite Zarr (Luoyang window): ``--ylj_sat_zarr``.
-``training.pv_value_column``: ``active_power`` (raw power / ``ylj_raw_parquet.pv_value_scale``) or
-``clear_sky_ratio`` (power / GHI from ``ghi_csv``; train ``ghi_col_train``, test ``ghi_col_test``).
+PV targets: raw ``observe_power`` / ``training.pv_value_scale`` (kW). Model input uses ``kt`` from
+``solar_features_csv`` (``train_ylj.py`` applies kt/20 and power reconstruction at train time).
+Solar timefeats from ``solar_features_csv`` via ``extract_solar_features`` (missing times -> mask 0).
+Also exposes ``kt``, ``kt_mask``, ``p_cs`` (history), ``p_mean``, ``target_p_cs`` (forecast), aligned with Luoyang Zarr.
 """
 
 from __future__ import annotations
@@ -24,7 +26,11 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from modules.solar_encoder import compute_solar_features, delta_time_encoder, solar_features_encoder
+from modules.solar_encoder import (
+    delta_time_encoder,
+    extract_solar_features,
+    solar_features_encoder,
+)
 
 # Keep aligned with ``dataloader.luoyang.VALID_STATE``; avoid importing luoyang (loads config at import).
 VALID_STATE = 512
@@ -36,12 +42,6 @@ _SAT_MIN_AFTER_ANCHOR = 30
 
 _PARQUET_NWP_SSRD_COL = "ssrd_100_55_29_95_predict"
 _PARQUET_NWP_T2M_COL = "t2m_100_6_29_9_predict"
-_GHI_COL_DEFAULT_TRAIN = "GHI_real"
-_GHI_COL_DEFAULT_TEST = "GHI_clear_sky"
-_POWER_COL = "Power"
-_TRAIN_MAX_RESAMPLE_TRIES = 3200
-
-
 @dataclass(frozen=True)
 class YljRawParquetMatrixConfig:
     """Parquet matrix layout; YAML via :func:`ylj_raw_parquet_matrix_config_from_conf`."""
@@ -52,10 +52,7 @@ class YljRawParquetMatrixConfig:
     naive_tz: str = "Asia/Shanghai"
     train_parquet: str = "ds_v322_2024.parquet"
     test_parquet: str = "ds_v322_1219_2025_1-12.parquet"
-    pv_value_scale: float = 50.0
-    ghi_csv: str = "processed_2024_2025.csv"
-    ghi_col_train: str = "GHI_real"
-    ghi_col_test: str = "GHI_clear_sky"
+    solar_features_csv: str = "solar_features_ylj_2024_2025_15min.csv"
 
 
 _DEFAULT_MATRIX_CONFIG = YljRawParquetMatrixConfig()
@@ -90,17 +87,14 @@ def ylj_raw_parquet_matrix_config_from_conf(conf: dict) -> YljRawParquetMatrixCo
         naive_tz=_sg("naive_tz", d.naive_tz),
         train_parquet=_sg("train_parquet", d.train_parquet),
         test_parquet=_sg("test_parquet", d.test_parquet),
-        pv_value_scale=_fg("pv_value_scale", d.pv_value_scale),
-        ghi_csv=_sg("ghi_csv", d.ghi_csv),
-        ghi_col_train=_sg("ghi_col_train", d.ghi_col_train),
-        ghi_col_test=_sg("ghi_col_test", d.ghi_col_test),
+        solar_features_csv=_sg("solar_features_csv", d.solar_features_csv),
     )
     if cfg.hist_len < 1 or cfg.fut_len < 1 or cfg.native_interval_min < 1:
         raise ValueError(f"ylj_raw_parquet: hist_len, fut_len, native_interval_min must be >= 1 (got {cfg})")
     if not cfg.naive_tz:
         raise ValueError("ylj_raw_parquet.naive_tz must be non-empty")
-    if not cfg.ghi_csv:
-        raise ValueError("ylj_raw_parquet.ghi_csv must be non-empty")
+    if not cfg.solar_features_csv:
+        raise ValueError("ylj_raw_parquet.solar_features_csv must be non-empty")
     return cfg
 
 
@@ -172,32 +166,110 @@ def _utc_wall_naive(ts: pd.Timestamp) -> pd.Timestamp:
 
 
 def _ts_key_local(ts: pd.Timestamp) -> pd.Timestamp:
-    """Naive local wall time for GHI CSV ``dtime`` lookup."""
+    """Naive local wall time for solar CSV ``china_local_time`` lookup."""
     t = pd.Timestamp(ts)
     if t.tzinfo is not None:
         t = t.tz_convert("UTC").tz_localize(None)
     return t.floor("us")
 
 
-def _load_ghi_table(
-    ghi_path: Path, *, ghi_col: str
-) -> tuple[dict[pd.Timestamp, float], dict[pd.Timestamp, float]]:
-    if not ghi_path.is_file():
-        raise FileNotFoundError(f"GHI table not found: {ghi_path}")
-    ghi_col = str(ghi_col).strip()
-    if not ghi_col:
-        raise ValueError("ghi_col must be non-empty")
-    gdf = pd.read_csv(ghi_path, usecols=["dtime", ghi_col, _POWER_COL])
-    gdf["dtime"] = pd.to_datetime(gdf["dtime"], errors="coerce")
-    gdf = gdf.dropna(subset=["dtime"])
-    ghi_map: dict[pd.Timestamp, float] = {}
-    pw_map: dict[pd.Timestamp, float] = {}
-    for t, g, p in zip(gdf["dtime"], gdf[ghi_col], gdf[_POWER_COL], strict=False):
+def _load_solar_table(solar_path: Path) -> dict[pd.Timestamp, dict[str, object]]:
+    """Map naive China-local time -> row fields for :func:`extract_solar_features`."""
+    if not solar_path.is_file():
+        raise FileNotFoundError(f"solar features table not found: {solar_path}")
+    usecols = [
+        "china_local_time",
+        "local_solar_time",
+        "solar_azimuth",
+        "solar_zenith",
+        "day_of_year",
+        "hour_of_day",
+        "p_cs",
+        "kt",
+        "kt_mask",
+        "p_mean",
+    ]
+    sdf = pd.read_csv(solar_path, usecols=usecols)
+    sdf["china_local_time"] = pd.to_datetime(sdf["china_local_time"], errors="coerce")
+    sdf = sdf.dropna(subset=["china_local_time"])
+    solar_map: dict[pd.Timestamp, dict[str, object]] = {}
+    for row in sdf.itertuples(index=False):
+        k = _ts_key_local(pd.Timestamp(row.china_local_time))
+        if k in solar_map:
+            continue
+        solar_map[k] = {
+            "local_solar_time": str(row.local_solar_time),
+            "solar_azimuth": float(row.solar_azimuth),
+            "solar_zenith": float(row.solar_zenith),
+            "day_of_year": int(row.day_of_year),
+            "hour_of_day": float(row.hour_of_day),
+            "p_cs": float(row.p_cs),
+            "kt": float(row.kt),
+            "kt_mask": float(row.kt_mask),
+            "p_mean": float(row.p_mean),
+        }
+    return solar_map
+
+
+def _solar_series_at_times(
+    solar_map: dict[pd.Timestamp, dict[str, object]],
+    ts_local: list[pd.Timestamp],
+    field: str,
+) -> np.ndarray:
+    """Per-step values from solar CSV; missing timestamps -> 0."""
+    out = np.zeros(len(ts_local), dtype=np.float32)
+    for i, t in enumerate(ts_local):
+        hit = solar_map.get(_ts_key_local(pd.Timestamp(t)))
+        if hit is not None:
+            out[i] = float(hit[field])
+    return out
+
+
+def _solar_features_for_local_times(
+    solar_map: dict[pd.Timestamp, dict[str, object]],
+    ts_local: list[pd.Timestamp],
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """
+    Lookup precomputed solar rows by China-local time.
+
+    Missing timestamps -> numeric zeros and ``solar_mask[i]=0`` (encoded solar dims zeroed later).
+    """
+    n = len(ts_local)
+    mask = np.zeros(n, dtype=np.float32)
+    records: list[dict[str, object]] = []
+    for i, t in enumerate(ts_local):
         k = _ts_key_local(pd.Timestamp(t))
-        if k not in ghi_map:
-            ghi_map[k] = float(g)
-            pw_map[k] = float(p)
-    return ghi_map, pw_map
+        hit = solar_map.get(k)
+        if hit is None:
+            records.append(
+                {
+                    "local_solar_time": "1970-01-01 00:00:00",
+                    "solar_azimuth": 0.0,
+                    "solar_zenith": 0.0,
+                    "day_of_year": 0,
+                    "hour_of_day": 0.0,
+                }
+            )
+        else:
+            mask[i] = 1.0
+            records.append(hit)
+    feats = extract_solar_features(pd.DataFrame(records))
+    return feats, mask
+
+
+def _build_solar_timefeats(
+    solar_map: dict[pd.Timestamp, dict[str, object]],
+    ts_local: list[pd.Timestamp],
+    ts_utc: list[pd.Timestamp],
+    t0_utc_naive: pd.Timestamp,
+) -> torch.Tensor:
+    """``[T, 7]`` = masked solar encoder (6) + ``delta_time_encoder`` (1)."""
+    feats, solar_mask = _solar_features_for_local_times(solar_map, ts_local)
+    enc = solar_features_encoder(feats, include_doy=False)
+    m = torch.from_numpy(solar_mask).to(dtype=enc.dtype).unsqueeze(-1)
+    enc = enc * m
+    dt = delta_time_encoder(ts_utc, t0_utc_naive)
+    return torch.cat([enc, dt.unsqueeze(1)], dim=1)
 
 
 class YljRawParquetEmptyValDataset(Dataset):
@@ -217,8 +289,8 @@ class YljRawParquetDataset(Dataset):
     """
     One row = one sample. ``timestamp_win`` = last ``observe_power`` time (naive local).
 
-    ``pv_value_column`` ``active_power``: raw power / ``ylj_raw_parquet.pv_value_scale``.
-    ``clear_sky_ratio``: ``power / GHI`` at aligned local timestamps (column from matrix config); masks per step.
+    ``pv`` / ``target_pv``: raw Parquet power divided by ``pv_value_scale`` (kW when scale=1).
+    ``kt``, ``p_cs``, ``p_mean``, ``target_p_cs``: from ``solar_features_csv``.
     """
 
     def __init__(
@@ -237,9 +309,7 @@ class YljRawParquetDataset(Dataset):
         use_nwp: bool = False,
         use_sat_zarr: bool = False,
         sat_zarr_dir: str | Path | None = None,
-        pv_value_column: str = "active_power",
-        training_pv_value_scale: float = 1.0,
-        clear_sky_ratio_max_valid: float = 1.5,
+        pv_value_scale: float = 1.0,
         include_export_metadata: bool = False,
     ) -> None:
         if split not in ("train", "test", "val"):
@@ -278,16 +348,9 @@ class YljRawParquetDataset(Dataset):
         self.sample_files: list[Path] = []
         self.supports_single_horizon_test_only = False
 
-        self._pv_value_col = str(pv_value_column).strip()
-        self._ratio_mode = self._pv_value_col == "clear_sky_ratio"
-        self._loss_on_power = self._ratio_mode
-        self._ratio_max = float(clear_sky_ratio_max_valid)
-        if self._ratio_mode:
-            self._pv_value_scale = float(training_pv_value_scale)
-            self._loss_power_scale = float(mx.pv_value_scale)
-        else:
-            self._pv_value_scale = float(mx.pv_value_scale)
-            self._loss_power_scale = None
+        self._pv_value_scale = float(pv_value_scale)
+        if self._pv_value_scale <= 0:
+            raise ValueError(f"pv_value_scale must be positive, got {self._pv_value_scale}")
 
         nat = self._native_min
         in_stride = self.pv_input_interval_min // nat
@@ -356,25 +419,17 @@ class YljRawParquetDataset(Dataset):
             self._ssrd_future = None
             self._t2m_future = None
 
-        self._ghi_map: dict[pd.Timestamp, float] = {}
-        self._power_map: dict[pd.Timestamp, float] = {}
-        if self._ratio_mode:
-            ghi_path = root / str(mx.ghi_csv)
-            if split == "test":
-                self._ghi_col = str(mx.ghi_col_test)
-            else:
-                self._ghi_col = str(mx.ghi_col_train)
-            self._ghi_map, self._power_map = _load_ghi_table(ghi_path, ghi_col=self._ghi_col)
-            print(
-                f"[YljRawParquetDataset] clear_sky_ratio split={split} from {ghi_path.name} "
-                f"(GHI={self._ghi_col}, scale={self._pv_value_scale}, max_valid={self._ratio_max})"
-            )
-        else:
-            self._ghi_col = ""
-            print(
-                f"[YljRawParquetDataset] active_power mode (scale={self._pv_value_scale}) "
-                f"({path.name})"
-            )
+        print(
+            f"[YljRawParquetDataset] split={split} pv_value_scale={self._pv_value_scale} "
+            f"({path.name})"
+        )
+
+        solar_path = root / str(mx.solar_features_csv)
+        self._solar_map = _load_solar_table(solar_path)
+        print(
+            f"[YljRawParquetDataset] solar features CSV: {solar_path.name} "
+            f"({len(self._solar_map)} timestamps)"
+        )
 
         self._parquet_path = path
         self.dev_idx = torch.tensor(int(dev_dn_index), dtype=torch.long)
@@ -410,30 +465,6 @@ class YljRawParquetDataset(Dataset):
             t = t.tz_localize(self._naive_tz, ambiguous=True)
         return t.tz_convert("UTC")
 
-    def _ghi_at(self, t_local: pd.Timestamp) -> float | None:
-        return self._ghi_map.get(_ts_key_local(t_local))
-
-    def _power_at(self, t_local: pd.Timestamp) -> float | None:
-        return self._power_map.get(_ts_key_local(t_local))
-
-    def _ratio_and_mask(self, power: float, t_local: pd.Timestamp) -> tuple[float, float]:
-        """Return (clear_sky_ratio, mask). Missing GHI -> (0, 0); night GHI=0 -> (0, 1)."""
-        ghi = self._ghi_at(t_local)
-        if ghi is None:
-            return 0.0, 0.0
-        g = float(ghi)
-        if not np.isfinite(g) or g < 0.0:
-            return 0.0, 0.0
-        p = float(power)
-        if not np.isfinite(p):
-            return 0.0, 0.0
-        if g == 0.0:
-            return 0.0, 1.0
-        r = p / g
-        if not np.isfinite(r) or r > self._ratio_max + 1e-12:
-            return 0.0, 0.0
-        return float(r), 1.0
-
     def _build_sample(self, row: int) -> dict:
         op, of, twin_local = self._row_arrays(int(row))
         t_win_utc = self._t_win_utc(twin_local)
@@ -463,50 +494,25 @@ class YljRawParquetDataset(Dataset):
             y_times_utc.append(t_win_utc + pd.Timedelta(minutes=nat * (int(jix) + 1)))
 
         sc = float(self._pv_value_scale)
-        pv_vals = np.zeros(self.pv_input_len, dtype=np.float32)
-        pv_m = np.zeros(self.pv_input_len, dtype=np.float32)
-        pow_y = np.zeros(self.pv_output_len, dtype=np.float64)
-        pow_y_raw = np.zeros(self.pv_output_len, dtype=np.float64)
-        ghi_y = np.zeros(self.pv_output_len, dtype=np.float32)
-        y_masks = np.zeros(self.pv_output_len, dtype=np.float32)
+        pw_x = op[hist_ix].astype(np.float32)
+        pv_vals = pw_x / sc
+        pv_m = np.ones(self.pv_input_len, dtype=np.float32)
+        pow_y = of[fut_ix].astype(np.float64)
 
-        if self._ratio_mode:
-            for i, iix in enumerate(hist_ix):
-                r, m = self._ratio_and_mask(float(op[iix]), ts_x_local[i])
-                pv_vals[i] = np.float32(r / sc)
-                pv_m[i] = m
-            for i, jix in enumerate(fut_ix):
-                p_raw = float(of[jix])
-                r, m = self._ratio_and_mask(p_raw, ts_y_local[i])
-                pow_y[i] = r
-                pow_y_raw[i] = p_raw
-                y_masks[i] = m
-                ghi = self._ghi_at(ts_y_local[i])
-                if ghi is not None and np.isfinite(ghi) and float(ghi) >= 0.0:
-                    ghi_y[i] = np.float32(ghi)
-        else:
-            pw_x = op[hist_ix].astype(np.float32)
-            pv_vals = pw_x / sc
-            pv_m[:] = 1.0
-            pow_y = of[fut_ix].astype(np.float64)
-            y_masks[:] = 1.0
-
-        xs_u = ts_x_utc
         pv = torch.from_numpy(pv_vals).unsqueeze(0)
-        pv_tf = solar_features_encoder(
-            compute_solar_features(xs_u, self.latitude, self.longitude),
-            include_doy=False,
+        pv_timefeats = _build_solar_timefeats(
+            self._solar_map, ts_x_local, ts_x_utc, t0u
         )
-        pv_dt = delta_time_encoder(xs_u, t0u)
-        pv_timefeats = torch.cat([pv_tf, pv_dt.unsqueeze(1)], dim=1)
+        forecast_timefeats = _build_solar_timefeats(
+            self._solar_map, ts_y_local, y_times_utc, t0u
+        )
 
-        y_u = y_times_utc
-        fc_tf = solar_features_encoder(
-            compute_solar_features(y_u, self.latitude, self.longitude),
-            include_doy=False,
-        )
-        fc_dt = delta_time_encoder(y_u, t0u)
-        forecast_timefeats = torch.cat([fc_tf, fc_dt.unsqueeze(1)], dim=1)
+        kt_x = _solar_series_at_times(self._solar_map, ts_x_local, "kt")
+        kt_mask_x = _solar_series_at_times(self._solar_map, ts_x_local, "kt_mask")
+        p_cs_x = _solar_series_at_times(self._solar_map, ts_x_local, "p_cs")
+        target_p_cs = _solar_series_at_times(self._solar_map, ts_y_local, "p_cs")
+        win_hit = self._solar_map.get(_ts_key_local(pd.Timestamp(twin_local)))
+        p_mean_val = float(win_hit["p_mean"]) if win_hit is not None else 0.0
 
         sat_tensor: torch.Tensor | None = None
         sat_timefeats: torch.Tensor | None = None
@@ -535,25 +541,23 @@ class YljRawParquetDataset(Dataset):
             "pv": pv,
             "pv_mask": torch.from_numpy(pv_m).unsqueeze(0),
             "pv_timefeats": pv_timefeats,
+            "kt": torch.from_numpy(kt_x).unsqueeze(0),
+            "kt_mask": torch.from_numpy(kt_mask_x).unsqueeze(0),
+            "p_cs": torch.from_numpy(p_cs_x).unsqueeze(0),
+            "p_mean": torch.tensor(p_mean_val, dtype=torch.float32),
             "forecast_timefeats": forecast_timefeats,
             "target_pv": torch.tensor([p / sc for p in pow_y], dtype=torch.float32),
-            "target_mask": torch.tensor(y_masks, dtype=torch.float32),
+            "target_mask": torch.ones(self.pv_output_len, dtype=torch.float32),
+            "target_p_cs": torch.from_numpy(target_p_cs.astype(np.float32)),
             "sat_tensor": sat_tensor,
             "sat_timefeats": sat_timefeats,
             "skimg_tensor": None,
             "skimg_timefeats": None,
             "nwp_tensor": nwp_tensor,
         }
-        if self._ratio_mode:
-            out["target_power"] = torch.tensor(pow_y_raw, dtype=torch.float32)
-            out["y_ghi"] = torch.tensor(ghi_y, dtype=torch.float32)
         if self._include_export_metadata:
             t_utc = self._t_win_utc(twin_local)
             out["csv_collect_time_utc"] = t_utc.tz_convert("UTC").strftime("%Y-%m-%d %H:%M:%S")
-            if self._ratio_mode:
-                out["target_timestamps_local"] = [
-                    pd.Timestamp(t).strftime("%Y-%m-%d %H:%M:%S") for t in ts_y_local
-                ]
         return out
 
     def row_window_timestamps_utc(self, row: int) -> tuple[list[pd.Timestamp], list[pd.Timestamp]]:
@@ -576,21 +580,6 @@ class YljRawParquetDataset(Dataset):
         return ts_x_utc, y_times_utc
 
     def __getitem__(self, idx: int) -> dict:
-        if self.split == "train" and self._ratio_mode:
-            s_try = self._build_sample(int(idx))
-            if float(s_try["target_mask"].sum().item()) > 0.0:
-                return s_try
-            n = len(self)
-            rng = np.random.default_rng()
-            for _ in range(_TRAIN_MAX_RESAMPLE_TRIES):
-                row = int(rng.integers(0, n))
-                s = self._build_sample(row)
-                if float(s["target_mask"].sum().item()) > 0.0:
-                    return s
-            raise RuntimeError(
-                f"YljRawParquetDataset: could not sample row with valid Y after "
-                f"{_TRAIN_MAX_RESAMPLE_TRIES} tries (clear_sky_ratio mode)"
-            )
         return self._build_sample(int(idx))
 
 
@@ -604,17 +593,17 @@ def collate_ylj_batched(batch: list[dict]) -> dict:
         "pv": torch.stack([x["pv"] for x in batch]),
         "pv_mask": torch.stack([x["pv_mask"] for x in batch]),
         "pv_timefeats": torch.stack([x["pv_timefeats"] for x in batch]),
+        "kt": torch.stack([x["kt"] for x in batch]),
+        "kt_mask": torch.stack([x["kt_mask"] for x in batch]),
+        "p_cs": torch.stack([x["p_cs"] for x in batch]),
+        "p_mean": torch.stack([x["p_mean"] for x in batch]),
         "forecast_timefeats": torch.stack([x["forecast_timefeats"] for x in batch]),
         "target_pv": torch.stack([x["target_pv"] for x in batch]),
         "target_mask": torch.stack([x["target_mask"] for x in batch]),
+        "target_p_cs": torch.stack([x["target_p_cs"] for x in batch]),
     }
     if "csv_collect_time_utc" in batch[0]:
         out["csv_collect_time_utc"] = [x["csv_collect_time_utc"] for x in batch]
-    if "target_timestamps_local" in batch[0]:
-        out["target_timestamps_local"] = [x["target_timestamps_local"] for x in batch]
-    for key in ("target_power", "y_ghi"):
-        if key in batch[0]:
-            out[key] = torch.stack([x[key] for x in batch])
     for key in ("sat_tensor", "sat_timefeats", "skimg_tensor", "skimg_timefeats", "nwp_tensor"):
         if batch[0][key] is None:
             if not all(x[key] is None for x in batch):

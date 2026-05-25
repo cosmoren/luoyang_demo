@@ -16,9 +16,7 @@ FOLSOM_CONF_PATH = PROJECT_ROOT / "config" / "datasets" / "conf_folsom.yaml"
 YLJ_TRAINING_EXTRA_KEYS = frozenset({
     "t_off_min",
     "pv_output_rand",
-    "pv_value_column",
     "pv_value_scale",
-    "clear_sky_ratio_max_valid",
 })
 
 TRAINING_HPARAM_KEYS = frozenset({
@@ -188,22 +186,12 @@ def get_training_hparams_from_conf(conf: dict | None = None) -> dict:
             raise ValueError("training.t_off_min must be a non-negative int (minutes)")
         out["t_off_min"] = int(off)
         out["pv_output_rand"] = bool(out["pv_output_rand"])
-        col = str(out["pv_value_column"]).strip()
-        if col not in ("active_power", "clear_sky_ratio"):
-            raise ValueError("training.pv_value_column must be 'active_power' or 'clear_sky_ratio'")
-        out["pv_value_column"] = col
         pvs = out["pv_value_scale"]
         if isinstance(pvs, str):
             pvs = float(pvs)
         if not isinstance(pvs, (int, float)) or isinstance(pvs, bool) or pvs <= 0:
             raise ValueError("training.pv_value_scale must be a positive number")
         out["pv_value_scale"] = float(pvs)
-        csr = out["clear_sky_ratio_max_valid"]
-        if isinstance(csr, str):
-            csr = float(csr)
-        if not isinstance(csr, (int, float)) or isinstance(csr, bool) or csr <= 0:
-            raise ValueError("training.clear_sky_ratio_max_valid must be a positive number")
-        out["clear_sky_ratio_max_valid"] = float(csr)
 
     return out
 
