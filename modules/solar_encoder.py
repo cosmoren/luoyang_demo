@@ -3,6 +3,10 @@ import pandas as pd
 from pvlib import solarposition
 import torch
 
+# Solar vector width before ``delta_time_encoder`` is concatenated (see ``solar_features_encoder``).
+SOLAR_FEAT_DIM_WITH_DOY = 8
+SOLAR_FEAT_DIM_NO_DOY = 6
+
 
 def utc_to_local_solar_time_pvlib(utc_times: pd.DatetimeIndex, longitude: float) -> pd.DatetimeIndex:
     """Convert UTC to local (apparent) solar time using longitude and pvlib equation of time."""
@@ -81,35 +85,44 @@ def compute_solar_features(
         "hour_of_day": hour_of_day,
     }
 
-def solar_features_encoder(solar_features: dict[str, np.ndarray]) -> torch.Tensor:
-    """Vectorized encoder. ``solar_features`` is a dict of length-T arrays:
-    ``azimuth`` / ``zenith`` (deg), ``hour_of_day`` (0-24), ``day_of_year`` (1-366).
-    Returns a ``[T, 8]`` float32 tensor with columns
-    ``[sin_az, cos_az, sin_ze, cos_ze, sin_doy, cos_doy, sin_hod, cos_hod]``.
+def solar_features_encoder(
+    solar_features: dict[str, np.ndarray],
+    *,
+    include_doy: bool = True,
+) -> torch.Tensor:
+    """Encode sun position + local time-of-day.
+
+    Args:
+        solar_features: dict with ``azimuth``, ``zenith``, ``hour_of_day``; ``day_of_year`` if ``include_doy``.
+        include_doy: If True (default, Luoyang/Folsom), return ``[T, 8]`` with
+            ``sin/cos`` day-of-year. If False (YLJ / ``luoyang_demo`` Parquet path), return ``[T, 6]`` without DOY.
+
+    With DOY: ``[sin_az, cos_az, sin_ze, cos_ze, sin_doy, cos_doy, sin_hod, cos_hod]``.
+    Without DOY: ``[sin_az, cos_az, sin_ze, cos_ze, sin_hod, cos_hod]``.
     """
     azimuth = np.asarray(solar_features["azimuth"], dtype=np.float32)
     zenith = np.asarray(solar_features["zenith"], dtype=np.float32)
     hour_of_day = np.asarray(solar_features["hour_of_day"], dtype=np.float32)
-    day_of_year = np.asarray(solar_features["day_of_year"], dtype=np.float32)
 
     azimuth_rad = np.deg2rad(azimuth)
     zenith_rad = np.deg2rad(zenith)
     hod_rad = (2.0 * np.pi / 24.0) * hour_of_day
-    doy_rad = (2.0 * np.pi / 366.0) * day_of_year
 
-    feats = np.stack(
-        [
-            np.sin(azimuth_rad),
-            np.cos(azimuth_rad),
-            np.sin(zenith_rad),
-            np.cos(zenith_rad),
-            np.sin(doy_rad),
-            np.cos(doy_rad),
-            np.sin(hod_rad),
-            np.cos(hod_rad),
-        ],
-        axis=-1,
-    ).astype(np.float32, copy=False)
+    base = [
+        np.sin(azimuth_rad),
+        np.cos(azimuth_rad),
+        np.sin(zenith_rad),
+        np.cos(zenith_rad),
+    ]
+
+    if include_doy:
+        day_of_year = np.asarray(solar_features["day_of_year"], dtype=np.float32)
+        doy_rad = (2.0 * np.pi / 366.0) * day_of_year
+        base.extend([np.sin(doy_rad), np.cos(doy_rad)])
+    # else: YLJ — no sin/cos DOY (see ``dataloader/ylj_zarr.py`` ``include_doy=False``).
+
+    base.extend([np.sin(hod_rad), np.cos(hod_rad)])
+    feats = np.stack(base, axis=-1).astype(np.float32, copy=False)
     return torch.from_numpy(feats)
 
 def _as_utc_naive_pd(ts) -> pd.Timestamp:

@@ -365,17 +365,42 @@ class pv_forecasting_model_vit_nwp(nn.Module):
         self.use_batchnorm = use_batchnorm
         self.dropout = dropout
 
+        dim = 64
+        self.sat_mod_embed = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+
         self.inverter_embedding = nn.Embedding(num_embeddings=1000, embedding_dim=16)
-        self.TCN = TemporalCNN1d(in_channels=11, out_channels=64, use_batchnorm=use_batchnorm, dropout=dropout)
-        self.query_mlp = MLP(in_dim=13, hidden_dims=(64, 64), out_dim=64, dropout=0.0)
+        # YLJ only: TCN 2+7=9; query MLP 7+3=10 (full T=192 PV keys, no coarse compression)
+        self._pv_timefeat_dim = 7
+        self.TCN = TemporalCNN1d(in_channels=2 + self._pv_timefeat_dim, out_channels=64, use_batchnorm=use_batchnorm, dropout=dropout)
+        self.query_mlp = MLP(in_dim=self._pv_timefeat_dim + 3, hidden_dims=(64, 64), out_dim=64, dropout=0.0)
         self.cross_attention_pv = CrossAttention(query_dim=64, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
-        # self.cross_attention_sat = CrossAttention(query_dim=9, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
-        # self.cross_attention_skimg = CrossAttention(query_dim=9, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
-        # self.sat_downdim = MLP(in_dim=768, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
-        # self.skimg_downdim = MLP(in_dim=768, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
-        # self.timefeats_encoder = MLP(in_dim=9, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
         self.pv_feats_head = MLP(in_dim=80, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
         self.fc = FC(in_dim=64, out_dim=1)
+
+        self.sat_time_mlp = nn.Sequential(
+            nn.Linear(self._pv_timefeat_dim, 64),
+            nn.GELU(),
+            nn.Linear(64, 64),
+        )
+        self.sat_embed_dim = 64
+        self.sat_patch_embed = VideoPatchSpatiotemporalEmbed(
+            embed_dim=self.sat_embed_dim, patch_size=16, image_size=112
+        )
+        self.sat_alt_attn = AlternatingIntraInterFrameAttention(
+            embed_dim=self.sat_embed_dim, num_heads=8, num_cycles=4, dropout=dropout
+        )
+        self.sat_two_stage_compressor = SatelliteTwoStageCompressor(
+            dim=self.sat_embed_dim,
+            num_frames=24,
+            num_patches=49,
+            num_frame_queries=8,
+            num_sat_queries=48,
+            num_heads=8,
+            use_patch_pos=True,
+            use_frame_time=True,
+            use_coarse_spatial=True,
+            coarse_query_grid_hw=(6, 8),
+        )
 
     def forward(self, device_id: torch.Tensor, pv: torch.Tensor, 
                 pv_mask: Optional[torch.Tensor] = None, 
@@ -387,48 +412,99 @@ class pv_forecasting_model_vit_nwp(nn.Module):
                 skimg_timefeats: Optional[torch.Tensor] = None,
                 nwp_tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
         
-        # PV features
         pv_masked = pv * pv_mask.to(pv.dtype)
-        pv_history = torch.cat([pv_masked, pv_mask, pv_timefeats.permute(0, 2, 1)], dim=1)  # [B, C=11, T]
-        pv_hist_mem = self.TCN(pv_history, pv_mask)     # [B, C_out, T]()
-        KV_hist_mem = pv_hist_mem.permute(0, 2, 1)   # [B, T, C_out]
+        if pv_timefeats is not None and pv_timefeats.shape[-1] != self._pv_timefeat_dim:
+            c = pv_timefeats.shape[-1]
+            if c > self._pv_timefeat_dim:
+                pv_timefeats = pv_timefeats[..., : self._pv_timefeat_dim]
+            else:
+                pv_timefeats = torch.nn.functional.pad(pv_timefeats, (0, self._pv_timefeat_dim - c))
+        if forecast_timefeats is not None and forecast_timefeats.shape[-1] != self._pv_timefeat_dim:
+            c = forecast_timefeats.shape[-1]
+            if c > self._pv_timefeat_dim:
+                forecast_timefeats = forecast_timefeats[..., : self._pv_timefeat_dim]
+            else:
+                forecast_timefeats = torch.nn.functional.pad(
+                    forecast_timefeats, (0, self._pv_timefeat_dim - c)
+                )
+        pv_history = torch.cat([pv_masked, pv_mask, pv_timefeats.permute(0, 2, 1)], dim=1)  # [B, C=9, T] for YLJ
+        pv_hist_mem = self.TCN(pv_history, pv_mask)
+        KV_hist_mem = pv_hist_mem.permute(0, 2, 1)  # [B, T=192, 64]
 
-        ssrd_normalized = (nwp_tensor[:,:,0]/1000 - 0.5)*2
-        msl_normalized = (nwp_tensor[:,:,1]-101325)/1000
-        t2m_normalized = (nwp_tensor[:,:,2]-288.15)/10
-        forecast_ssrd_timefeats = torch.cat([forecast_timefeats, ssrd_normalized.unsqueeze(2), msl_normalized.unsqueeze(2), t2m_normalized.unsqueeze(2), nwp_tensor[:,:,-1].unsqueeze(2)], dim=2)
+        if nwp_tensor is None:
+            B, Tq = pv.shape[0], forecast_timefeats.shape[1]
+            nwp_tensor = torch.zeros(B, Tq, 3, device=pv.device, dtype=pv.dtype)
+        else:
+            nwp_tensor = nwp_tensor.to(device=pv.device, dtype=pv.dtype)
+
+        ssrd_normalized = (nwp_tensor[:, :, 0] / 1000 - 0.5) * 2
+        t2m_normalized = nwp_tensor[:, :, 1] / 18
+        forecast_ssrd_timefeats = torch.cat(
+            [
+                forecast_timefeats,
+                ssrd_normalized.unsqueeze(2),
+                t2m_normalized.unsqueeze(2),
+                nwp_tensor[:, :, -1].unsqueeze(2),
+            ],
+            dim=2,
+        )
         forecast_query = self.query_mlp(forecast_ssrd_timefeats)
-        forecast_pv_features = self.cross_attention_pv(query=forecast_query, key=KV_hist_mem, value=KV_hist_mem)   #[B,T,D]
 
-        '''
-        # Satellite features    
-        if sat_tensor is None:
-            forecast_sat_features = torch.zeros(pv.shape[0], forecast_timefeats.shape[1], 64).to(pv.device)
+        B = forecast_query.shape[0]
+        if sat_tensor is None or sat_tensor.max() == 0:
+            hist_keys = KV_hist_mem
+            if pv_mask.dim() == 3:
+                key_value_mask = pv_mask.squeeze(1)
+            else:
+                key_value_mask = pv_mask
         else:
-            sat_tensor = nn.functional.interpolate(sat_tensor.view(-1, 3, *sat_tensor.shape[-2:]), size=(224, 224), mode='bilinear', align_corners=False).view(*sat_tensor.shape[:3], 224, 224)
-            sat_features = self.sat_extractor(sat_tensor[:,-24:,:,:,:])   #[B,T=xx,D=768]
-            sat_timefeats_hdim = self.timefeats_encoder(sat_timefeats[:,-24:,:])
-            sat_down_features = self.sat_downdim(sat_features) # [B,T=xx,D=64]
-            sat_down_features = sat_down_features + sat_timefeats_hdim
-            forecast_sat_features = self.cross_attention_sat(query=forecast_timefeats, key=sat_down_features, value=sat_down_features)
+            B_sat, T_sat, C_sat, H_sat, W_sat = sat_tensor.shape
+            if C_sat != 3:
+                raise ValueError(f"sat_tensor expected 3 channels, got {C_sat}")
+            sat_hr = F.interpolate(
+                sat_tensor.reshape(B_sat * T_sat, C_sat, H_sat, W_sat),
+                size=(112, 112),
+                mode="bilinear",
+                align_corners=False,
+            ).view(B_sat, T_sat, 3, 112, 112)
 
-        # Sky imager features
-        if skimg_tensor is None:
-            forecast_skimg_features = torch.zeros(pv.shape[0], forecast_timefeats.shape[1], 64).to(pv.device)
-        else:
-            skimg_tensor = nn.functional.interpolate(skimg_tensor.view(-1, 3    , *skimg_tensor.shape[-2:]), size=(224, 224), mode='bilinear', align_corners=False).view(*skimg_tensor.shape[:3], 224, 224)
-            skimg_features = self.skimg_extractor(skimg_tensor)   #[B,T=12,D=768]
-            skimg_down_features = self.skimg_downdim(skimg_features) # [B,T=12,D=64]
-            forecast_skimg_features = self.cross_attention_skimg(query=forecast_timefeats, key=skimg_down_features, value=skimg_down_features)
-            skimg_timefeats_hdim = self.timefeats_encoder(skimg_timefeats)
-            forecast_skimg_features = forecast_skimg_features + skimg_timefeats_hdim
-        '''
+            sat_patch_tokens = patchify_spatiotemporal_images(
+                sat_hr, self.sat_patch_embed, timefeats=sat_timefeats[:, :, -1].unsqueeze(2)
+            )
+            sat_patch_tokens = self.sat_alt_attn(sat_patch_tokens)
+            sat_start = sat_timefeats[:, 0, -1]
+            sat_end = sat_timefeats[:, -1, -1]
+            sat_steps = torch.linspace(0, 1, 48, device=sat_patch_tokens.device)
+            sat_query_times = sat_start[:, None] + (sat_end - sat_start)[:, None] * sat_steps
+            sat_compressed = self.sat_two_stage_compressor(sat_patch_tokens, sat_query_times) + self.sat_mod_embed
 
-        # Inverter features (embeddings)
-        inverter_features = self.inverter_embedding(device_id).unsqueeze(1).repeat(1, forecast_pv_features.shape[1], 1)
+            sat_timefeats_48 = F.interpolate(
+                sat_timefeats.transpose(1, 2),
+                size=48,
+                mode="linear",
+                align_corners=True,
+            ).transpose(1, 2)
+            sat_compressed = sat_compressed + self.sat_time_mlp(sat_timefeats_48)
 
-        # Fuse and predict
-        fused = torch.cat([forecast_pv_features, inverter_features], dim=2)   # [B=1,T=192,C=80]
+            sat_mask = torch.ones(B, sat_compressed.shape[1], device=pv.device, dtype=pv.dtype)
+            hist_keys = torch.cat([KV_hist_mem, sat_compressed], dim=1)
+            if pv_mask.dim() == 3:
+                pv_km = pv_mask.squeeze(1)
+            else:
+                pv_km = pv_mask
+            key_value_mask = torch.cat([pv_km, sat_mask], dim=1)
+
+        forecast_pv_features = self.cross_attention_pv(
+            query=forecast_query,
+            key=hist_keys,
+            value=hist_keys,
+            key_value_mask=key_value_mask,
+        )
+
+        inverter_features = self.inverter_embedding(device_id).unsqueeze(1).repeat(
+            1, forecast_pv_features.shape[1], 1
+        )
+        fused = torch.cat([forecast_pv_features, inverter_features], dim=2)
         pv_feats = self.pv_feats_head(fused)
         pv = self.fc(pv_feats)
 
@@ -647,7 +723,7 @@ class pv_forecasting_model_vit_imgs(nn.Module):
             sat_compressed = self.sat_two_stage_compressor(sat_patch_tokens, sat_query_times) + self.sat_mod_embed  # [B,P=48,D=64]
 
             sat_timefeats_48 = F.interpolate(
-                    sat_timefeats.transpose(1, 2),       # -> [B, F=9, T=24]  (interp 要求 [N, C, L])
+                    sat_timefeats.transpose(1, 2),       # -> [B, F=9, T=24]
                     size=48,
                     mode="linear",
                     align_corners=True,                  # 头尾对齐 -> 保留首末时刻原值

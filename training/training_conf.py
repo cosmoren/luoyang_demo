@@ -1,7 +1,8 @@
-"""Load ``config/conf.yaml`` training section and resolved data paths for CLI defaults."""
+"""Load config YAML training section and resolved data paths for CLI defaults."""
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import yaml
@@ -9,8 +10,16 @@ import yaml
 from config_utils import get_resolved_paths
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-CONF_PATH = PROJECT_ROOT / "config" / "conf.yaml"
+CONF_PATH = PROJECT_ROOT / "config" / "datasets" / "conf_luoyang.yaml"
 FOLSOM_CONF_PATH = PROJECT_ROOT / "config" / "datasets" / "conf_folsom.yaml"
+
+YLJ_TRAINING_EXTRA_KEYS = frozenset({
+    "t_off_min",
+    "pv_output_rand",
+    "pv_value_column",
+    "pv_value_scale",
+    "clear_sky_ratio_max_valid",
+})
 
 TRAINING_HPARAM_KEYS = frozenset({
     "csv_interval_min",
@@ -67,6 +76,30 @@ def _dataset_profile_is_folsom(conf: dict) -> bool:
     return str(conf.get("dataset_profile", "")).strip().lower() == "folsom"
 
 
+def _site_is_ylj(conf: dict) -> bool:
+    site = conf.get("site", {})
+    return str(site.get("name", "")).strip().lower() == "ylj"
+
+
+def set_config_path(path: str | Path) -> None:
+    global CONF_PATH
+    CONF_PATH = Path(path).expanduser().resolve()
+
+
+def bootstrap_config_from_argv(argv: list[str] | None = None) -> None:
+    """Apply ``--config PATH`` before other modules call :func:`load_config`."""
+    args = sys.argv if argv is None else argv
+    for i, arg in enumerate(args):
+        if arg == "--config" and i + 1 < len(args):
+            set_config_path(args[i + 1])
+            print(f"[config] using config: {CONF_PATH}")
+            return
+        if arg.startswith("--config="):
+            set_config_path(arg.split("=", 1)[1])
+            print(f"[config] using config: {CONF_PATH}")
+            return
+
+
 def load_config(config_path: str | Path | None = None) -> dict:
     path = Path(config_path) if config_path is not None else CONF_PATH
     with open(path) as f:
@@ -81,14 +114,18 @@ def load_config_path(path: Path | str | None = None) -> dict:
 
 
 def get_training_hparams_from_conf(conf: dict | None = None) -> dict:
-    """Load ``conf['training']``; required keys depend on ``dataset_profile``."""
+    """Load ``conf['training']`` (or ``conf['sampling']`` for Luoyang); keys depend on site/profile."""
     if conf is None:
         conf = load_config()
     raw = conf.get("training")
     if not isinstance(raw, dict):
-        raise ValueError("conf must define a non-empty 'training:' mapping")
+        raw = conf.get("sampling")
+    if not isinstance(raw, dict):
+        raise ValueError("conf must define a non-empty 'training:' or 'sampling:' mapping")
     is_folsom = _dataset_profile_is_folsom(conf)
     keys = FOLSOM_IRR_TRAINING_HPARAM_KEYS if is_folsom else TRAINING_HPARAM_KEYS
+    if _site_is_ylj(conf):
+        keys = keys | YLJ_TRAINING_EXTRA_KEYS
     missing = sorted(keys - raw.keys())
     if missing:
         ref = "FOLSOM_IRR_TRAINING_HPARAM_KEYS" if is_folsom else "TRAINING_HPARAM_KEYS"
@@ -143,6 +180,31 @@ def get_training_hparams_from_conf(conf: dict | None = None) -> dict:
         raise ValueError("training.test_collect_time_match_tolerance_min must be a non-negative int (minutes)")
     out["test_collect_time_match_tolerance_min"] = int(tol)
 
+    if _site_is_ylj(conf):
+        off = out["t_off_min"]
+        if isinstance(off, str):
+            off = int(float(off))
+        if not isinstance(off, int) or isinstance(off, bool) or off < 0:
+            raise ValueError("training.t_off_min must be a non-negative int (minutes)")
+        out["t_off_min"] = int(off)
+        out["pv_output_rand"] = bool(out["pv_output_rand"])
+        col = str(out["pv_value_column"]).strip()
+        if col not in ("active_power", "clear_sky_ratio"):
+            raise ValueError("training.pv_value_column must be 'active_power' or 'clear_sky_ratio'")
+        out["pv_value_column"] = col
+        pvs = out["pv_value_scale"]
+        if isinstance(pvs, str):
+            pvs = float(pvs)
+        if not isinstance(pvs, (int, float)) or isinstance(pvs, bool) or pvs <= 0:
+            raise ValueError("training.pv_value_scale must be a positive number")
+        out["pv_value_scale"] = float(pvs)
+        csr = out["clear_sky_ratio_max_valid"]
+        if isinstance(csr, str):
+            csr = float(csr)
+        if not isinstance(csr, (int, float)) or isinstance(csr, bool) or csr <= 0:
+            raise ValueError("training.clear_sky_ratio_max_valid must be a positive number")
+        out["clear_sky_ratio_max_valid"] = float(csr)
+
     return out
 
 
@@ -187,9 +249,15 @@ def get_training_paths_from_conf(conf: dict | None = None, project_root: Path | 
     pv_dir = (data_dir / _req("pv_path")).resolve()
     sky_dir = (data_dir / _req("sky_image_path")).resolve()
     sat_dir = (data_dir / _req("sat_path")).resolve()
-
-    return {
+    out: dict[str, str] = {
         "pv_dir": str(pv_dir),
         "skyimg_dir": str(sky_dir),
         "satimg_dir": str(sat_dir),
     }
+    nwp_rel = paths_cfg.get("nwp_path")
+    if nwp_rel is not None and str(nwp_rel).strip():
+        out["nwp_dir"] = str((data_dir / str(nwp_rel).strip()).resolve())
+    raw_parquet = resolved.get("ylj_raw_parquet_dir")
+    if raw_parquet is not None:
+        out["ylj_raw_parquet_dir"] = str(raw_parquet)
+    return out

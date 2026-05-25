@@ -67,12 +67,24 @@ def list_csv_files(
     return all_csvs[start_idx : end_idx + 1]
 
 
-def _load_training_defaults() -> dict:
-    conf = load_config()
-    return get_training_hparams_from_conf(conf)
-
-
-_TRAINING_HPARAM_DEFAULTS = _load_training_defaults()
+# Static fallbacks (``conf_luoyang.yaml`` ``sampling:``); avoid ``load_config()`` at import time.
+_TRAINING_HPARAM_DEFAULTS: dict = {
+    "csv_interval_min": 5,
+    "pv_input_interval_min": 5,
+    "pv_output_interval_min": 15,
+    "pv_input_len": 576,
+    "pv_output_len": 192,
+    "pv_train_time_fraction": 0.7,
+    "test_anchor_stride_min": 1500,
+    "val_anchor_stride_min": 1800,
+    "test_collect_time_match_tolerance_min": 0,
+    "skyimg_window_size": 30,
+    "skyimg_time_resolution_min": 1,
+    "skyimg_spatial_size": 224,
+    "satimg_window_size": 24,
+    "satimg_time_resolution_min": 10,
+    "satimg_npy_shape_hwc": (100, 100, 3),
+}
 
 # ``nwp_interp`` columns: ssrd (solar) then wind fields, in this order.
 _NWP_INTERP_STACK_COLS = ("ssrd", "msl", "t2m", "u10", "v10", "u100", "v100")
@@ -1061,10 +1073,16 @@ def collate_batched(batch):
         "pv_mask": _stack("pv_mask"),
         "pv_timefeats": _stack("pv_timefeats"),
         "forecast_timefeats": _stack("forecast_timefeats"),
-        "nwp_tensor": _stack("nwp_tensor"),
         "target_pv": _stack("target_pv"),
         "target_mask": _stack("target_mask"),
     }
+    nwp_vals = [s["nwp_tensor"] for s in batch]
+    if nwp_vals[0] is None:
+        if not all(v is None for v in nwp_vals):
+            raise ValueError("collate_batched: mixed None and tensor for 'nwp_tensor'")
+        out["nwp_tensor"] = None
+    else:
+        out["nwp_tensor"] = torch.stack(nwp_vals)
     for key in ("sat_tensor", "sat_timefeats", "skimg_tensor", "skimg_timefeats"):
         vals = [s[key] for s in batch]
         if vals[0] is None:

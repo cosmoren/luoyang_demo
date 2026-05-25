@@ -105,7 +105,7 @@ venv.bak/
 .mypy_cache/
 
 # Checkpoints (model weights, not for repo)
-checkpoints/
+checkpoints*/
 runs/
 
 # NFS silly-rename stubs (created when a file is deleted while still open)
