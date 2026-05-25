@@ -18,7 +18,7 @@ TOTAL=${TOTAL:-20}
 CONFIG=${CONFIG:-conf_train.yaml}
 
 # ── /dev/shm setup ────────────────────────────────────────────────────────────
-SRC="/work/datasets/luoyang_SPMF"
+SRC="${HOME}/datasets/luoyang_SPMF"
 DST="/dev/shm/luoyang_SPMF"
 LOCK="/tmp/luoyang_shm_rsync.lock"
 DONE="${DST}/.rsync_done"

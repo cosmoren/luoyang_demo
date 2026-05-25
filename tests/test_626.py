@@ -8,7 +8,7 @@ import csv
 import os
 from datetime import datetime
 
-DATA_DIR = "/work/datasets/luoyang_SPMF/pv_sf1"
+DATA_DIR = os.path.expanduser("~/datasets/luoyang_SPMF/pv_kt")
 TIME_COLUMNS = ("collectTime", "local_solar_time")
 TIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f")
 
@@ -67,7 +67,7 @@ def check_file(path: str) -> int:
 
 def main():
     if not os.path.isdir(DATA_DIR):
-        print(f"目录不存在: {DATA_DIR}")
+        print(f"目录不存在: {DATA_DIR}  (已 expanduser，请确认路径)")
         return
 
     files = sorted(

@@ -7,7 +7,7 @@ site:
 paths:
   data_dir: "/dev/shm/luoyang_SPMF"
   pv_device_path: dataloader/XINSHENG_power_total_devices_type1.xlsx
-  pv_path: pv
+  pv_path: pv_ktuni
   sky_image_path: skimg_zarr
   sat_path: sat_himawari_zarr_500km
   nwp_path: NWP

@@ -63,8 +63,12 @@ def _batch_to_device(batch: dict, device: torch.device) -> dict:
         "pv_mask": batch["pv_mask"].to(device),
         "pv_timefeats": batch["pv_timefeats"].to(device),
         "forecast_timefeats": batch["forecast_timefeats"].to(device),
+        "kt": batch["kt"].to(device),
+        "kt_mask": batch["kt_mask"].to(device),
+        "p_mean": batch["p_mean"].to(device),
         "target_pv": batch["target_pv"].to(device),
         "target_mask": batch["target_mask"].to(device),
+        "target_p_cs": batch["target_p_cs"].to(device),
     }
     for key in ("sat_tensor", "sat_timefeats", "skimg_tensor", "skimg_timefeats", "nwp_tensor"):
         v = batch.get(key)
@@ -75,8 +79,8 @@ def _batch_to_device(batch: dict, device: torch.device) -> dict:
 def forward_vit(model: nn.Module, d: dict) -> torch.Tensor:
     return model(
         d["device_id"],
-        d["pv"],
-        pv_mask=d["pv_mask"],
+        d["kt"]/20.0,
+        pv_mask=d["kt_mask"],
         pv_timefeats=d["pv_timefeats"],                  # [B, T, C=9]
         forecast_timefeats=d["forecast_timefeats"],      # [B, T, C=9]
         sat_tensor=d["sat_tensor"],                      # [B, T=24, C=3, H=100, W=100]
@@ -147,8 +151,10 @@ def train_one_epoch(
         d = _batch_to_device(batch, device)
         B = d["device_id"].size(0)
         optimizer.zero_grad()
-        pv_pred = forward_vit(model, d)
-        loss = criterion( (pv_pred * d["target_mask"])[:,0:16], (d["target_pv"] * d["target_mask"])[:,0:16])
+        kt_pred = forward_vit(model, d) * 20.0
+        pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
+
+        loss = criterion( pv_pred, d["target_pv"] )
         # loss = criterion(pv_pred, d["target_pv"])
         loss.backward()
         optimizer.step()
@@ -172,8 +178,9 @@ def evaluate(
         for batch in loader:
             d = _batch_to_device(batch, device)
             B = d["device_id"].size(0)
-            pv_pred = forward_vit(model, d)
-            loss = criterion( (pv_pred * d["target_mask"])[:,0:16], (d["target_pv"] * d["target_mask"])[:,0:16] )
+            kt_pred = forward_vit(model, d) * 20.0
+            pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
+            loss = criterion( pv_pred, d["target_pv"] )
             # loss = criterion(pv_pred, d["target_pv"])
             total_loss += loss.item()
             n += B
@@ -182,14 +189,11 @@ def evaluate(
                 kk = int(d["device_id"][i].item()) # the inverter ID
                 # forecast_timefeats[:, 3] == cos_zenith (see solar_features_encoder column order)
                 # RMSE/MAE aggregation: first 16 horizons only (match training loss window)
-                cos_zenith = d["forecast_timefeats"][i, :16][:, 3].detach().cpu().float().numpy()
-                night = cos_zenith < 0
-                pred_np = pv_pred[i, :16].detach().cpu().float().numpy().copy()
-                tgt_np = d["target_pv"][i, :16].detach().cpu().float().numpy().copy()
-                pred_np[night] = 0.0
-                # tgt_np[night] = 0.0
+                pred_np = pv_pred[i, :].detach().cpu().float().numpy().copy()
+                tgt_np = d["target_pv"][i, :].detach().cpu().float().numpy().copy()
                 discrete_pred = pred_np.tolist()
                 discrete_target = tgt_np.tolist()
+                
                 if kk not in pred_dict:
                     pred_dict[kk] = []
                     target_dict[kk] = []
@@ -209,7 +213,7 @@ def evaluate(
             else:
                 total_target = total_target + np.asarray(target_dict[kk]).reshape(-1)
         
-        scale = 50.0
+        scale = 1.0
         mae = np.mean(np.abs(total_pred*scale - total_target*scale))
         rmse = np.sqrt(np.mean((total_pred*scale - total_target*scale) ** 2))
 

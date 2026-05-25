@@ -852,9 +852,18 @@ class PVDataset(Dataset):
         time0_utc = timestamps[-1]
 
         inv_x = pd.to_numeric(sub_x[INVERTER_STATE_COL], errors="coerce").fillna(0).astype(np.int32).values
-        pow_x = pd.to_numeric(sub_x["active_power"], errors="coerce").fillna(0).values.astype(np.float32) / 50.0
+        pow_x = pd.to_numeric(sub_x["active_power"], errors="coerce").fillna(0).values.astype(np.float32)
         pv_mask = torch.from_numpy((inv_x == VALID_STATE).astype(np.float32)).unsqueeze(0)
+        kt_mask_np = pd.to_numeric(sub_x["kt_mask"], errors="coerce").fillna(0).astype(np.float32).values
+        kt_np = pd.to_numeric(sub_x["kt"], errors="coerce").fillna(0).values.astype(np.float32)
+        p_cs_np = pd.to_numeric(sub_x["p_cs"], errors="coerce").fillna(0).values.astype(np.float32)
+        p_mean_np = pd.to_numeric(sub_x["p_mean"], errors="coerce").fillna(0).values.astype(np.float32)
+
         pv = torch.from_numpy(pow_x.astype(np.float32)).unsqueeze(0)
+        kt = torch.from_numpy(kt_np).unsqueeze(0)
+        kt_mask = torch.from_numpy(kt_mask_np).unsqueeze(0)
+        p_cs = torch.from_numpy(p_cs_np).unsqueeze(0)
+        p_mean = torch.tensor(float(p_mean_np[-1]) if len(p_mean_np) else 0.0, dtype=torch.float32)
         prof.mark("build.pv_history_tensors")
 
         pv_solar_features = extract_solar_features(sub_x)
@@ -886,10 +895,12 @@ class PVDataset(Dataset):
 
         inv_y = pd.to_numeric(sub_y[INVERTER_STATE_COL], errors="coerce").fillna(0).astype(np.int32).values
         pow_y = pd.to_numeric(sub_y["active_power"], errors="coerce").fillna(0).values.astype(np.float32)
-        target_pv = torch.from_numpy((pow_y / 50.0).astype(np.float32))
+        target_pv = torch.from_numpy((pow_y).astype(np.float32))
         target_mask = torch.from_numpy((inv_y == VALID_STATE).astype(np.float32))
+        target_p_cs = torch.from_numpy(sub_y["p_cs"].values.astype(np.float32))
         prof.mark("build.targets")
 
+        
         # Select satellite images from the window
         sat_t0 = time0_utc - timedelta(minutes=(245+30))
         sat_t1 = time0_utc - timedelta(minutes=30)
@@ -978,6 +989,10 @@ class PVDataset(Dataset):
             "pv": pv,
             "pv_mask": pv_mask,
             "pv_timefeats": pv_timefeats,
+            "kt": kt,
+            "kt_mask": kt_mask,
+            "p_cs": p_cs,
+            "p_mean": p_mean,
             "forecast_timefeats": forecast_timefeats,
             "sat_tensor": sat_tensor,
             "sat_timefeats": sat_timefeats,
@@ -986,6 +1001,7 @@ class PVDataset(Dataset):
             "nwp_tensor": nwp_tensor,
             "target_pv": target_pv,
             "target_mask": target_mask,
+            "target_p_cs": target_p_cs,
         }
 
 
@@ -1075,8 +1091,13 @@ def collate_batched(batch):
         "pv_mask": _stack("pv_mask"),
         "pv_timefeats": _stack("pv_timefeats"),
         "forecast_timefeats": _stack("forecast_timefeats"),
+        "kt": _stack("kt"),
+        "kt_mask": _stack("kt_mask"),
+        "p_cs": _stack("p_cs"),
+        "p_mean": _stack("p_mean"),
         "target_pv": _stack("target_pv"),
         "target_mask": _stack("target_mask"),
+        "target_p_cs": _stack("target_p_cs"),
     }
     for key in ("nwp_tensor", "sat_tensor", "sat_timefeats", "skimg_tensor", "skimg_timefeats"):
         vals = [s[key] for s in batch]

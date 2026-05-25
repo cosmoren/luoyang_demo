@@ -127,7 +127,8 @@ class FC(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [..., in_dim]. Returns: [..., out_dim]."""
-        return self.fc(x)
+        kt = torch.sigmoid( self.fc(x) ) * 1.2
+        return kt
 
 
 class CrossAttention(nn.Module):
@@ -532,10 +533,10 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         self.sky_mod_embed = nn.Parameter(torch.randn(1, 1, dim) * 0.02)   # Sky imagem odality embedding
 
         self.inverter_embedding = nn.Embedding(num_embeddings=1000, embedding_dim=16)
-        self.TCN = TemporalCNN1d(in_channels=11, out_channels=64, use_batchnorm=use_batchnorm, dropout=dropout)
+        self.TCN = TemporalCNN1d(in_channels=5, out_channels=64, use_batchnorm=use_batchnorm, dropout=dropout)
 
         self.time_mlp = nn.Sequential(
-            nn.Linear(9, 64),
+            nn.Linear(3, 64),
             nn.GELU(),
             nn.Linear(64, 64),
         )
@@ -544,7 +545,7 @@ class pv_forecasting_model_vit_imgs(nn.Module):
                            529, 532, 535, 538, 541, 544, 547, 550, 553, 556, 559, 562, 565, 568, 571, 574]
         self.learnable_pv_queries = nn.Parameter(torch.randn(1, 48, 64))
         self.cross_attention_pv_compression = CrossAttention(query_dim=64, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)        
-        self.query_mlp = MLP(in_dim=11, hidden_dims=(64, 64), out_dim=64, dropout=0.0)
+        self.query_mlp = MLP(in_dim=5, hidden_dims=(64, 64), out_dim=64, dropout=0.0)
 
         self.sat_embed_dim = 64
         self.sat_patch_embed = VideoPatchSpatiotemporalEmbed(
@@ -601,6 +602,10 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         
         # PV history features
         pv_masked = pv * pv_mask.to(pv.dtype)
+
+        pv_timefeats = pv_timefeats[:, :, [2,3,8]]
+        forecast_timefeats = forecast_timefeats[:, :, [2,3,8]]
+        
         pv_history = torch.cat([pv_masked, pv_mask, pv_timefeats.permute(0, 2, 1)], dim=1)  # [B, C=11, T]
         pv_hist_mem = self.TCN(pv_history, pv_mask)     # [B, C_out, T]()
         KV_hist_mem = pv_hist_mem.permute(0, 2, 1)   # [B, T, C_out]
@@ -631,6 +636,7 @@ class pv_forecasting_model_vit_imgs(nn.Module):
             B_sat, T_sat, C_sat, H_sat, W_sat = sat_tensor.shape
             if C_sat != 3:
                 raise ValueError(f"sat_tensor expected 3 channels, got {C_sat}")
+            sat_timefeats = sat_timefeats[:, :, [2, 3, 8]]
             sat_hr = nn.functional.interpolate(
                 sat_tensor.reshape(B_sat * T_sat, C_sat, H_sat, W_sat),
                 size=(112, 112),
@@ -647,7 +653,7 @@ class pv_forecasting_model_vit_imgs(nn.Module):
             sat_compressed = self.sat_two_stage_compressor(sat_patch_tokens, sat_query_times) + self.sat_mod_embed  # [B,P=48,D=64]
 
             sat_timefeats_48 = F.interpolate(
-                    sat_timefeats.transpose(1, 2),       # -> [B, F=9, T=24]  (interp 要求 [N, C, L])
+                    sat_timefeats.transpose(1, 2),       # -> [B, F=3, T=24]  (interp 要求 [N, C, L])
                     size=48,
                     mode="linear",
                     align_corners=True,                  # 头尾对齐 -> 保留首末时刻原值

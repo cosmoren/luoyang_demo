@@ -10,7 +10,6 @@ Aggregate 365 daily CSV files by devDn:
   from collectTime (UTC) + device lat/lon via pvlib:
   solar_zenith, solar_azimuth, local_solar_time, day_of_year, hour_of_day.
   day_of_year and hour_of_day are taken from local solar time.
-- After per-devDn files, writes NE_total.csv: row-wise aggregate (see aggregate_ne_total).
 
 Each daily file is read once; staging CSVs on disk then one devDn at a time in RAM
 for the final grid. Staging is deleted when done.
@@ -32,13 +31,13 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Set
 
+import numpy as np
 import pandas as pd
 import pvlib
 
 # Paths already reported as empty (no header row); avoid duplicate stderr lines per devDn pass.
 _logged_empty_csv_paths: Set[Path] = set()
 
-NE_TOTAL_FILENAME = "NE_total.csv"
 STAGING_DIRNAME = "_staging_by_devdn"
 
 # Source tables use China wall time (UTC+8, no DST).
@@ -63,10 +62,10 @@ NUMERIC_COL_NAMES = [
 ]
 
 # Extra time/solar-geometry columns appended only to the final per-devDn CSVs
-# and NE_total.csv (staging files keep the original HEADER).
+# (staging files keep the original HEADER).
 SOLAR_EXTRA_COLS = [
     "solar_zenith", "solar_azimuth", "local_solar_time",
-    "day_of_year", "hour_of_day",
+    "day_of_year", "hour_of_day", "p_cs", "kt", "kt_mask", "p_mean",
 ]
 OUTPUT_HEADER = HEADER + SOLAR_EXTRA_COLS
 
@@ -97,6 +96,33 @@ def utc_index_for_grid() -> pd.DatetimeIndex:
 _solar_cache: dict = {}
 
 
+def compute_clearsky_power(lat: float, lon: float, utc_index: pd.DatetimeIndex) -> pd.Series:
+    """Normalized clear-sky POA (``poa_global / 1000``), clipped to [0, 1.2]."""
+    tilt = abs(lat)  # unknown tilt: rough latitude-tilt assumption
+    azimuth = 180 if lat >= 0 else 0  # north: south-facing; south: north-facing
+    solpos = pvlib.solarposition.get_solarposition(utc_index, lat, lon)
+
+    loc = pvlib.location.Location(lat, lon)
+    # 1. Clear-sky GHI/DNI/DHI
+    cs = loc.get_clearsky(utc_index, model="ineichen")
+
+    poa = pvlib.irradiance.get_total_irradiance(
+        surface_tilt=tilt,
+        surface_azimuth=azimuth,
+        solar_zenith=solpos["apparent_zenith"],
+        solar_azimuth=solpos["azimuth"],
+        dni=cs["dni"],
+        ghi=cs["ghi"],
+        dhi=cs["dhi"],
+        albedo=0.2,
+    )
+
+    poa_clear = poa["poa_global"].clip(lower=0)
+    p_cs = (poa_clear / 1000).clip(0, 1.2)
+
+    return p_cs
+
+
 def compute_solar_arrays(utc_index: pd.DatetimeIndex, lat: float, lon: float) -> dict:
     """Vectorized per-(lat, lon) solar arrays aligned with utc_index. Cached by rounded coords."""
     key = (round(float(lat), 5), round(float(lon), 5))
@@ -113,6 +139,8 @@ def compute_solar_arrays(utc_index: pd.DatetimeIndex, lat: float, lon: float) ->
     utc_naive = utc_index.tz_convert("UTC").tz_localize(None)
     lst_index = utc_naive + offset
 
+    p_cs = compute_clearsky_power(lat, lon, utc_index)
+
     arrays = {
         "zenith": zenith,
         "azimuth": azimuth,
@@ -123,19 +151,21 @@ def compute_solar_arrays(utc_index: pd.DatetimeIndex, lat: float, lon: float) ->
             + lst_index.minute / 60.0
             + lst_index.second / 3600.0
         ).to_numpy(),
+        "p_cs": p_cs.to_numpy(),
     }
     _solar_cache[key] = arrays
     return arrays
 
 
 def solar_fields_at(arrays: dict, idx: int) -> dict:
-    """Format the 5 solar/temporal output fields for the row at array index `idx`."""
+    """Format solar/temporal output fields (incl. ``p_cs``) for the row at array index ``idx``."""
     return {
         "solar_zenith": f"{float(arrays['zenith'][idx]):.4f}",
         "solar_azimuth": f"{float(arrays['azimuth'][idx]):.4f}",
         "local_solar_time": arrays["lst_strs"][idx],
         "day_of_year": str(int(arrays["day_of_year"][idx])),
         "hour_of_day": f"{float(arrays['hour_of_day'][idx]):.4f}",
+        "p_cs": f"{float(arrays['p_cs'][idx]):.6f}",
     }
 
 
@@ -320,135 +350,6 @@ def zero_like_row():
     return {k: "0" if k in NUMERIC_COL_NAMES else "" for k in HEADER}
 
 
-def ne_total_partial_blank():
-    """Running aggregate for one UTC collectTime (one row added per station file)."""
-    return {
-        "n": 0,
-        "cap_sum": 0.0,
-        "has_512": False,
-        "eff_sum": 0.0,
-        "temp_sum": 0.0,
-        "pf_sum": 0.0,
-        "efq_sum": 0.0,
-        "react_sum": 0.0,
-        "ap_sum": 0.0,
-        "day_sum": 0.0,
-        "mppt_sum": 0.0,
-        "totc_sum": 0.0,
-        "mppt_tot_sum": 0.0,
-    }
-
-
-def ne_total_partial_add(partials: dict, utc_key: str, row: dict) -> None:
-    """Incorporate one station row into the running totals for utc_key."""
-    p = partials.setdefault(utc_key, ne_total_partial_blank())
-    p["n"] += 1
-    p["cap_sum"] += parse_float(row["capacity"])
-    if int(round(parse_float(row["inverter_state"]))) == 512:
-        p["has_512"] = True
-    p["eff_sum"] += parse_float(row["efficiency"])
-    p["temp_sum"] += parse_float(row["temperature"])
-    p["pf_sum"] += parse_float(row["power_factor"])
-    p["efq_sum"] += parse_float(row["elec_freq"])
-    p["react_sum"] += parse_float(row["reactive_power"])
-    p["ap_sum"] += parse_float(row["active_power"])
-    p["day_sum"] += parse_float(row["day_cap"])
-    p["mppt_sum"] += parse_float(row["mppt_power"])
-    p["totc_sum"] += parse_float(row["total_cap"])
-    p["mppt_tot_sum"] += parse_float(row["mppt_total_cap"])
-
-
-def ne_total_partial_finalize(p: dict, utc_key: str, lat: float, lon: float) -> dict:
-    """Turn running totals into one NE=total row (same rules as former aggregate_ne_total_row)."""
-    n = p["n"]
-    if n == 0:
-        out = zero_like_row()
-        out["stationCode"] = "NE=total"
-        out["devDn"] = "NE=total"
-        out["collectTime"] = utc_key
-        out["latitude_device"] = fmt_number(lat)
-        out["longitude_device"] = fmt_number(lon)
-        return out
-    inv = 512 if p["has_512"] else 0
-    return {
-        "stationCode": "NE=total",
-        "latitude_device": fmt_number(lat),
-        "longitude_device": fmt_number(lon),
-        "capacity": fmt_number(p["cap_sum"] / n),
-        "collectTime": utc_key,
-        "devDn": "NE=total",
-        "inverter_state": str(inv),
-        "efficiency": fmt_number(p["eff_sum"] / n),
-        "temperature": fmt_number(p["temp_sum"] / n),
-        "power_factor": fmt_number(p["pf_sum"] / n),
-        "elec_freq": fmt_number(p["efq_sum"] / n),
-        "active_power": fmt_number(p["ap_sum"]),
-        "reactive_power": fmt_number(p["react_sum"] / n),
-        "day_cap": fmt_number(p["day_sum"]),
-        "mppt_power": fmt_number(p["mppt_sum"] / n),
-        "total_cap": fmt_number(p["totc_sum"] / n),
-        "mppt_total_cap": fmt_number(p["mppt_tot_sum"] / n),
-    }
-
-
-def write_ne_total(output_dir: Path, lat: float, lon: float):
-    """Combine all per-devDn CSVs (excluding NE_total.csv) into NE_total.csv.
-
-    Reads one device file at a time; peak RAM is O(number of UTC timesteps), not O(stations × timesteps).
-    Solar geometry is computed using the externally supplied ``lat``/``lon``.
-    """
-    dev_paths = sorted(
-        p for p in output_dir.glob("*.csv") if p.name != NE_TOTAL_FILENAME
-    )
-    if not dev_paths:
-        print("No per-devDn CSVs found; skip NE_total.csv")
-        return
-
-    n_files = len(dev_paths)
-    print(
-        f"Building {NE_TOTAL_FILENAME} from {n_files} device files "
-        f"(streaming, one file at a time)..."
-    )
-    partials: dict = {}
-
-    for path in dev_paths:
-        with open(path, "r", encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                ct = row.get("collectTime", "").strip()
-                if not ct:
-                    continue
-                ne_total_partial_add(partials, ct, row)
-
-    sun = compute_solar_arrays(utc_index_for_grid(), lat, lon)
-
-    keys = ordered_utc_collect_time_keys()
-    out_path = output_dir / NE_TOTAL_FILENAME
-    with open(out_path, "w", encoding="utf-8", newline="") as out:
-        writer = csv.DictWriter(out, fieldnames=OUTPUT_HEADER)
-        writer.writeheader()
-        for i, utc_key in enumerate(keys):
-            p = partials.get(utc_key)
-            n_have = 0 if p is None else p["n"]
-            need = n_files - n_have
-            if need < 0:
-                raise ValueError(
-                    f"NE_total: more than {n_files} rows for {utc_key!r} "
-                    f"(duplicate collectTime in one device file?)"
-                )
-            if need > 0:
-                z = zero_like_row()
-                z["collectTime"] = utc_key
-                for _ in range(need):
-                    ne_total_partial_add(partials, utc_key, z)
-                p = partials[utc_key]
-            row = ne_total_partial_finalize(p, utc_key, lat, lon)
-            row.update(solar_fields_at(sun, i))
-            writer.writerow(row)
-
-    print(f"Wrote {out_path}")
-
-
 def main(input_dir: Path, output_dir: Path, lat: float, lon: float):
     input_dir = input_dir.resolve()
     output_dir = output_dir.resolve()
@@ -471,7 +372,7 @@ def main(input_dir: Path, output_dir: Path, lat: float, lon: float):
 
     zero_row = {k: "0" if k in NUMERIC_COL_NAMES else "" for k in HEADER}
 
-    utc_idx = utc_index_for_grid()  # built once; shared across devices and NE_total
+    utc_idx = utc_index_for_grid()  # built once; shared across all per-devDn outputs
 
     try:
         print("Pass 2/2: fill 5-min grid from staging (one devDn at a time)...")
@@ -483,6 +384,26 @@ def main(input_dir: Path, output_dir: Path, lat: float, lon: float):
             )
 
             sun = compute_solar_arrays(utc_idx, lat, lon)
+
+            p_cs_arr = np.asarray(sun["p_cs"], dtype=np.float64)
+            utc_keys = ordered_utc_collect_time_keys()
+            active_power_arr = np.array(
+                [
+                    parse_float(time_to_row.get(ts, {}).get("active_power", "0"))
+                    for ts in utc_keys
+                ],
+                dtype=np.float64,
+            )
+            if active_power_arr.shape != p_cs_arr.shape:
+                raise ValueError(
+                    f"shape mismatch for {devdn}: active_power={active_power_arr.shape}, "
+                    f"p_cs={p_cs_arr.shape}"
+                )
+
+            p_mean = float(active_power_arr.mean())
+            kt_mask = (p_cs_arr > 0.1).astype(np.float64)
+            kt = active_power_arr / (p_cs_arr * p_mean + 1e-6)
+            kt = kt * kt_mask
 
             out_path = output_dir / safe_devdn_filename(devdn)
             with open(out_path, "w", encoding="utf-8", newline="") as out:
@@ -500,19 +421,20 @@ def main(input_dir: Path, output_dir: Path, lat: float, lon: float):
                         row["latitude_device"] = fmt_number(lat)
                         row["longitude_device"] = fmt_number(lon)
                     row.update(solar_fields_at(sun, i))
+                    row["kt"] = f"{float(kt[i]):.6f}"
+                    row["kt_mask"] = str(int(kt_mask[i]))
+                    row["p_mean"] = f"{p_mean:.6f}"
                     writer.writerow(row)
     finally:
         shutil.rmtree(staging_dir, ignore_errors=True)
 
-    write_ne_total(output_dir, lat, lon)
-
     print(f"Done. Output directory: {output_dir}")
-    print(f"Per-devDn files: {len(unique_devdns)}, plus {NE_TOTAL_FILENAME}")
+    print(f"Per-devDn files: {len(unique_devdns)}")
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Aggregate daily 组串式逆变器 CSVs by devDn; output UTC collectTime and NE_total.csv."
+        description="Aggregate daily 组串式逆变器 CSVs by devDn; output UTC collectTime per devDn."
     )
     p.add_argument(
         "-i",
@@ -526,7 +448,7 @@ def parse_args():
         "--output",
         type=Path,
         default='/data/data/luoyang_data_626',
-        help="Directory for per-devDn CSVs and NE_total.csv (default: <input>/aggregated_by_devDn).",
+        help="Directory for per-devDn CSVs (default: <input>/aggregated_by_devDn).",
     )
     p.add_argument(
         "--lat",
