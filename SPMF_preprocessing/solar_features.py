@@ -1,279 +1,286 @@
+#!/usr/bin/env python3
+"""
+YLJ solar / kt features from matrix Parquet windows.
+
+CSV rows:
+- 2024 train: 7-day history before the first ``timestamp_win``, then one row per anchor
+  (``china_local_time`` = ``timestamp_win`` = last ``observe_power``).
+- 2025 test: anchors only (late 2024 lookback already covered by 2024 rows).
+
+``p_mean`` = mean of all 2024 powers in that table (prefix steps + every window-end);
+same scalar applied to 2025. ``p_cs`` / ``kt`` / ``kt_mask`` match ``aggregate_by_devdn_solarfeats``.
+"""
+
+from __future__ import annotations
+
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from pvlib import solarposition
-from pvlib.location import Location
 
-# Yalongjiang site (``config/datasets/conf_ylj.yaml``)
+_SPMF_DIR = Path(__file__).resolve().parent
+if str(_SPMF_DIR) not in sys.path:
+    sys.path.insert(0, str(_SPMF_DIR))
+
+from aggregate_by_devdn_solarfeats import compute_solar_arrays  # noqa: E402
+
+# Yalongjiang (``config/datasets/conf_ylj.yaml``)
 DEFAULT_LATITUDE = 29.9254
 DEFAULT_LONGITUDE = 100.5703
 DEFAULT_TZ = "Asia/Shanghai"
-DEFAULT_GRID_START = "2017-01-01 00:00:00"
-DEFAULT_GRID_END = "2024-12-31 23:45:00"
-DEFAULT_FREQ_MIN = 15
-DEFAULT_GRID_OUT = (
-    "/data/training_data/ylj_dataset_raw/solar_features_ylj_2017_2024_15min.csv"
+DEFAULT_RAW_DIR = "/data/training_data/ylj_dataset_raw"
+DEFAULT_TRAIN_PARQUET = "ds_v322_2024.parquet"
+DEFAULT_TEST_PARQUET = "ds_v322_1219_2025_1-12.parquet"
+DEFAULT_HIST_LEN = 672
+DEFAULT_NATIVE_INTERVAL_MIN = 15
+DEFAULT_P_MEAN_YEAR = 2024
+DEFAULT_OUT = (
+    "/data/training_data/ylj_dataset_raw/solar_features_ylj_2024_2025_15min.csv"
 )
 
-
-def utc_to_local_solar_time_pvlib(utc_times: pd.DatetimeIndex, longitude: float) -> pd.DatetimeIndex:
-    """Convert UTC to local (apparent) solar time using longitude and pvlib equation of time."""
-    if utc_times.tz is not None:
-        utc_naive = utc_times.tz_convert("UTC").tz_localize(None)
-    else:
-        utc_naive = utc_times
-    lmst_offset_hours = longitude / 15.0
-    dayofyear = utc_naive.dayofyear
-    eot_minutes = solarposition.equation_of_time_spencer71(dayofyear)
-    local_solar = utc_naive + pd.Timedelta(hours=lmst_offset_hours) + pd.to_timedelta(eot_minutes, unit="m")
-    return local_solar
-
-
-def build_china_local_time_grid(
-    start: str,
-    end: str,
-    *,
-    freq_min: int = 15,
-    tz: str = DEFAULT_TZ,
-) -> tuple[pd.DatetimeIndex, pd.DatetimeIndex]:
-    """15-minute grid in China local time; returns (local_aware, utc_aware)."""
-    if freq_min < 1:
-        raise ValueError("freq_min must be >= 1")
-    local = pd.date_range(
-        start,
-        end,
-        freq=f"{int(freq_min)}min",
-        tz=tz,
-        inclusive="both",
-    )
-    return local, local.tz_convert("UTC")
+OUTPUT_COLS = [
+    "china_local_time",
+    "solar_zenith",
+    "solar_azimuth",
+    "local_solar_time",
+    "day_of_year",
+    "hour_of_day",
+    "p_cs",
+    "kt",
+    "kt_mask",
+    "p_mean",
+]
 
 
-def compute_solar_features(
-    forecast_timestamps_utc, latitude: float, longitude: float
-) -> list[dict]:
-    """
-    From UTC forecast times and site lat/lon, compute per timestep:
-    - local_solar_time: apparent solar time at the site (naive datetime)
-    - azimuth: sun azimuth (degrees)
-    - zenith: sun zenith angle (degrees)
-    - day_of_year: 1-366
-    - hour_of_day: hour in local solar time (0-24, decimal)
-    - ghi, dni, dhi: clear-sky irradiance (Ineichen)
-    Returns a list of dicts, one per timestep.
-    """
-    ts = pd.to_datetime(forecast_timestamps_utc)
-    if isinstance(ts, pd.Series):
-        times_utc = pd.DatetimeIndex(ts)
-    elif isinstance(ts, pd.DatetimeIndex):
-        times_utc = ts
-    else:
-        times_utc = pd.DatetimeIndex(ts)
-    if times_utc.tz is None:
-        times_utc = times_utc.tz_localize("UTC", ambiguous="infer")
-    else:
-        times_utc = times_utc.tz_convert("UTC")
+def _to_naive_china_local(times: pd.Series, tz: str) -> pd.Series:
+    t = pd.to_datetime(times, errors="coerce")
+    if t.isna().any():
+        raise ValueError("invalid timestamp(s)")
+    if t.dt.tz is None:
+        return t.dt.tz_localize(tz, ambiguous=True).dt.tz_localize(None)
+    return t.dt.tz_convert(tz).dt.tz_localize(None)
 
-    local_solar = utc_to_local_solar_time_pvlib(times_utc, longitude)
 
-    solpos = solarposition.get_solarposition(times_utc, latitude, longitude)
-    azimuth = solpos["azimuth"].values
-    zenith = solpos["apparent_zenith"].values
-    clearsky = Location(latitude, longitude, tz="UTC").get_clearsky(times_utc, model="ineichen")
-    ghi = clearsky["ghi"].values
-    dni = clearsky["dni"].values
-    dhi = clearsky["dhi"].values
+def _observe_row(cell, hist_len: int) -> np.ndarray:
+    arr = np.asarray(cell, dtype=np.float64).reshape(-1)
+    if arr.shape != (hist_len,):
+        raise ValueError(
+            f"observe_power length {arr.shape[0]} != expected hist_len={hist_len}"
+        )
+    return arr
 
-    day_of_year = local_solar.dayofyear.values
-    hour_of_day = (
-        local_solar.hour.values
-        + local_solar.minute.values / 60.0
-        + local_solar.second.values / 3600.0
+
+def window_end_power(series: pd.Series, hist_len: int) -> np.ndarray:
+    return np.array([_observe_row(c, hist_len)[-1] for c in series], dtype=np.float64)
+
+
+def hist_times_before_win(
+    win_local: pd.Timestamp, *, hist_len: int, native_min: int
+) -> pd.DatetimeIndex:
+    """``hist_len - 1`` China-local times strictly before ``win_local`` (15-min grid)."""
+    offsets_min = (hist_len - 1 - np.arange(hist_len - 1, dtype=np.int64)) * int(native_min)
+    base = pd.Timestamp(win_local)
+    return pd.DatetimeIndex(
+        [base - pd.Timedelta(minutes=int(m)) for m in offsets_min]
     )
 
-    return [
-        {
-            "utc_time": times_utc[i].to_pydatetime(),
-            "local_solar_time": local_solar[i].floor("us").to_pydatetime(),
-            "ghi": float(ghi[i]),
-            "dni": float(dni[i]),
-            "dhi": float(dhi[i]),
-            "azimuth": float(azimuth[i]),
-            "zenith": float(zenith[i]),
-            "day_of_year": int(day_of_year[i]),
-            "hour_of_day": float(hour_of_day[i]),
-        }
-        for i in range(len(times_utc))
-    ]
 
-
-def solar_features_to_dataframe(
-    feats: list[dict],
-    china_local: pd.DatetimeIndex,
+def earliest_window_prefix(
+    path: Path,
     *,
-    tz: str = DEFAULT_TZ,
+    hist_len: int,
+    native_min: int,
+    tz: str,
 ) -> pd.DataFrame:
-    """Attach China wall-clock column (naive local) for alignment with YLJ Parquet."""
-    if len(feats) != len(china_local):
-        raise ValueError(f"feats len {len(feats)} != china_local len {len(china_local)}")
-    out = pd.DataFrame(feats)
-    local_naive = china_local
-    if local_naive.tz is not None:
-        local_naive = local_naive.tz_convert(tz).tz_localize(None)
-    out.insert(0, "china_local_time", local_naive)
-    return out
-
-
-def compute_importance_factor(
-    ghi: np.ndarray,
-    active_power: np.ndarray,
-    inverter_state: np.ndarray,
-    *,
-    tau: float = 0.03,
-    inverter_ok: int = 512,
-) -> np.ndarray:
     """
-    Per-row weight exp(-|Δ(ghi/1000) - Δ(AP/550)| / τ); first timestep Δ=0 on both.
-    Rows with inverter_state != inverter_ok or non-finite ghi/active_power → 0.
+    Seven-day lookback on the row with earliest ``timestamp_win`` (steps before that anchor).
     """
-    g = np.asarray(ghi, dtype=np.float64) / 1000.0
-    ap = np.asarray(active_power, dtype=np.float64) / 550.0
-    state = np.asarray(inverter_state)
-    ok = (state == inverter_ok) & np.isfinite(g) & np.isfinite(ap)
-
-    n = g.shape[0]
-    d_g = np.zeros(n, dtype=np.float64)
-    d_ap = np.zeros(n, dtype=np.float64)
-    if n > 1:
-        d_g[1:] = np.diff(g)
-        d_ap[1:] = np.diff(ap)
-
-    w = np.exp(-np.abs(d_g - d_ap) / float(tau))
-    out = np.zeros(n, dtype=np.float64)
-    out[ok] = w[ok]
-    return out
-
-
-def run_grid_mode(args: argparse.Namespace) -> None:
-    local, utc = build_china_local_time_grid(
-        args.start,
-        args.end,
-        freq_min=int(args.freq_min),
-        tz=str(args.tz),
+    df = pd.read_parquet(
+        path, columns=["timestamp_win", "observe_power"], engine="pyarrow"
     )
-    n = len(local)
+    m = df["observe_power"].notna()
+    df = df.loc[m].reset_index(drop=True)
+    if len(df) == 0:
+        raise ValueError(f"{path.name}: no valid observe_power rows")
+
+    wins = _to_naive_china_local(df["timestamp_win"], tz)
+    idx = int(wins.idxmin())
+    win_local = pd.Timestamp(wins.iloc[idx])
+    op = _observe_row(df["observe_power"].iloc[idx], hist_len)
+
+    times = hist_times_before_win(win_local, hist_len=hist_len, native_min=native_min)
+    return pd.DataFrame(
+        {
+            "china_local_time": times,
+            "power_end": op[: hist_len - 1],
+        }
+    )
+
+
+def anchor_frame(path: Path, *, hist_len: int, tz: str) -> pd.DataFrame:
+    """One row per sample: ``china_local_time`` = ``timestamp_win``."""
+    df = pd.read_parquet(
+        path, columns=["timestamp_win", "observe_power"], engine="pyarrow"
+    )
+    m = df["observe_power"].notna()
+    df = df.loc[m].reset_index(drop=True)
+    if len(df) == 0:
+        raise ValueError(f"{path.name}: no valid observe_power rows")
+
+    return pd.DataFrame(
+        {
+            "china_local_time": _to_naive_china_local(df["timestamp_win"], tz),
+            "power_end": window_end_power(df["observe_power"], hist_len),
+        }
+    )
+
+
+def compute_p_mean_2024(prefix: pd.DataFrame, anchors_2024: pd.DataFrame) -> float:
+    """Mean of prefix + all 2024 window-end powers (includes 7 days before first anchor)."""
+    parts = [prefix["power_end"].to_numpy(), anchors_2024["power_end"].to_numpy()]
+    all_pw = np.concatenate(parts)
+    p_mean = float(np.mean(all_pw))
     print(
-        f"[grid] {n} steps, {args.freq_min} min, tz={args.tz}, "
-        f"lat={args.latitude} lon={args.longitude}"
+        f"[p_mean] 2024 prefix n={len(prefix)} anchors n={len(anchors_2024)} "
+        f"total n={len(all_pw)} p_mean={p_mean:.6f}"
     )
-    print(f"[grid] china local: {local[0]} .. {local[-1]}")
+    return p_mean
 
-    feats = compute_solar_features(utc, latitude=float(args.latitude), longitude=float(args.longitude))
-    out_df = solar_features_to_dataframe(feats, local, tz=str(args.tz))
 
-    out_path = Path(args.out or DEFAULT_GRID_OUT).expanduser().resolve()
+def dedupe_power_rows(rows: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """One row per ``china_local_time``; keep first (train prefix before train anchors)."""
+    rows = rows.sort_values("china_local_time").reset_index(drop=True)
+    grouped = rows.groupby("china_local_time", sort=True)
+    n_conflict = int(
+        grouped["power_end"].apply(lambda s: s.nunique(dropna=False) > 1).sum()
+    )
+    if n_conflict > 0:
+        print(f"[warn] {n_conflict} time(s) with conflicting power; using first")
+
+    out = grouped.agg(power_end=("power_end", "first")).reset_index()
+    return out, n_conflict
+
+
+def attach_solar_and_kt(
+    df: pd.DataFrame,
+    *,
+    latitude: float,
+    longitude: float,
+    tz: str,
+    p_mean: float,
+) -> pd.DataFrame:
+    local = pd.to_datetime(df["china_local_time"])
+    if local.dt.tz is None:
+        local_tz = local.dt.tz_localize(tz, ambiguous=True)
+    else:
+        local_tz = local.dt.tz_convert(tz)
+    utc = pd.DatetimeIndex(local_tz.dt.tz_convert("UTC"))
+
+    import aggregate_by_devdn_solarfeats as agg_mod
+
+    agg_mod._solar_cache.clear()
+    arrays = compute_solar_arrays(utc, latitude, longitude)
+
+    p_cs = np.asarray(arrays["p_cs"], dtype=np.float64)
+    kt_mask = (p_cs > 0.1).astype(np.float64)
+    power = df["power_end"].to_numpy(dtype=np.float64)
+    kt = power / (p_cs * float(p_mean) + 1e-6) * kt_mask
+
+    out = pd.DataFrame(
+        {
+            "china_local_time": local_tz.dt.tz_localize(None),
+            "solar_zenith": np.round(arrays["zenith"].astype(np.float64), 4),
+            "solar_azimuth": np.round(arrays["azimuth"].astype(np.float64), 4),
+            "local_solar_time": arrays["lst_strs"],
+            "day_of_year": arrays["day_of_year"].astype(int),
+            "hour_of_day": np.round(arrays["hour_of_day"].astype(np.float64), 4),
+            "p_cs": np.round(p_cs, 6),
+            "kt": np.round(kt, 6),
+            "kt_mask": kt_mask.astype(int),
+            "p_mean": float(p_mean),
+        }
+    )
+    return out[OUTPUT_COLS]
+
+
+def run_parquet_mode(args: argparse.Namespace) -> None:
+    raw_dir = Path(args.raw_dir).expanduser().resolve()
+    train_path = raw_dir / str(args.train_parquet)
+    test_path = raw_dir / str(args.test_parquet)
+    for p in (train_path, test_path):
+        if not p.is_file():
+            raise FileNotFoundError(f"Parquet not found: {p}")
+
+    hist_len = int(args.hist_len)
+    native_min = int(args.native_interval_min)
+    tz = str(args.tz)
+    lat = float(args.latitude)
+    lon = float(args.longitude)
+
+    prefix_2024 = earliest_window_prefix(
+        train_path, hist_len=hist_len, native_min=native_min, tz=tz
+    )
+    anchors_2024 = anchor_frame(train_path, hist_len=hist_len, tz=tz)
+    anchors_2025 = anchor_frame(test_path, hist_len=hist_len, tz=tz)
+
+    print(
+        f"[parquet] 2024 prefix={len(prefix_2024)} anchors={len(anchors_2024)}; "
+        f"2025 anchors={len(anchors_2025)}"
+    )
+    if len(prefix_2024):
+        print(
+            f"[parquet] prefix range: {prefix_2024['china_local_time'].min()} .. "
+            f"{prefix_2024['china_local_time'].max()}"
+        )
+        print(
+            f"[parquet] first anchor: {anchors_2024['china_local_time'].min()}"
+        )
+
+    p_mean = compute_p_mean_2024(prefix_2024, anchors_2024)
+
+    combined = pd.concat(
+        [prefix_2024, anchors_2024, anchors_2025],
+        ignore_index=True,
+    )
+    deduped, n_conflict = dedupe_power_rows(combined)
+    print(f"[parquet] unique rows: {len(deduped)}")
+
+    years = pd.to_datetime(deduped["china_local_time"]).dt.year.value_counts().sort_index()
+    print(f"[parquet] calendar year counts: {years.to_dict()}")
+    if n_conflict:
+        print(f"[parquet] power conflicts: {n_conflict}")
+
+    out_df = attach_solar_and_kt(
+        deduped, latitude=lat, longitude=lon, tz=tz, p_mean=p_mean
+    )
+
+    out_path = Path(args.out or DEFAULT_OUT).expanduser().resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(out_path, index=False)
     print(f"Saved {len(out_df)} rows to {out_path}")
-
-
-def run_csv_mode(args: argparse.Namespace) -> None:
-    in_path = Path(args.csv).expanduser().resolve()
-    if not in_path.is_file():
-        raise FileNotFoundError(f"input csv not found: {in_path}")
-
-    df = pd.read_csv(in_path)
-    if "collectTime" not in df.columns:
-        raise KeyError(f"{in_path}: missing required column 'collectTime'")
-
-    ts = pd.to_datetime(df["collectTime"], errors="coerce")
-    if ts.isna().any():
-        bad = int(ts.isna().sum())
-        raise ValueError(f"{in_path}: collectTime contains {bad} invalid timestamp(s)")
-
-    feats = compute_solar_features(ts, latitude=float(args.latitude), longitude=float(args.longitude))
-    out_df = pd.DataFrame(feats)
-    for col in ("inverter_state", "active_power"):
-        if col not in df.columns:
-            raise KeyError(f"{in_path}: missing required column {col!r}")
-    out_df["inverter_state"] = df["inverter_state"].to_numpy()
-    out_df["active_power"] = df["active_power"].to_numpy()
-    out_df["importance_factor"] = compute_importance_factor(
-        out_df["ghi"].to_numpy(),
-        out_df["active_power"].to_numpy(),
-        out_df["inverter_state"].to_numpy(),
-        tau=float(args.importance_tau),
-    )
-
-    out_path = (
-        Path(args.out).expanduser().resolve()
-        if args.out is not None
-        else in_path.with_name(f"{in_path.stem}_solar_features.csv")
-    )
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_df.to_csv(out_path, index=False)
-    print(f"Saved {len(out_df)} rows to {out_path}")
+    print(f"Columns: {list(out_df.columns)}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Compute solar features for a site. Default: 15-min China-local grid "
-            "(YLJ 2017–2024). Use --csv for PV CSV + importance_factor."
+            "YLJ solar+kt CSV: 2024 includes 7d before first timestamp_win + anchors; "
+            "2025 anchors only; p_mean from all 2024 powers."
         )
     )
-    parser.add_argument(
-        "--csv",
-        type=str,
-        default=None,
-        help="If set, read collectTime from this CSV (UTC) and add importance_factor.",
-    )
+    parser.add_argument("--raw-dir", type=str, default=DEFAULT_RAW_DIR)
+    parser.add_argument("--train-parquet", type=str, default=DEFAULT_TRAIN_PARQUET)
+    parser.add_argument("--test-parquet", type=str, default=DEFAULT_TEST_PARQUET)
+    parser.add_argument("--out", type=str, default=None, help=f"Default: {DEFAULT_OUT}")
     parser.add_argument("--latitude", type=float, default=DEFAULT_LATITUDE)
     parser.add_argument("--longitude", type=float, default=DEFAULT_LONGITUDE)
-    parser.add_argument(
-        "--out",
-        type=str,
-        default=None,
-        help=f"Output CSV (grid default: {DEFAULT_GRID_OUT}).",
-    )
-    parser.add_argument(
-        "--start",
-        type=str,
-        default=DEFAULT_GRID_START,
-        help=f"Grid mode: China-local start (default {DEFAULT_GRID_START}).",
-    )
-    parser.add_argument(
-        "--end",
-        type=str,
-        default=DEFAULT_GRID_END,
-        help=f"Grid mode: China-local end inclusive (default {DEFAULT_GRID_END}).",
-    )
-    parser.add_argument(
-        "--freq-min",
-        type=int,
-        default=DEFAULT_FREQ_MIN,
-        help="Grid mode: step size in minutes (default 15).",
-    )
-    parser.add_argument(
-        "--tz",
-        type=str,
-        default=DEFAULT_TZ,
-        help=f"Grid mode: civil timezone (default {DEFAULT_TZ}).",
-    )
-    parser.add_argument(
-        "--importance-tau",
-        type=float,
-        default=0.03,
-        help="CSV mode only: τ for importance_factor (default 0.03).",
-    )
+    parser.add_argument("--hist-len", type=int, default=DEFAULT_HIST_LEN)
+    parser.add_argument("--native-interval-min", type=int, default=DEFAULT_NATIVE_INTERVAL_MIN)
+    parser.add_argument("--tz", type=str, default=DEFAULT_TZ)
     args = parser.parse_args()
-
-    if args.csv:
-        run_csv_mode(args)
-    else:
-        run_grid_mode(args)
+    run_parquet_mode(args)
 
 
 if __name__ == "__main__":
