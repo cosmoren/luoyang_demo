@@ -5,12 +5,17 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+from modules.SkyCompressor import build_continuous_time_embed
+
 
 class SkyPatchSpatiotemporalEmbed(nn.Module):
     """
     Patchify ``[B, T, 3, H, W]`` frames and add:
     - learned spatial position embedding per patch
-    - temporal embedding from ``timefeats`` ``[B, T, 9]`` via MLP
+    - sinusoidal temporal embedding built from a single ``delta_t`` scalar per frame
+      (``timefeats`` ``[B, T, 1]``), via :func:`modules.SkyCompressor.build_continuous_time_embed`.
+
+    Mirrors :class:`modules.SatEncoder.VideoPatchSpatiotemporalEmbed` for symmetry.
     """
 
     def __init__(self, embed_dim: int = 192, patch_size: int = 16, image_size: int = 112):
@@ -30,17 +35,11 @@ class SkyPatchSpatiotemporalEmbed(nn.Module):
         self.spatial_pos_embed = nn.Parameter(torch.zeros(1, 1, self.num_patches, embed_dim))
         nn.init.trunc_normal_(self.spatial_pos_embed, std=0.02)
 
-        self.timefeats_mlp = nn.Sequential(
-            nn.Linear(9, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, embed_dim),
-        )
-
     def forward(self, x: torch.Tensor, timefeats: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
             x: ``[B, T, 3, H, W]`` where ``H=W=image_size``.
-            timefeats: ``[B, T, 9]`` time features aligned with frames.
+            timefeats: ``[B, T, 1]`` single ``delta_t`` scalar per frame.
         Returns:
             ``[B, T, P, D]`` where ``P=num_patches`` and ``D=embed_dim``.
         """
@@ -50,15 +49,17 @@ class SkyPatchSpatiotemporalEmbed(nn.Module):
         if channels != 3:
             raise ValueError(f"expected 3 input channels, got {channels}")
         if timefeats is None:
-            raise ValueError("timefeats is required with shape [B, T, 9]")
+            raise ValueError("timefeats is required with shape [B, T, 1]")
 
         x_bt = x.reshape(bsz * num_frames, channels, height, width)
         tokens = self.patch_embed(x_bt)  # [B*T, D, gh, gw]
         tokens = tokens.flatten(2).transpose(1, 2)  # [B*T, P, D]
         tokens = tokens.view(bsz, num_frames, self.num_patches, self.embed_dim)
         tokens = tokens + self.spatial_pos_embed
-
-        time_tokens = self.timefeats_mlp(timefeats.to(dtype=tokens.dtype)).unsqueeze(2)  # [B,T,1,D]
+        # timefeats: [B, T, 1] -> squeeze to [B, T] -> build_continuous_time_embed -> [B, T, D] -> unsqueeze -> [B, T, 1, D]
+        time_tokens = build_continuous_time_embed(
+            timefeats.squeeze(-1).to(dtype=torch.float32), self.embed_dim
+        ).to(dtype=tokens.dtype).unsqueeze(2)
         tokens = tokens + time_tokens
         return tokens
 

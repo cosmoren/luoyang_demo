@@ -673,6 +673,7 @@ class pv_forecasting_model_vit_imgs(nn.Module):
             B_sky, T_sky, C_sky, H_sky, W_sky = skimg_tensor.shape
             if C_sky != 3:
                 raise ValueError(f"skimg_tensor expected 3 channels, got {C_sky}")
+            skimg_timefeats = skimg_timefeats[:, :, [2, 3, 8]]
             if H_sky != 224 or W_sky != 224:
                 sky_hr = nn.functional.interpolate(
                     skimg_tensor.reshape(B_sky * T_sky, C_sky, H_sky, W_sky),
@@ -683,10 +684,27 @@ class pv_forecasting_model_vit_imgs(nn.Module):
                 sky_hr = skimg_tensor
 
             sky_patch_tokens = patchify_spatiotemporal_sky_images(
-                sky_hr, self.sky_patch_embed, timefeats=skimg_timefeats
+                sky_hr,
+                self.sky_patch_embed,
+                timefeats=skimg_timefeats[:, :, -1].unsqueeze(2),
             )
             sky_patch_tokens = self.sky_alt_attn(sky_patch_tokens)
-            sky_compressed = self.sky_two_stage_compressor(sky_patch_tokens) + self.sky_mod_embed
+            sky_start = skimg_timefeats[:, 0, -1]   # [B]
+            sky_end   = skimg_timefeats[:, -1, -1]  # [B]
+            sky_steps = torch.linspace(0, 1, 48, device=sky_patch_tokens.device)
+            sky_query_times = sky_start[:, None] + (sky_end - sky_start)[:, None] * sky_steps  # [B, 48]
+            sky_compressed = self.sky_two_stage_compressor(sky_patch_tokens, sky_query_times) + self.sky_mod_embed  # [B,P=48,D=64]
+
+            sky_timefeats_48 = F.interpolate(
+                    skimg_timefeats.transpose(1, 2),       # -> [B, F=3, T=30]
+                    size=48,
+                    mode="linear",
+                    align_corners=True,                  # 头尾对齐 -> 保留首末时刻原值
+                ).transpose(1, 2)
+
+            sky_timefeats_48_hd = self.time_mlp(sky_timefeats_48)
+            sky_compressed = sky_compressed + sky_timefeats_48_hd
+
             sky_mask = torch.ones(B, 48, device=pv.device, dtype=pv.dtype)
 
         hist_mem_compressed = torch.cat([KV_hist_mem_compressed, sat_compressed, sky_compressed], dim=1)

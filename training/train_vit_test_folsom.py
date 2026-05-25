@@ -110,8 +110,12 @@ def _batch_to_device(batch: dict, device: torch.device) -> dict:
         "pv_mask": batch["pv_mask"].to(device),
         "pv_timefeats": batch["pv_timefeats"].to(device),
         "forecast_timefeats": batch["forecast_timefeats"].to(device),
+        "kt": batch["kt"].to(device),
+        "kt_mask": batch["kt_mask"].to(device),
+        "p_mean": batch["p_mean"].to(device),
         "target_pv": batch["target_pv"].to(device),
         "target_mask": batch["target_mask"].to(device),
+        "target_p_cs": batch["target_p_cs"].to(device),
     }
     for key in ("sat_tensor", "sat_timefeats", "skimg_tensor", "skimg_timefeats", "nwp_tensor"):
         v = batch.get(key)
@@ -156,10 +160,13 @@ def _prepare_sky_for_vit(d: dict, *, zero_sky: bool) -> dict:
 
 
 def forward_vit(model: nn.Module, d: dict) -> torch.Tensor:
+    """Mirrors ``training/train_vit_test.py::forward_vit``: the ViT is fed normalized
+    ``kt`` (clear-sky index / 20.0) and the daytime ``kt_mask``; the caller scales the
+    output back to ``kt`` and multiplies by ``target_p_cs * p_mean`` to recover ``pv``."""
     return model(
         d["device_id"],
-        d["pv"],
-        pv_mask=d["pv_mask"],
+        d["kt"] / 20.0,
+        pv_mask=d["kt_mask"],
         pv_timefeats=d["pv_timefeats"],
         forecast_timefeats=d["forecast_timefeats"],
         sat_tensor=d["sat_tensor"],
@@ -228,7 +235,8 @@ def train_one_epoch(
         _prepare_sky_for_vit(d, zero_sky=zero_sky)
         B = d["device_id"].size(0)
         optimizer.zero_grad()
-        pv_pred = forward_vit(model, d)
+        kt_pred = forward_vit(model, d) * 20.0
+        pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
         t_out = int(pv_pred.shape[1])
         assert d["target_pv"].shape[1] == t_out, (pv_pred.shape, d["target_pv"].shape)
         h = min(_LOSS_METRIC_HORIZON, t_out)
@@ -277,7 +285,8 @@ def evaluate(
             d = _batch_to_device(batch, device)
             _prepare_nwp_for_vit(d, use_nwp=use_nwp)
             _prepare_sky_for_vit(d, zero_sky=zero_sky)
-            pv_pred = forward_vit(model, d)
+            kt_pred = forward_vit(model, d) * 20.0
+            pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
             t_out = int(pv_pred.shape[1])
             h = min(_LOSS_METRIC_HORIZON, t_out)
             m = d["target_mask"][:, :h]

@@ -51,6 +51,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import pvlib
 import torch
 import torch.nn.functional as F
 import yaml
@@ -119,6 +120,38 @@ _DEFAULT_FOLSOM_TRAIN_EPOCH_LEN = 50_000
 # threshold (W/m^2). Mirrors PVDataset's "any inverter_state == VALID_STATE" filter so we
 # avoid sampling all-night windows where target_pv is uniformly 0.
 _FOLSOM_TRAIN_GHI_DAYTIME_THRESHOLD = 10.0
+
+# GHI scaling factor used for both ``target_pv`` and ``p_cs`` so that
+# ``pv_pred = kt_pred * target_p_cs * p_mean`` lives in the same normalized space as
+# ``target_pv = ghi / _FOLSOM_GHI_SCALE`` (mirrors Luoyang's ``poa_global / 1000`` recipe
+# in ``SPMF_preprocessing/luoyang/aggregate_by_devdn_solarfeats.py``).
+_FOLSOM_GHI_SCALE = 1100.0
+# Daytime guard: matches Luoyang's preprocessing ``kt_mask = (p_cs > 0.1)`` rule. Anchors
+# where ``p_cs <= 0.1`` (nighttime / very low sun) get ``kt = 0`` via the mask product.
+_FOLSOM_KT_DAYTIME_THRESHOLD = 0.1
+_FOLSOM_KT_EPS = 1e-6
+
+
+def _compute_folsom_p_cs(
+    lat: float,
+    lon: float,
+    utc_index: pd.DatetimeIndex,
+) -> np.ndarray:
+    """
+    Normalized clear-sky GHI (``clearsky_ghi / _FOLSOM_GHI_SCALE``, clipped to ``[0, 1.2]``).
+
+    Mirrors :func:`SPMF_preprocessing/luoyang/aggregate_by_devdn_solarfeats.compute_clearsky_power`
+    but uses ``clearsky["ghi"]`` directly (Folsom's active signal is GHI, not PV power), so no
+    POA transposition / tilt assumption is needed.
+    """
+    idx = utc_index
+    if getattr(idx, "tz", None) is None:
+        idx = idx.tz_localize("UTC")
+    loc = pvlib.location.Location(float(lat), float(lon))
+    cs = loc.get_clearsky(idx, model="ineichen")
+    ghi_cs = np.asarray(cs["ghi"].values, dtype=np.float64)
+    p_cs = np.clip(ghi_cs / _FOLSOM_GHI_SCALE, 0.0, 1.2)
+    return p_cs.astype(np.float32, copy=False)
 
 
 def _folsom_parse_zarr_utc_naive(raw: Any) -> pd.DatetimeIndex:
@@ -653,6 +686,20 @@ class FolsomIrradianceDataset(Dataset):
         if self._n < 1:
             raise RuntimeError(f"{self._csv_path.name}: expected at least one data row")
 
+        # Precompute normalized clear-sky GHI per CSV row once (1.5M rows for Folsom is fast
+        # in pvlib). ``_build_tensors`` slices into this array for both the input window and
+        # the forecast window (both are integer CSV row offsets from the anchor), so no
+        # per-sample pvlib call is needed. Mirrors the Luoyang offline preprocessing that
+        # stores ``p_cs`` in the CSV (see ``SPMF_preprocessing/luoyang/...``).
+        _folsom_progress("computing per-row clear-sky GHI via pvlib (ineichen) ...")
+        _times_utc = pd.DatetimeIndex(
+            pd.to_datetime(self._df[self._time_col].to_numpy(), utc=True)
+        )
+        self._p_cs_full = _compute_folsom_p_cs(self.latitude, self.longitude, _times_utc)
+        _folsom_progress(
+            f"p_cs ready: {len(self._p_cs_full):,} rows, max={float(self._p_cs_full.max()):.3f}"
+        )
+
         # Anchor bookkeeping.
         n = self._n
         lx, ly = self._lx, self._ly
@@ -1093,6 +1140,20 @@ class FolsomIrradianceDataset(Dataset):
         ghi, dni, dhi = x_stack[0], x_stack[1], x_stack[2]
         tg, td, th = y_stack[0], y_stack[1], y_stack[2]
 
+        # Clear-sky / kt fields (Luoyang-parity: see ``dataloader/luoyang_zarr.py::_build_sample``
+        # and ``SPMF_preprocessing/luoyang/aggregate_by_devdn_solarfeats.py``). Folsom is a
+        # single GHI sensor, so ``p_mean = 1.0`` and ``p_cs = clearsky_ghi / _FOLSOM_GHI_SCALE``.
+        p_cs_x = self._p_cs_full[x_idx]
+        p_cs_y = self._p_cs_full[y_idx]
+        kt_mask_np = (p_cs_x > _FOLSOM_KT_DAYTIME_THRESHOLD).astype(np.float32)
+        ghi_norm = ghi / _FOLSOM_GHI_SCALE
+        kt_np = (ghi_norm / (p_cs_x + _FOLSOM_KT_EPS)) * kt_mask_np
+        kt = torch.from_numpy(kt_np.astype(np.float32)).unsqueeze(0)
+        kt_mask = torch.from_numpy(kt_mask_np).unsqueeze(0)
+        p_cs = torch.from_numpy(p_cs_x.astype(np.float32)).unsqueeze(0)
+        target_p_cs = torch.from_numpy(p_cs_y.astype(np.float32))
+        p_mean = torch.tensor(1.0, dtype=torch.float32)
+
         x_times = sub_x[self._time_col]
         if bool(x_times.isna().any()):
             raise ValueError(f"NaT in {self._time_col!r} for input window")
@@ -1143,13 +1204,17 @@ class FolsomIrradianceDataset(Dataset):
         dev_idx = torch.tensor(700, dtype=torch.long)
 
         # Match PVDataset: pv is [1, T_in] (sensor/dev dim leading), target_pv is [T_out].
-        pv_tensor = torch.from_numpy((ghi / 1100.0).astype(np.float32)).unsqueeze(0)
-        target_pv_tensor = torch.from_numpy((tg / 1100.0).astype(np.float32))
+        pv_tensor = torch.from_numpy((ghi / _FOLSOM_GHI_SCALE).astype(np.float32)).unsqueeze(0)
+        target_pv_tensor = torch.from_numpy((tg / _FOLSOM_GHI_SCALE).astype(np.float32))
         return {
             "dev_idx": dev_idx,
             "pv": pv_tensor,
             "pv_mask": input_mask,
             "pv_timefeats": irr_timefeats,
+            "kt": kt,
+            "kt_mask": kt_mask,
+            "p_cs": p_cs,
+            "p_mean": p_mean,
             "ghi": torch.from_numpy(ghi.astype(np.float32)),
             "dni": torch.from_numpy(dni.astype(np.float32)),
             "dhi": torch.from_numpy(dhi.astype(np.float32)),
@@ -1161,6 +1226,7 @@ class FolsomIrradianceDataset(Dataset):
             "target_dhi": torch.from_numpy(th.astype(np.float32)),
             "target_pv": target_pv_tensor,
             "target_mask": target_mask,
+            "target_p_cs": target_p_cs,
             "sat_tensor": None,
             "sat_timefeats": None,
             "skimg_tensor": skimg_tensor,
