@@ -1,0 +1,60 @@
+# Stanford SKIPP'd (Huang Engineering rooftop) — PV CSV + sky Zarr (no NWP, no satellite).
+# -----------------------------------------------------------------------------
+# Used by ``dataloader.skippd_pv`` and ``training/train_vit_test_skippd.py``.
+#
+# Run SKIPP'd PV training:
+#   python training/train_vit_test_skippd.py --dataset-config conf_skippd.yaml
+# -----------------------------------------------------------------------------
+
+site:
+  name: "Stanford SKIPP'd (Huang Engineering rooftop)"
+  latitude: 37.4275
+  longitude: -122.1697
+  # POA projection assumption (used by dataloader.skippd_pv for clear-sky p_cs).
+  # 0 deg / 180 (south-facing horizontal) approximates the rooftop fixed-mount layout.
+  tilt_deg: 0.0
+  surface_azimuth_deg: 180.0
+  # System rated capacity (kW). Close to observed max (29.59 kW). Used both as the
+  # PV normalization scale (``_SKIPPD_PV_KW_SCALE``) and the clear-sky scale factor
+  # ``p_mean`` in ``kt = pv / (p_cs * p_mean + 1e-6)``. Bump to 31 if you re-calibrate.
+  rated_capacity_kw: 30.0
+
+paths:
+  data_dir: "/work/skippd_dataset"
+  # Folder containing the single PV CSV (Date, Huang_E4102_kW).
+  pv_path: "pv"
+  sky_format: "zarr"
+  # Sky Zarr store (uint8 images [T, 3, 224, 224] on 1D ``time_utc`` axis).
+  sky_image_path: "sky_utc.zarr"
+  # No satellite for SKIPP'd; placeholder for API parity with Folsom/Luoyang.
+  sat_path: "sat"
+  # No NWP for SKIPP'd; trainer feeds a synthetic NWP tensor that normalizes to
+  # neutral values inside the ViT.
+  nwp_path: ""
+
+sampling:
+  # CSV row spacing — SKIPP'd PV CSV is 1-minute UTC.
+  csv_interval_min: 1
+  # Input window: 576 * 5 min = 2880 min = 48 h history.
+  pv_input_interval_min: 5
+  pv_input_len: 576
+  # Forecast window: 192 * 15 min = 2880 min = 48 h ahead.
+  pv_output_interval_min: 15
+  pv_output_len: 192
+  # Required by the dataset constructor signature; SkippdPvDataset uses a fixed
+  # 60/10/30 row split (same as Folsom) and ignores this value at runtime.
+  pv_train_time_fraction: 0.7
+  test_anchor_stride_min: 1500
+  val_anchor_stride_min: 7000
+  test_collect_time_match_tolerance_min: 0
+  # Sky stack: 30 frames * 1 min = last 30 min ending at the anchor.
+  skyimg_window_size: 30
+  skyimg_time_resolution_min: 1
+  skyimg_spatial_size: 224
+  # Sat keys required for API parity with FolsomIrradianceDataset / PVDataset.
+  # SKIPP'd has no satellite imagery; ``sat_tensor`` / ``sat_timefeats`` returned as None.
+  satimg_window_size: 24
+  satimg_time_resolution_min: 10
+  satimg_npy_shape_hwc: [100, 100, 3]
+
+dataset_profile: skippd
