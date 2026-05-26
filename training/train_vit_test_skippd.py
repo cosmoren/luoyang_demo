@@ -1,0 +1,792 @@
+"""
+Canonical **SKIPP'd** trainer for ``pv_forecasting_model_vit_imgs`` (long-lived entrypoint).
+
+Uses ``dataloader.skippd_pv.SkippdPvDataset`` (PV CSV + sky-Zarr; no NWP, no satellite)
+with the Luoyang-shaped ``collate_batched`` batches. If ``paths.sky_format`` is omitted
+in the dataset YAML, this script injects **zarr** (see ``_skippd_pv_dataset_config_path``).
+
+This is a near-1:1 port of ``training/train_vit_test_folsom.py`` on this branch. The
+substitutions versus Folsom are:
+
+* GHI scale ``1100`` (W/m²) → PV capacity ``30.0`` (kW). Used in masked-MAE / RMSE
+  conversion (normalized → kW) and the ACC denominator.
+* Folsom-only NWP-merge code paths are dropped (no ``--use-nwp`` flag, no
+  ``remap_nwp_tensor_for_pv_vit_imgs``, no ``_prepare_nwp_for_vit``). The SKIPP'd
+  dataloader emits a zero ``nwp_tensor`` of Folsom's missing-NWP shape
+  (``[T_out, len(_FOLSOM_NWP_FEATURE_COLS) + 1]``), so the model's
+  ``nwp_tensor[:, :, 0|2|-1]`` indexing receives zeros / a 1.0 invalid-mask channel.
+* Checkpoint dir ``checkpoints_folsom_pv`` → ``checkpoints_skippd_pv``;
+  TB dir ``runs/folsom_pv_*`` → ``runs/skippd_pv_*``;
+  best/final checkpoint stems ``folsom_pv_forecast_vit_*`` → ``skippd_pv_forecast_vit_*``.
+* Default ``--dataset-config`` ``conf_folsom.yaml`` → ``conf_skippd.yaml``.
+
+The kt-aware forward/loss/eval path is identical to Folsom:
+
+    kt_pred = model(...) * 20.0
+    pv_pred = kt_pred * target_p_cs * p_mean.unsqueeze(1)
+    loss    = HuberLoss(pv_pred[:, :H] * target_mask[:, :H], target_pv[:, :H] * target_mask[:, :H])
+
+with ``H = _LOSS_METRIC_HORIZON = 16`` (same constant as Folsom). The SKIPP'd
+dataloader puts both ``target_pv = pv_kW / 30`` and ``target_p_cs = clearsky_ghi / 1000``
+in normalized space; ``p_mean = 1.0`` (literal Folsom constant), which keeps the
+identity ``pv_pred ≈ target_pv`` algebraically clean. The reported MAE in kW is
+``mae_norm * 30.0`` (analog of Folsom's ``mae_norm * 1100.0`` W/m² conversion).
+
+Local smoke (1 logical GPU, tiny run):
+
+  python training/train_vit_test_skippd.py --epochs 1 --train_max_batches_per_epoch 3 \
+    --eval_max_batches 20 --num_workers 0 --batch_size 1
+
+  # Sky-ablation (dataloader still loads real Zarr but sky tensors are zeroed before forward):
+  python training/train_vit_test_skippd.py --zero-sky  # plus your usual epoch/batch flags
+
+Training hyperparameters: ``config/train/conf_train.yaml`` (``--config``). Dataset paths:
+``config/datasets/conf_skippd.yaml`` (``--dataset-config``).
+"""
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import contextlib
+import copy
+import os
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.optim.lr_scheduler as lr_scheduler
+import yaml
+from torch.optim.lr_scheduler import LRScheduler
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_CONFIG_DIR = _PROJECT_ROOT / "config"
+_TRAIN_CONFIG_DIR = _CONFIG_DIR / "train"
+_DATASETS_CONFIG_DIR = _CONFIG_DIR / "datasets"
+_DEFAULT_TRAIN_CONF_NAME = "conf_train.yaml"
+_DEFAULT_SKIPPD_DATASET_CONFIG = "conf_skippd.yaml"
+# When the dataset YAML omits ``paths.sky_format``, ``dataloader.skippd_pv`` would
+# error (only ``zarr`` is supported); this trainer injects ``zarr`` to match Folsom's
+# trainer-side convention.
+_DEFAULT_SKY_FORMAT_FOR_PV_TRAINER = "zarr"
+_SKIPPD_PV_TEMP_CFG_DIRS: list[Path] = []
+sys.path.insert(0, str(_PROJECT_ROOT))
+
+from dataloader.luoyang_zarr import collate_batched  # noqa: E402
+from dataloader.skippd_pv import SkippdPvDataset  # noqa: E402
+from models.models import pv_forecasting_model_vit_imgs  # noqa: E402
+
+# Match Folsom (and ``train_vit_test.py``): first 16 output steps (~4 h at 15 min;
+# SKIPP'd uses the same 15-min output cadence).
+_LOSS_METRIC_HORIZON = 16
+# PV capacity (kW). Analog of Folsom's ``ghi_scale = 1100.0`` (W/m²). Used to
+# convert normalized MAE/RMSE back to kW and as the ACC denominator.
+_SKIPPD_PV_CAPACITY_KW = 30.0
+
+
+def _gpu_id_for_checkpoint() -> int:
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if raw is None:
+        return torch.cuda.current_device()
+    s = raw.strip()
+    if not s:
+        return torch.cuda.current_device()
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    if not parts:
+        return torch.cuda.current_device()
+    first = parts[0]
+    if first.isdigit():
+        return int(first)
+    return torch.cuda.current_device()
+
+
+def _batch_to_device(batch: dict, device: torch.device) -> dict:
+    out = {
+        "device_id": batch["dev_idx"].to(device),
+        "pv": batch["pv"].to(device),
+        "pv_mask": batch["pv_mask"].to(device),
+        "pv_timefeats": batch["pv_timefeats"].to(device),
+        "forecast_timefeats": batch["forecast_timefeats"].to(device),
+        "kt": batch["kt"].to(device),
+        "kt_mask": batch["kt_mask"].to(device),
+        "p_mean": batch["p_mean"].to(device),
+        "target_pv": batch["target_pv"].to(device),
+        "target_mask": batch["target_mask"].to(device),
+        "target_p_cs": batch["target_p_cs"].to(device),
+    }
+    for key in ("sat_tensor", "sat_timefeats", "skimg_tensor", "skimg_timefeats", "nwp_tensor"):
+        v = batch.get(key)
+        out[key] = None if v is None else v.to(device)
+    return out
+
+
+def _prepare_sky_for_vit(d: dict, *, zero_sky: bool) -> dict:
+    """
+    Optionally zero sky tensors after ``_batch_to_device`` so the ViT uses the
+    empty-sky branch while the dataloader still loads real Zarr frames. Same
+    behaviour as Folsom's ``_prepare_sky_for_vit``.
+    """
+    if not zero_sky:
+        return d
+    for key in ("skimg_tensor", "skimg_timefeats"):
+        t = d.get(key)
+        if t is not None:
+            d[key] = torch.zeros_like(t)
+    return d
+
+
+def forward_vit(model: nn.Module, d: dict) -> torch.Tensor:
+    """Mirrors ``training/train_vit_test_folsom.py::forward_vit``: the ViT is fed
+    normalized ``kt`` (``kt / 20.0``) and the daytime ``kt_mask``; the caller scales
+    the output back to ``kt`` and multiplies by ``target_p_cs * p_mean`` to recover
+    ``pv``."""
+    return model(
+        d["device_id"],
+        d["kt"] / 20.0,
+        pv_mask=d["kt_mask"],
+        pv_timefeats=d["pv_timefeats"],
+        forecast_timefeats=d["forecast_timefeats"],
+        sat_tensor=d["sat_tensor"],
+        sat_timefeats=d["sat_timefeats"],
+        skimg_tensor=d["skimg_tensor"],
+        skimg_timefeats=d["skimg_timefeats"],
+        nwp_tensor=d["nwp_tensor"],
+    )
+
+
+class ModelEMA:
+    """Exponential Moving Average of model weights (same idea as ``train_vit_test_folsom.py``)."""
+
+    def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
+        self.decay = decay
+        self.shadow: dict[str, torch.Tensor] = {
+            k: v.detach().clone().float()
+            for k, v in model.state_dict().items()
+            if v.is_floating_point()
+        }
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        for k, v in model.state_dict().items():
+            if k in self.shadow:
+                self.shadow[k].mul_(self.decay).add_(v.detach().float(), alpha=1.0 - self.decay)
+
+    @contextlib.contextmanager
+    def apply(self, model: nn.Module):
+        msd = model.state_dict()
+        backup = {k: msd[k].clone() for k in self.shadow}
+        for k, v in self.shadow.items():
+            msd[k].copy_(v.to(msd[k].dtype))
+        try:
+            yield
+        finally:
+            msd = model.state_dict()
+            for k, v in backup.items():
+                msd[k].copy_(v)
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return self.shadow
+
+
+def train_one_epoch(
+    model: nn.Module,
+    device: torch.device,
+    loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    max_batches: int | None = None,
+    ema: ModelEMA | None = None,
+    *,
+    zero_sky: bool = False,
+) -> float:
+    model.train()
+    total_loss = 0.0
+    n = 0
+    print("number of batches: ", len(loader))
+    for batch_idx, batch in enumerate(loader):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
+        d = _batch_to_device(batch, device)
+        _prepare_sky_for_vit(d, zero_sky=zero_sky)
+        B = d["device_id"].size(0)
+        optimizer.zero_grad()
+        kt_pred = forward_vit(model, d) * 20.0
+        pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
+        t_out = int(pv_pred.shape[1])
+        assert d["target_pv"].shape[1] == t_out, (pv_pred.shape, d["target_pv"].shape)
+        h = min(_LOSS_METRIC_HORIZON, t_out)
+        m = d["target_mask"][:, :h]
+        loss = criterion(
+            (pv_pred[:, :h] * m),
+            (d["target_pv"][:, :h] * m),
+        )
+        loss.backward()
+        optimizer.step()
+        if ema is not None:
+            ema.update(model)
+        total_loss += loss.item()
+        n += B
+    print()
+    return total_loss / max(n, 1)
+
+
+def evaluate(
+    model: nn.Module,
+    device: torch.device,
+    loader: DataLoader,
+    criterion: nn.Module,
+    *,
+    max_batches: int | None = None,
+    zero_sky: bool = False,
+) -> tuple[float, float, float]:
+    """Returns mean Huber loss (first ``_LOSS_METRIC_HORIZON`` steps, masked like train),
+    RMSE and MAE in **normalized** PV space over the same slice (``target_mask``;
+    predictions at night cos-zenith < 0 are zeroed before residuals, matching the
+    Folsom / Luoyang trainers).
+
+    If ``max_batches`` is set, only the first N batches are used (smoke / faster dev
+    runs; metrics are not a full pass over the split).
+    """
+    model.eval()
+    total_loss = 0.0
+    n_batches = 0
+    sum_abs = 0.0
+    sum_sq = 0.0
+    n_elem = 0.0
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(loader):
+            if max_batches is not None and batch_idx >= int(max_batches):
+                break
+            d = _batch_to_device(batch, device)
+            _prepare_sky_for_vit(d, zero_sky=zero_sky)
+            kt_pred = forward_vit(model, d) * 20.0
+            pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
+            t_out = int(pv_pred.shape[1])
+            h = min(_LOSS_METRIC_HORIZON, t_out)
+            m = d["target_mask"][:, :h]
+            tgt = d["target_pv"][:, :h]
+            loss = criterion((pv_pred[:, :h] * m), (tgt * m))
+            total_loss += loss.item()
+            n_batches += 1
+            # Night mask on predictions (``forecast_timefeats[:, :, 3]`` == cos zenith), like Folsom.
+            pred_h = pv_pred[:, :h].clone()
+            night = d["forecast_timefeats"][:, :h, 3] < 0
+            pred_h[night] = 0.0
+            diff = pred_h - tgt
+            sum_abs += (diff.abs() * m).sum().item()
+            sum_sq += ((diff ** 2) * m).sum().item()
+            n_elem += m.sum().item()
+
+    mean_loss = total_loss / max(n_batches, 1)
+    mae_norm = sum_abs / max(n_elem, 1.0)
+    rmse_norm = (sum_sq / max(n_elem, 1.0)) ** 0.5
+    # Dataset stores PV / 30 kW; convert error back to kW for readability.
+    pv_scale = _SKIPPD_PV_CAPACITY_KW
+    mae_kw = mae_norm * pv_scale
+    rmse_kw = rmse_norm * pv_scale
+    capacity = pv_scale
+    print(
+        f"First-{_LOSS_METRIC_HORIZON}-step metrics (masked PV; pred zeroed at night): "
+        f"MAE(norm)={mae_norm:.6f}  RMSE(norm)={rmse_norm:.6f}  "
+        f"MAE≈{mae_kw:.2f} kW  RMSE≈{rmse_kw:.2f} kW"
+    )
+    print(
+        f"RMSE/MAE on first {_LOSS_METRIC_HORIZON} forecast steps (~4 h at 15 min). "
+        f"Capacity: {capacity:.0f} (kW PV rated)"
+    )
+    print(
+        f"MAE: {mae_kw:.6f}, RMSE: {rmse_kw:.6f}, "
+        f"ACC(MAE): {1.0 - mae_kw / capacity:.6f}, ACC(RMSE): {1.0 - rmse_kw / capacity:.6f}"
+    )
+    return mean_loss, rmse_norm, mae_norm
+
+
+def _build_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    epochs: int,
+    warmup_epochs: int,
+    lr_min: float,
+) -> LRScheduler:
+    warmup_epochs = max(0, int(warmup_epochs))
+    epochs = max(1, int(epochs))
+    if warmup_epochs == 0:
+        return lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr_min)
+    if warmup_epochs >= epochs:
+        return lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-8, end_factor=1.0, total_iters=epochs
+        )
+    return lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[
+            lr_scheduler.LinearLR(
+                optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_epochs
+            ),
+            lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=epochs - warmup_epochs, eta_min=lr_min
+            ),
+        ],
+        milestones=[warmup_epochs],
+    )
+
+
+def _resolve_named_config(directory: Path, name: str, label: str) -> Path:
+    cfg = Path(name)
+    if cfg.name != name:
+        raise ValueError(
+            f"--{label} only accepts a bare filename under {directory.relative_to(_PROJECT_ROOT)}/, "
+            f"e.g. --{label} {cfg.name}"
+        )
+    cfg_path = directory / cfg.name
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"{label} file not found: {cfg_path}")
+    return cfg_path
+
+
+def _load_yaml(path: Path) -> dict:
+    with open(path) as f:
+        data = yaml.safe_load(f)
+    return data or {}
+
+
+def _cleanup_skippd_pv_temp_cfg_dirs() -> None:
+    for d in _SKIPPD_PV_TEMP_CFG_DIRS:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+atexit.register(_cleanup_skippd_pv_temp_cfg_dirs)
+
+
+def _skippd_pv_dataset_config_path(base: Path) -> Path:
+    """
+    YAML path for ``SkippdPvDataset``: ``base`` as-is, or a temp copy with
+    ``paths.sky_format`` set to ``_DEFAULT_SKY_FORMAT_FOR_PV_TRAINER`` when missing/blank.
+    """
+    cfg = _load_yaml(base)
+    raw = (cfg.get("paths") or {}).get("sky_format")
+    if raw is not None and str(raw).strip() != "":
+        return base
+    cfg2 = copy.deepcopy(cfg)
+    cfg2.setdefault("paths", {})["sky_format"] = _DEFAULT_SKY_FORMAT_FOR_PV_TRAINER
+    tmp = Path(tempfile.mkdtemp(prefix="skippd_pv_ds_cfg_"))
+    _SKIPPD_PV_TEMP_CFG_DIRS.append(tmp)
+    out = tmp / "dataset.yaml"
+    with open(out, "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg2, f, sort_keys=False, allow_unicode=True)
+    return out.resolve()
+
+
+def _resolve_data_dir(paths_cfg: dict, cfg_path: Path) -> Path:
+    raw = paths_cfg.get("data_dir")
+    if raw is None or str(raw).strip() == "":
+        raise KeyError(f"dataset config paths.data_dir is required (in {cfg_path})")
+    p = Path(str(raw))
+    return p.resolve() if p.is_absolute() else (_PROJECT_ROOT / p).resolve()
+
+
+def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Train pv_forecasting_model_vit_imgs on SKIPP'd (single rooftop PV + sky Zarr)"
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=config_default,
+        help=f"Training config filename under config/train/ (default: {config_default!r}).",
+    )
+    parser.add_argument(
+        "--dataset-config",
+        type=str,
+        default=_DEFAULT_SKIPPD_DATASET_CONFIG,
+        help=f"Dataset YAML filename under config/datasets/ (default: {_DEFAULT_SKIPPD_DATASET_CONFIG!r}).",
+    )
+    parser.add_argument("--epochs", type=int, default=int(h["epochs"]))
+    parser.add_argument("--lr", type=float, default=float(h["lr"]))
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=0.01,
+        help="AdamW weight decay (default 0.01).",
+    )
+    parser.add_argument(
+        "--warmup-epochs",
+        type=int,
+        default=5,
+        help="Linear LR warmup in epoch units before cosine decay (0 = no warmup).",
+    )
+    parser.add_argument(
+        "--lr-min",
+        type=float,
+        default=1e-6,
+        help="Minimum learning rate for cosine tail (default 1e-6).",
+    )
+    parser.add_argument(
+        "--use-ema",
+        dest="use_ema",
+        action="store_true",
+        help="Enable Exponential Moving Average of model weights.",
+    )
+    parser.add_argument(
+        "--no-ema",
+        dest="use_ema",
+        action="store_false",
+        help="Disable EMA (default).",
+    )
+    parser.set_defaults(use_ema=False)
+    parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.99,
+        help="EMA decay (default 0.99). Lower decay catches up faster.",
+    )
+    parser.add_argument(
+        "--ema-warmup-epochs",
+        type=int,
+        default=5,
+        help="Skip EMA updates for the first N epochs (default 5).",
+    )
+    parser.add_argument("--batch_size", type=int, default=int(h["batch_size"]))
+    parser.add_argument("--checkpoint_dir", type=str, default=None)
+    parser.add_argument("--save_every", type=int, default=int(h["save_every"]))
+    parser.add_argument("--num_workers", type=int, default=int(h["num_workers"]))
+    mb = h.get("train_max_batches_per_epoch")
+    parser.add_argument(
+        "--train_max_batches_per_epoch",
+        type=int,
+        default=None if mb is None else int(mb),
+        help="Cap batches per epoch (default from train YAML; null = no cap).",
+    )
+    parser.add_argument(
+        "--eval_max_batches",
+        type=int,
+        default=None,
+        metavar="N",
+        help="If set, cap val/test ``evaluate()`` to the first N batches each call (default: full loader).",
+    )
+    parser.add_argument(
+        "--zero-sky",
+        action="store_true",
+        help=(
+            "After each batch is on device, replace sky image tensors (and sky time features) "
+            "with zeros so the ViT uses the empty-sky branch while the dataset still loads real "
+            "Zarr frames. Useful for PV-only / PV+(zero-NWP) ablations."
+        ),
+    )
+    return parser
+
+
+def _dataset_kwargs(dataset_config_name: str, split: str) -> dict:
+    base_cfg_path = _resolve_named_config(_DATASETS_CONFIG_DIR, dataset_config_name, "dataset-config")
+    cfg_path = _skippd_pv_dataset_config_path(base_cfg_path)
+    cfg = _load_yaml(cfg_path)
+    paths_cfg = cfg.get("paths", {}) or {}
+    sampling_cfg = cfg.get("sampling", {}) or {}
+    if not sampling_cfg:
+        raise KeyError(
+            f"dataset config {base_cfg_path} is missing a non-empty 'sampling:' section"
+        )
+
+    data_dir = _resolve_data_dir(paths_cfg, base_cfg_path)
+
+    def _req_path(key: str) -> str:
+        v = paths_cfg.get(key)
+        if v is None or str(v).strip() == "":
+            raise KeyError(f"dataset config paths.{key} is required (in {base_cfg_path})")
+        return str(v)
+
+    def _req_sampling(key: str):
+        if key not in sampling_cfg:
+            raise KeyError(f"dataset config sampling.{key} is required (in {base_cfg_path})")
+        return sampling_cfg[key]
+
+    pv_dir = (data_dir / _req_path("pv_path")).resolve()
+    skyimg_dir = (data_dir / _req_path("sky_image_path")).resolve()
+    satimg_dir = (data_dir / _req_path("sat_path")).resolve()
+
+    shwc = _req_sampling("satimg_npy_shape_hwc")
+    if not isinstance(shwc, (list, tuple)) or len(shwc) != 3:
+        raise ValueError(f"sampling.satimg_npy_shape_hwc must be [H, W, C] (in {base_cfg_path})")
+
+    return dict(
+        config_path=str(cfg_path),
+        pv_dir=str(pv_dir),
+        skyimg_dir=str(skyimg_dir),
+        satimg_dir=str(satimg_dir),
+        split=split,
+        csv_interval_min=int(_req_sampling("csv_interval_min")),
+        pv_input_interval_min=int(_req_sampling("pv_input_interval_min")),
+        pv_input_len=int(_req_sampling("pv_input_len")),
+        pv_output_interval_min=int(_req_sampling("pv_output_interval_min")),
+        pv_output_len=int(_req_sampling("pv_output_len")),
+        pv_train_time_fraction=float(_req_sampling("pv_train_time_fraction")),
+        test_anchor_stride_min=int(_req_sampling("test_anchor_stride_min")),
+        val_anchor_stride_min=int(_req_sampling("val_anchor_stride_min")),
+        test_collect_time_match_tolerance_min=int(_req_sampling("test_collect_time_match_tolerance_min")),
+        skyimg_window_size=int(_req_sampling("skyimg_window_size")),
+        skyimg_time_resolution_min=int(_req_sampling("skyimg_time_resolution_min")),
+        skyimg_spatial_size=int(_req_sampling("skyimg_spatial_size")),
+        satimg_window_size=int(_req_sampling("satimg_window_size")),
+        satimg_time_resolution_min=int(_req_sampling("satimg_time_resolution_min")),
+        satimg_npy_shape_hwc=tuple(int(x) for x in shwc),
+    )
+
+
+def main() -> None:
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", type=str, default=_DEFAULT_TRAIN_CONF_NAME)
+    pre_args, _ = pre_parser.parse_known_args()
+
+    train_conf_path = _resolve_named_config(_TRAIN_CONFIG_DIR, pre_args.config, "config")
+    train_conf = _load_yaml(train_conf_path)
+    h = train_conf.get("training") or {}
+    if not h:
+        raise KeyError(f"training config {train_conf_path} is missing a 'training:' section")
+
+    parser = _build_parser(h, config_default=pre_args.config)
+    args = parser.parse_args()
+
+    dataset_cfg = args.dataset_config
+    train_dataset = SkippdPvDataset(**_dataset_kwargs(dataset_cfg, "train"))
+    val_dataset = SkippdPvDataset(**_dataset_kwargs(dataset_cfg, "val"))
+    test_dataset = SkippdPvDataset(**_dataset_kwargs(dataset_cfg, "test"))
+
+    dev_dn_list = train_dataset.devDn_list
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = pv_forecasting_model_vit_imgs(dev_dn_list=dev_dn_list).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        betas=(0.9, 0.999),
+    )
+
+    scheduler = _build_lr_scheduler(
+        optimizer,
+        epochs=args.epochs,
+        warmup_epochs=args.warmup_epochs,
+        lr_min=args.lr_min,
+    )
+    criterion = nn.HuberLoss(delta=1.0)
+    ema: ModelEMA | None = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
+    print(
+        f"EMA: {'enabled' if args.use_ema else 'disabled'}"
+        + (f" (decay={args.ema_decay}, warmup={args.ema_warmup_epochs} epoch)" if args.use_ema else "")
+    )
+
+    nw = int(args.num_workers)
+    pin = torch.cuda.is_available()
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate_batched,
+        num_workers=nw,
+        pin_memory=pin,
+        persistent_workers=nw > 0,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_batched,
+        num_workers=nw,
+        pin_memory=pin,
+        persistent_workers=nw > 0,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_batched,
+        num_workers=nw,
+        pin_memory=pin,
+        persistent_workers=nw > 0,
+    )
+
+    checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else _PROJECT_ROOT / "checkpoints_skippd_pv"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if device.type == "cuda":
+        _gpu_id = _gpu_id_for_checkpoint()
+        _ckpt_suffix = f"gpu{_gpu_id}"
+    else:
+        _ckpt_suffix = "cpu"
+    best_ckpt_path = checkpoint_dir / f"skippd_pv_forecast_vit_best_{_ckpt_suffix}.pt"
+
+    tb_log_dir = _PROJECT_ROOT / "runs" / f"skippd_pv_{_ckpt_suffix}"
+    writer = SummaryWriter(log_dir=str(tb_log_dir))
+    print(f"TensorBoard log dir: {tb_log_dir}")
+
+    max_batches = args.train_max_batches_per_epoch
+    if max_batches is not None and max_batches < 0:
+        max_batches = None
+
+    eval_cap = args.eval_max_batches
+    zero_sky = bool(args.zero_sky)
+    print("NWP input: ZERO (SKIPP'd has no NWP; dataloader emits zeros + ones mask)")
+    print(f"Sky images: {'ZEROED (--zero-sky; PV-only ablation)' if zero_sky else 'REAL from dataset'}")
+    initial_test_loss, _, _ = evaluate(
+        model,
+        device,
+        test_loader,
+        criterion,
+        max_batches=eval_cap,
+        zero_sky=zero_sky,
+    )
+    print(f"Initial test loss: {initial_test_loss:.6f}")
+
+    rmse_min = 1e8
+    for epoch in range(1, args.epochs + 1):
+        cur_lr = optimizer.param_groups[0]["lr"]
+        ema_active = ema is not None and epoch > args.ema_warmup_epochs
+        if ema is not None and not ema_active:
+            for k, v in model.state_dict().items():
+                if k in ema.shadow:
+                    ema.shadow[k].copy_(v.detach().float())
+        avg_loss = train_one_epoch(
+            model,
+            device,
+            train_loader,
+            criterion,
+            optimizer,
+            max_batches,
+            ema=ema if ema_active else None,
+            zero_sky=zero_sky,
+        )
+        if ema_active:
+            assert ema is not None
+            with ema.apply(model):
+                val_loss, val_rmse, val_mae = evaluate(
+                    model,
+                    device,
+                    val_loader,
+                    criterion,
+                    max_batches=eval_cap,
+                    zero_sky=zero_sky,
+                )
+        else:
+            val_loss, val_rmse, val_mae = evaluate(
+                model,
+                device,
+                val_loader,
+                criterion,
+                max_batches=eval_cap,
+                zero_sky=zero_sky,
+            )
+        print(
+            f"Epoch {epoch}/{args.epochs}  lr={cur_lr:.2e}  "
+            f"train_loss={avg_loss:.6f}  val_loss={val_loss:.6f}  val_RMSE(norm)={val_rmse:.6f}"
+        )
+        writer.add_scalar("loss/train", avg_loss, epoch)
+        writer.add_scalar("loss/val", val_loss, epoch)
+        writer.add_scalar("metric/val_rmse", val_rmse, epoch)
+        writer.add_scalar("metric/val_mae", val_mae, epoch)
+        writer.add_scalar("lr", cur_lr, epoch)
+        scheduler.step()
+
+        if args.save_every and epoch % args.save_every == 0:
+            path = checkpoint_dir / f"skippd_pv_forecast_vit_epoch_{epoch}_{_ckpt_suffix}.pt"
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "loss": avg_loss,
+                    "dev_dn_list": dev_dn_list,
+                    "dataset_config": dataset_cfg,
+                    "ema": ema_active,
+                    "zero_sky": zero_sky,
+                },
+                path,
+            )
+            print(f"  saved {path}")
+
+        if val_rmse < rmse_min:
+            rmse_min = val_rmse
+            best_state = ema.state_dict() if ema_active else model.state_dict()
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": best_state,
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "loss": avg_loss,
+                    "dev_dn_list": dev_dn_list,
+                    "dataset_config": dataset_cfg,
+                    "ema": ema_active,
+                    "zero_sky": zero_sky,
+                },
+                best_ckpt_path,
+            )
+
+    final_path = checkpoint_dir / f"skippd_pv_forecast_vit_final_{_ckpt_suffix}.pt"
+    final_state = ema.state_dict() if ema is not None else model.state_dict()
+    torch.save(
+        {
+            "epoch": args.epochs,
+            "model_state_dict": final_state,
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "dev_dn_list": dev_dn_list,
+            "dataset_config": dataset_cfg,
+            "ema": ema is not None,
+            "zero_sky": zero_sky,
+        },
+        final_path,
+    )
+    print(f"Saved final checkpoint to {final_path}")
+
+    if best_ckpt_path.is_file():
+        ckpt = torch.load(best_ckpt_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        test_loss_best, test_rmse_best, test_mae_best = evaluate(
+            model,
+            device,
+            test_loader,
+            criterion,
+            max_batches=eval_cap,
+            zero_sky=zero_sky,
+        )
+        print(
+            f"Test set with best val-RMSE checkpoint ({best_ckpt_path.name}, epoch={ckpt.get('epoch', '?')}): "
+            f"loss={test_loss_best:.6f}, RMSE(norm)={test_rmse_best:.6f}, MAE(norm)={test_mae_best:.6f}"
+        )
+        writer.add_scalar("metric/test_rmse", test_rmse_best, args.epochs)
+        writer.add_scalar("metric/test_mae", test_mae_best, args.epochs)
+        writer.add_hparams(
+            {
+                "lr": args.lr,
+                "batch_size": args.batch_size,
+                "epochs": args.epochs,
+                "warmup_epochs": args.warmup_epochs,
+                "weight_decay": args.weight_decay,
+                "zero_sky": int(zero_sky),
+                "dataset_config": dataset_cfg,
+                "eval_max_batches": -1 if eval_cap is None else int(eval_cap),
+                "use_ema": int(args.use_ema),
+            },
+            {
+                "hparam/test_rmse": test_rmse_best,
+                "hparam/test_mae": test_mae_best,
+            },
+        )
+        metrics_log = checkpoint_dir / f"skippd_pv_forecast_metrics_{_ckpt_suffix}.txt"
+        with open(metrics_log, "a", encoding="utf-8") as mf:
+            mf.write(
+                f"{test_loss_best:.8f}\t{test_rmse_best:.8f}\t{test_mae_best:.8f}\n"
+            )
+        print(f"Appended best-test metrics to {metrics_log}")
+    else:
+        print(f"No {best_ckpt_path.name} on disk; skip test evaluation with best checkpoint.")
+
+    writer.close()
+
+
+if __name__ == "__main__":
+    main()

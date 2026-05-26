@@ -1,45 +1,61 @@
 """
 SKIPP'd PV dataset: one CSV with time + PV power (kW) plus sky Zarr (no NWP, no satellite).
 
-Modeled on :class:`dataloader.folsom.FolsomIrradianceDataset` but specialized for
-Stanford SKIPP'd:
+This module is a near-1:1 port of :class:`dataloader.folsom.FolsomIrradianceDataset`
+(the kt-aware Folsom code on this branch). The only substantive substitutions are:
 
-* PV CSV (``Date, Huang_E4102_kW``, 1-min UTC cadence) is loaded once and cached.
-* Site lat/lon comes from the dataset YAML ``site.{latitude,longitude}``; no info.yaml.
-* Clear-sky POA ``p_cs`` is precomputed once on the full CSV time index via pvlib
-  (``Location.get_clearsky`` -> ``get_total_irradiance``) and cached.
-* Each sample emits ``kt = pv / (p_cs * p_mean + 1e-6)`` plus ``kt_mask = (p_cs > 0.1)``;
-  nighttime negatives are masked out by ``kt_mask`` (daytime negatives are tiny and kept).
-* Train anchor filter: keep anchors whose Y window has at least one daytime step
-  (``kt_mask == 1``). Replaces Folsom's ``GHI > 10`` filter.
-* Sky stack uses the same Zarr-reading helpers as Folsom (imported / copy-pasted; see
-  ``# Sky-Zarr helpers reused from dataloader/folsom.py`` block below).
-* No NWP and no satellite: the dataset emits zeros for ``nwp_tensor`` and ``None`` for
-  ``sat_tensor`` / ``sat_timefeats``. The SKIPP'd trainer rewrites ``nwp_tensor`` just
-  before the forward pass so the model's slot-0/2 normalizations don't see -1.0 / -28.815.
+* CSV schema: hardcoded ``Date`` (time) + ``Huang_E4102_kW`` (PV power, kW) — SKIPP'd CSV
+  has only those two columns, so Folsom's GHI/DNI/DHI header detection is replaced with
+  fixed names.
+* Site lat/lon: read from the dataset YAML's ``site.{latitude, longitude}`` (with a
+  hardcoded Stanford rooftop fallback) — SKIPP'd has no ``<data_dir>/info.yaml``.
+* PV normalization: ``pv_norm = pv_kW / _SKIPPD_PV_SCALE`` with ``_SKIPPD_PV_SCALE = 30``
+  kW (analog of Folsom's ``_FOLSOM_GHI_SCALE = 1100`` W/m²).
+* Clear-sky scale: ``p_cs = clearsky_ghi / _SKIPPD_CS_GHI_SCALE`` with
+  ``_SKIPPD_CS_GHI_SCALE = 1000`` W/m². The PV scale (30 kW) and clear-sky GHI scale
+  (1000 W/m²) MUST decouple because PV is in kW and GHI is in W/m² — the user's
+  trainer-side "1100 → 30" substitution applies only to the PV normalization, not the
+  clear-sky scale (see the head-of-file note in
+  ``training/train_vit_test_skippd.py`` for the trainer-side math).
+* No NWP merged CSV: ``nwp_tensor`` is emitted as zeros + invalid-mask ones, with the
+  same ``[T_out, len(_FOLSOM_NWP_FEATURE_COLS) + 1]`` shape Folsom emits when its NWP
+  file is missing. The SKIPP'd trainer never reads it (the trainer drops the
+  ``--use-nwp`` / NWP-remap code paths Folsom uses).
+* No satellite: ``sat_tensor`` / ``sat_timefeats`` are ``None`` (same as Folsom).
+* Train anchor filter: Folsom keeps anchors whose Y window has any GHI > 10 W/m² row.
+  SKIPP'd has no GHI; we keep anchors whose Y window has any ``kt_mask == 1`` row
+  (i.e. ``p_cs > _SKIPPD_KT_DAYTIME_THRESHOLD``). Same daytime intent.
 
-POA projection assumption (tunable in ``site:`` block of the dataset YAML):
-    tilt_deg = 0.0 (horizontal)
-    surface_azimuth_deg = 180.0 (south-facing reference)
-These match a fixed-mount rooftop reference; SKIPP'd doesn't publish exact tilt/azimuth,
-so adjust ``site.tilt_deg`` / ``site.surface_azimuth_deg`` later if better info shows up.
+Everything else — Folsom-style 60/10/30 row split, random train anchors per epoch,
+strided val/test anchors, Ineichen clear-sky model, sky-Zarr nearest-frame stacking
+with the same ``_sky_anchor_max_lag`` / 90s tolerance, ``kt = pv_norm / (p_cs + eps) *
+kt_mask``, ``kt_mask = (p_cs > 0.1)``, ``p_mean = 1.0`` (literal mirror of Folsom),
+``dev_idx = 700``, time features via ``compute_solar_features`` / encoders — is a
+direct mirror.
 
-Batch contract — :meth:`SkippdPvDataset.__getitem__` returns the union of keys consumed
-by :func:`training.train_vit_test_skippd._batch_to_device` AND stacked by
-:func:`dataloader.luoyang_zarr.collate_batched`:
+Sky-Zarr helpers (``_folsom_*``) are imported from :mod:`dataloader.folsom` to avoid
+code duplication; the instance methods that wrap them (``_stack_sky_from_zarr``,
+``_nominal_sky_frame_times``, ``_resize_sky_chw``, ``_tensor_from_zarr_image_tile``,
+``_black_sky_tensor``, ``_sky_filename_ts``, ``_validate_sky_zarr_schema``) are copied
+verbatim from Folsom so a side-by-side diff is trivial.
+
+Returned sample-dict keys (one ``__getitem__`` -> one dict; the SKIPP'd trainer's
+``collate_batched`` call from :mod:`dataloader.luoyang_zarr` stacks the tensor keys
+with a leading batch dim B):
 
     dev_idx, pv, pv_mask, pv_timefeats, forecast_timefeats,
     kt, kt_mask, p_cs, p_mean, target_p_cs,
     target_pv, target_mask,
-    skimg_tensor, skimg_timefeats,
     sat_tensor=None, sat_timefeats=None,
-    nwp_tensor (zeros placeholder; trainer overwrites),
+    skimg_tensor, skimg_timefeats,
+    nwp_tensor (zeros placeholder),
     input_timestamps_utc, forecast_timestamps_utc, skimg_timestamps.
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect  # noqa: F401  # imported for parity with dataloader/folsom.py
 import os
 import sys
 import warnings
@@ -64,10 +80,10 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-# Sky-Zarr helpers reused from dataloader/folsom.py (module-level functions are imported
-# directly; instance methods like _stack_sky_from_zarr / _nominal_sky_frame_times can't
-# be cleanly imported, so they are copy-pasted below with explicit source references).
+# Sky-Zarr helpers reused from dataloader/folsom.py (module-level functions only;
+# instance methods are copied verbatim below — same source comment Folsom uses).
 from dataloader.folsom import (  # noqa: E402
+    _FOLSOM_NWP_FEATURE_COLS,
     _folsom_parse_zarr_utc_naive,
     _folsom_sky_zarr_count_in_time_range,
     _folsom_sky_zarr_len_time_utc,
@@ -80,59 +96,87 @@ from modules.solar_encoder import (  # noqa: E402
     solar_features_encoder,
 )
 
-# Module-level constants ----------------------------------------------------
+# One open handle per Zarr path (train/val/test share the same store path).
+# Mirrors ``_ZARR_SKY_DS_CACHE`` in :mod:`dataloader.folsom`.
+_ZARR_SKY_DS_CACHE: dict[str, Any] = {}
 
-# System rated capacity (kW). Used both as the PV normalization scale for the
-# model's input/target and as ``p_mean`` in ``kt = pv / (p_cs * p_mean + 1e-6)``.
-# Close to the observed max (29.59 kW); bump to 31 if you re-calibrate.
-_DEFAULT_SKIPPD_P_MEAN = 30.0
+# Default dataset YAML for SKIPP'd under ``config/datasets/`` (smoke CLI convenience).
+_DEFAULT_SKIPPD_DATASET_CONFIG = _PROJECT_ROOT / "config" / "datasets" / "conf_skippd.yaml"
 
-# Random anchor count per train epoch (matches Folsom).
 _DEFAULT_SKIPPD_TRAIN_EPOCH_LEN = 50_000
 
-# PV reporting scale (kW). Multiply normalized predictions / targets by this to get kW.
-# Analogous to Folsom's 1100 W/m^2 GHI scale.
-_SKIPPD_PV_KW_SCALE = 30.0
+# Train mode: keep anchors whose Y window has at least one ``kt_mask == 1`` row
+# (i.e. clearsky-daytime). Replaces Folsom's GHI > 10 W/m² filter.
+_SKIPPD_TRAIN_DAYTIME_KT_MASK_THRESHOLD = 0.5
 
-# Default YAML for the smoke CLI (the class itself takes config_path as required arg).
-_DEFAULT_SKIPPD_DATASET_CONFIG = (
-    _PROJECT_ROOT / "config" / "datasets" / "conf_skippd.yaml"
-)
+# PV normalization scale (analog of Folsom's _FOLSOM_GHI_SCALE = 1100 W/m²).
+# Used to put pv_kW into the same normalized space as target_pv / pv_pred.
+_SKIPPD_PV_SCALE = 30.0
+# Clear-sky GHI normalization scale (Folsom uses 1100; SKIPP'd uses 1000 — a more
+# standard peak-GHI reference, matching the user's hint "p_cs based on clear-sky
+# GHI / 1000"). Decoupled from _SKIPPD_PV_SCALE because PV (kW) and GHI (W/m²)
+# live in different unit spaces.
+_SKIPPD_CS_GHI_SCALE = 1000.0
+# Daytime guard (Luoyang/Folsom convention): kt_mask = (p_cs > 0.1).
+_SKIPPD_KT_DAYTIME_THRESHOLD = 0.1
+_SKIPPD_KT_EPS = 1e-6
 
-# Fallback site coordinates if the YAML's ``site:`` block omits them (warned).
-_DEFAULT_SKIPPD_LAT = 37.4275
-_DEFAULT_SKIPPD_LON = -122.1697
-
-# Hardcoded CSV columns for SKIPP'd (Date in ISO 8601 UTC, PV power in kW).
+# Hardcoded CSV columns for SKIPP'd (the user requested no auto-detection).
 _SKIPPD_TIME_COL = "Date"
 _SKIPPD_PV_COL = "Huang_E4102_kW"
 
-# Class-level caches (shared across train/val/test splits and DataLoader workers).
-_SKIPPD_CSV_CACHE: dict[str, tuple[pd.DataFrame, np.ndarray, np.ndarray]] = {}
-_SKIPPD_ZARR_DS_CACHE: dict[str, Any] = {}
-_SKIPPD_CLEARSKY_CACHE: dict[tuple[float, float, str, float, float], np.ndarray] = {}
+# Fallback site coordinates (Stanford SOLAR / Huang Engineering rooftop) used when
+# ``site.{latitude, longitude}`` is missing from the dataset YAML. Folsom reads
+# coords from ``<data_dir>/info.yaml``; SKIPP'd has no info.yaml, so the dataset
+# YAML's ``site:`` block is the source of truth.
+_DEFAULT_SKIPPD_LAT = 37.4275
+_DEFAULT_SKIPPD_LON = -122.1697
+
+
+def _compute_skippd_p_cs(
+    lat: float,
+    lon: float,
+    utc_index: pd.DatetimeIndex,
+) -> np.ndarray:
+    """
+    Normalized clear-sky GHI (``clearsky_ghi / _SKIPPD_CS_GHI_SCALE``, clipped to
+    ``[0, 1.2]``).
+
+    Direct mirror of :func:`dataloader.folsom._compute_folsom_p_cs`; only the
+    scaling constant differs (Folsom: 1100 W/m²; SKIPP'd: 1000 W/m²). NO POA
+    transposition (Folsom is GHI-only and so is the SKIPP'd port; tilt/azimuth
+    are explicitly NOT used here).
+    """
+    idx = utc_index
+    if getattr(idx, "tz", None) is None:
+        idx = idx.tz_localize("UTC")
+    loc = pvlib.location.Location(float(lat), float(lon))
+    cs = loc.get_clearsky(idx, model="ineichen")
+    ghi_cs = np.asarray(cs["ghi"].values, dtype=np.float64)
+    p_cs = np.clip(ghi_cs / _SKIPPD_CS_GHI_SCALE, 0.0, 1.2)
+    return p_cs.astype(np.float32, copy=False)
 
 
 def _skippd_progress(msg: str) -> None:
-    """Progress to stderr so training stdout stays clean; set SKIPPD_QUIET=1 to disable."""
+    """Progress to stderr so training stdout stays clean; SKIPPD_QUIET=1 disables.
+
+    Mirrors :func:`dataloader.folsom._folsom_progress`.
+    """
     if os.environ.get("SKIPPD_QUIET", "").strip().lower() in ("1", "true", "yes"):
         return
     print(f"[SKIPPd] {msg}", file=sys.stderr, flush=True)
 
 
-def _load_skippd_pv_csv(path: Path) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+def _load_skippd_pv_csv(path: Path) -> tuple[pd.DataFrame, str, str]:
     """
-    Load the SKIPP'd PV CSV into memory and cache it across dataset instances.
+    Load the single SKIPP'd PV CSV into memory.
 
-    Returns ``(df, time_ns_naive_utc, pv_kw)`` where ``df`` has the two original columns,
-    ``time_ns_naive_utc`` is ``int64`` ns-since-epoch (UTC, naive) for fast lookups, and
-    ``pv_kw`` is the float32 power column.
+    Returns ``(df, time_col, pv_col)`` where ``df`` has columns ``[time_col, pv_col]``
+    (hardcoded ``Date`` and ``Huang_E4102_kW``). Mirrors
+    :func:`dataloader.folsom._load_folsom_irradiance_csv` but without GHI/DNI/DHI
+    auto-detection.
     """
     p = path.resolve()
-    key = p.as_posix()
-    cached = _SKIPPD_CSV_CACHE.get(key)
-    if cached is not None:
-        return cached
     _skippd_progress(f"loading PV CSV {p.name} into memory ...")
     raw = pd.read_csv(p, engine="c")
     missing = [c for c in (_SKIPPD_TIME_COL, _SKIPPD_PV_COL) if c not in raw.columns]
@@ -142,133 +186,78 @@ def _load_skippd_pv_csv(path: Path) -> tuple[pd.DataFrame, np.ndarray, np.ndarra
             f"(expected {_SKIPPD_TIME_COL!r} and {_SKIPPD_PV_COL!r})"
         )
     df = raw[[_SKIPPD_TIME_COL, _SKIPPD_PV_COL]].copy()
-    # SKIPP'd PV times are ISO 8601 (e.g. "2017-01-01T08:00:00"); CSV is already in UTC.
     df[_SKIPPD_TIME_COL] = pd.to_datetime(
         df[_SKIPPD_TIME_COL], format="%Y-%m-%dT%H:%M:%S", errors="coerce"
     )
     if bool(df[_SKIPPD_TIME_COL].isna().any()):
-        raise ValueError(
-            f"{p.name}: NaT in {_SKIPPD_TIME_COL!r} after parsing (expected ISO 8601 UTC)"
-        )
-    df[_SKIPPD_PV_COL] = pd.to_numeric(df[_SKIPPD_PV_COL], errors="coerce").astype(
-        np.float32
-    )
-    time_ns = pd.DatetimeIndex(df[_SKIPPD_TIME_COL]).asi8.astype(np.int64, copy=False)
-    pv_kw = df[_SKIPPD_PV_COL].to_numpy(dtype=np.float32, copy=False)
+        raise ValueError(f"{p.name}: NaT in {_SKIPPD_TIME_COL!r} after parsing")
+    df[_SKIPPD_PV_COL] = pd.to_numeric(df[_SKIPPD_PV_COL], errors="coerce")
     _skippd_progress(
         f"PV CSV ready: {len(df):,} rows in RAM "
-        f"(time span {df[_SKIPPD_TIME_COL].iloc[0]} -> {df[_SKIPPD_TIME_COL].iloc[-1]})"
+        f"({_SKIPPD_TIME_COL!r}, {_SKIPPD_PV_COL!r})"
     )
-    cached = (df, time_ns, pv_kw)
-    _SKIPPD_CSV_CACHE[key] = cached
-    return cached
+    return df, _SKIPPD_TIME_COL, _SKIPPD_PV_COL
 
 
-def _compute_skippd_p_cs_on_csv_index(
-    lat: float,
-    lon: float,
-    csv_path: Path,
-    utc_naive_index: pd.DatetimeIndex,
-    *,
-    tilt_deg: float,
-    surface_azimuth_deg: float,
-) -> np.ndarray:
-    """
-    Normalized clear-sky POA on the full CSV time index (cached by (lat, lon, csv, tilt, az)).
+def _skippd_to_timestamps(values) -> list[pd.Timestamp]:
+    """Parse values as pandas timestamps; mirrors ``_folsom_to_timestamps``."""
+    return [pd.Timestamp(v) for v in values]
 
-    Uses pvlib's ``Location.get_clearsky()`` default (Ineichen) then projects onto a fixed
-    plane via ``get_total_irradiance``. ``p_cs = (poa_global / 1000).clip(0, 1.2)``.
-    Recipe mirrors ``SPMF_preprocessing/luoyang/aggregate_by_devdn_solarfeats.py:99-123``.
-    """
-    key = (
-        round(float(lat), 5),
-        round(float(lon), 5),
-        csv_path.resolve().as_posix(),
-        round(float(tilt_deg), 3),
-        round(float(surface_azimuth_deg), 3),
-    )
-    cached = _SKIPPD_CLEARSKY_CACHE.get(key)
-    if cached is not None:
-        return cached
-    n = len(utc_naive_index)
-    _skippd_progress(
-        f"computing clear-sky POA for ({lat:.4f}, {lon:.4f}) tilt={tilt_deg:g} "
-        f"az={surface_azimuth_deg:g} over {n:,} CSV steps ..."
-    )
-    # pvlib requires tz-aware DatetimeIndex; SKIPP'd CSV is already UTC.
-    utc_index = utc_naive_index.tz_localize("UTC")
-    loc = pvlib.location.Location(float(lat), float(lon))
-    cs = loc.get_clearsky(utc_index)  # Ineichen by default
-    solpos = pvlib.solarposition.get_solarposition(utc_index, float(lat), float(lon))
-    poa = pvlib.irradiance.get_total_irradiance(
-        surface_tilt=float(tilt_deg),
-        surface_azimuth=float(surface_azimuth_deg),
-        solar_zenith=solpos["apparent_zenith"],
-        solar_azimuth=solpos["azimuth"],
-        dni=cs["dni"],
-        ghi=cs["ghi"],
-        dhi=cs["dhi"],
-        albedo=0.2,
-    )
-    poa_clear = poa["poa_global"].clip(lower=0)
-    p_cs = (poa_clear / 1000.0).clip(0, 1.2).to_numpy(dtype=np.float32, copy=False)
-    _skippd_progress(
-        f"clear-sky ready: max p_cs={float(p_cs.max()):.3f}, "
-        f"daytime fraction (>0.1)={float((p_cs > 0.1).mean()):.3f}"
-    )
-    _SKIPPD_CLEARSKY_CACHE[key] = p_cs
-    return p_cs
+
+def load_skippd_conf(path: Path | str) -> dict:
+    """Load a SKIPP'd dataset YAML. Mirrors :func:`dataloader.folsom.load_folsom_conf`."""
+    if path is None:
+        raise TypeError("load_skippd_conf(path) is required; no canonical default")
+    p = Path(path)
+    with p.open() as f:
+        return yaml.safe_load(f) or {}
 
 
 class SkippdPvDataset(Dataset):
     """
-    Stanford SKIPP'd PV dataset: one PV CSV + sky Zarr, no NWP, no satellite.
+    Stanford SKIPP'd PV dataset (single rooftop PV CSV + sky Zarr; no NWP, no satellite).
 
-    Same constructor shape as :class:`dataloader.folsom.FolsomIrradianceDataset` for
-    drop-in compatibility with the trainer's ``_dataset_kwargs`` builder. The
-    ``satimg_*`` arguments are accepted for API parity but unused (no satellite data).
+    Constructor signature matches :class:`dataloader.folsom.FolsomIrradianceDataset` so
+    the SKIPP'd trainer's ``_dataset_kwargs(...)`` builder is the Folsom builder with a
+    different default YAML filename. The ``satimg_*`` kwargs are accepted for API
+    parity but unused — ``sat_tensor`` and ``sat_timefeats`` in returned samples are
+    ``None`` (same as Folsom).
 
-    Reads ``site.{latitude,longitude,tilt_deg,surface_azimuth_deg,rated_capacity_kw}``
-    plus ``paths.{data_dir, pv_path, sky_image_path, sky_format}`` and ``sampling.*``
-    from the per-instance ``config_path``. No info.yaml needed.
+    ``pv_dir`` must contain exactly one PV CSV with columns ``Date`` and
+    ``Huang_E4102_kW``. Site coordinates come from the per-instance ``config_path``'s
+    ``site.{latitude, longitude}`` (with a Stanford rooftop fallback) — SKIPP'd has no
+    ``<paths.data_dir>/info.yaml``. ``paths.sky_format`` must be ``zarr``.
 
-    Splits: fixed 60% / 10% / 30% by row count (same as Folsom).
-    Train: random anchor per ``__getitem__`` from precomputed valid-Y positions
-    (epoch length :data:`_DEFAULT_SKIPPD_TRAIN_EPOCH_LEN`).
-    Val/test: deterministic strided positions per the YAML strides.
+    Splits: rows are partitioned 60% train / 10% val / 30% test (same as Folsom).
+    Train samples a random valid anchor per ``__getitem__`` (epoch length defaults to
+    ``_DEFAULT_SKIPPD_TRAIN_EPOCH_LEN``; settable via ``self._train_epoch_len``);
+    val/test use the respective ``*_anchor_stride_min`` strides.
     """
 
     def __init__(
         self,
         config_path: str | Path,
-        pv_dir: str | None = None,
-        skyimg_dir: str | None = None,
-        satimg_dir: str | None = None,
+        pv_dir: str,
+        skyimg_dir: str,
+        satimg_dir: str,
         *,
         split: str,
-        csv_interval_min: int | None = None,
-        pv_input_interval_min: int | None = None,
-        pv_input_len: int | None = None,
-        pv_output_interval_min: int | None = None,
-        pv_output_len: int | None = None,
-        pv_train_time_fraction: float | None = None,
-        test_anchor_stride_min: int | None = None,
-        val_anchor_stride_min: int | None = None,
-        test_collect_time_match_tolerance_min: int | None = None,
-        skyimg_window_size: int | None = None,
-        skyimg_time_resolution_min: int | None = None,
-        skyimg_spatial_size: int | None = None,
-        satimg_window_size: int | None = None,
-        satimg_time_resolution_min: int | None = None,
-        satimg_npy_shape_hwc: tuple[int, int, int] | None = None,
-        sky_format: str = "zarr",
+        csv_interval_min: int,
+        pv_input_interval_min: int,
+        pv_input_len: int,
+        pv_output_interval_min: int,
+        pv_output_len: int,
+        pv_train_time_fraction: float,
+        test_anchor_stride_min: int,
+        val_anchor_stride_min: int,
+        test_collect_time_match_tolerance_min: int,
+        skyimg_window_size: int,
+        skyimg_time_resolution_min: int,
+        skyimg_spatial_size: int,
+        satimg_window_size: int,
+        satimg_time_resolution_min: int,
+        satimg_npy_shape_hwc: tuple[int, int, int],
     ):
-        """
-        Trainer call sites (mirroring Folsom) pass every kwarg explicitly; the smoke /
-        adhoc call sites can pass only ``config_path`` + ``split`` and let the constructor
-        fall back to the YAML's ``paths`` / ``sampling`` blocks. The Folsom-shape kwarg
-        signature is preserved so the trainer's ``_dataset_kwargs`` builder is unchanged.
-        """
         self._config_path = Path(config_path).resolve()
         if not self._config_path.is_file():
             raise FileNotFoundError(
@@ -278,76 +267,6 @@ class SkippdPvDataset(Dataset):
             raise ValueError("split must be 'train', 'val', or 'test'")
         self.split = split
 
-        # YAML fallback: load the per-instance config now so any None kwargs can be filled
-        # in from the ``paths:`` / ``sampling:`` blocks. The trainer passes all kwargs
-        # explicitly so this fallback is a no-op there.
-        with self._config_path.open() as _fb_f:
-            _fb_conf = yaml.safe_load(_fb_f) or {}
-        _fb_paths = _fb_conf.get("paths") or {}
-        _fb_sampling = _fb_conf.get("sampling") or {}
-        _fb_data_dir_raw = _fb_paths.get("data_dir")
-        if _fb_data_dir_raw is None or str(_fb_data_dir_raw).strip() == "":
-            _fb_data_dir = None
-        else:
-            _fb_dd = Path(str(_fb_data_dir_raw))
-            _fb_data_dir = _fb_dd.resolve() if _fb_dd.is_absolute() else (_PROJECT_ROOT / _fb_dd).resolve()
-
-        def _path_fb(arg: str | None, key: str, default_subdir: str | None = None) -> str:
-            if arg is not None and str(arg).strip() != "":
-                return str(arg)
-            v = _fb_paths.get(key)
-            if v is None or str(v).strip() == "":
-                if default_subdir is not None:
-                    v = default_subdir
-                else:
-                    raise KeyError(
-                        f"paths.{key} is required in {self._config_path} when {key!r} kwarg is omitted"
-                    )
-            v_p = Path(str(v))
-            if v_p.is_absolute():
-                return str(v_p.resolve())
-            if _fb_data_dir is None:
-                raise KeyError(
-                    f"paths.data_dir is required in {self._config_path} to resolve "
-                    f"relative paths.{key}={v!r}"
-                )
-            return str((_fb_data_dir / v_p).resolve())
-
-        def _samp_fb(arg, key: str, *, required: bool = True):
-            if arg is not None:
-                return arg
-            if key in _fb_sampling:
-                return _fb_sampling[key]
-            if required:
-                raise KeyError(
-                    f"sampling.{key} is required in {self._config_path} when {key!r} kwarg is omitted"
-                )
-            return None
-
-        pv_dir = _path_fb(pv_dir, "pv_path")
-        skyimg_dir = _path_fb(skyimg_dir, "sky_image_path")
-        satimg_dir = _path_fb(satimg_dir, "sat_path", default_subdir="sat")
-
-        csv_interval_min = int(_samp_fb(csv_interval_min, "csv_interval_min"))
-        pv_input_interval_min = int(_samp_fb(pv_input_interval_min, "pv_input_interval_min"))
-        pv_input_len = int(_samp_fb(pv_input_len, "pv_input_len"))
-        pv_output_interval_min = int(_samp_fb(pv_output_interval_min, "pv_output_interval_min"))
-        pv_output_len = int(_samp_fb(pv_output_len, "pv_output_len"))
-        pv_train_time_fraction = float(_samp_fb(pv_train_time_fraction, "pv_train_time_fraction"))
-        test_anchor_stride_min = int(_samp_fb(test_anchor_stride_min, "test_anchor_stride_min"))
-        val_anchor_stride_min = int(_samp_fb(val_anchor_stride_min, "val_anchor_stride_min"))
-        test_collect_time_match_tolerance_min = int(
-            _samp_fb(test_collect_time_match_tolerance_min, "test_collect_time_match_tolerance_min")
-        )
-        skyimg_window_size = int(_samp_fb(skyimg_window_size, "skyimg_window_size"))
-        skyimg_time_resolution_min = int(_samp_fb(skyimg_time_resolution_min, "skyimg_time_resolution_min"))
-        skyimg_spatial_size = int(_samp_fb(skyimg_spatial_size, "skyimg_spatial_size"))
-        satimg_window_size = int(_samp_fb(satimg_window_size, "satimg_window_size"))
-        satimg_time_resolution_min = int(_samp_fb(satimg_time_resolution_min, "satimg_time_resolution_min"))
-        if satimg_npy_shape_hwc is None:
-            satimg_npy_shape_hwc_raw = _samp_fb(None, "satimg_npy_shape_hwc", required=False) or [100, 100, 3]
-            satimg_npy_shape_hwc = tuple(int(x) for x in satimg_npy_shape_hwc_raw)
-
         if skyimg_window_size < 1:
             raise ValueError("skyimg_window_size must be >= 1")
         self.skyimg_window_size = int(skyimg_window_size)
@@ -356,13 +275,9 @@ class SkippdPvDataset(Dataset):
         self.satimg_window_size = int(satimg_window_size)
 
         if csv_interval_min <= 0 or pv_input_interval_min % csv_interval_min:
-            raise ValueError(
-                "pv_input_interval_min must be a positive multiple of csv_interval_min"
-            )
+            raise ValueError("pv_input_interval_min must be a positive multiple of csv_interval_min")
         if pv_output_interval_min % csv_interval_min:
-            raise ValueError(
-                "pv_output_interval_min must be a positive multiple of csv_interval_min"
-            )
+            raise ValueError("pv_output_interval_min must be a positive multiple of csv_interval_min")
         self._sx = pv_input_interval_min // csv_interval_min
         self._sy = pv_output_interval_min // csv_interval_min
         self.pv_input_len = int(pv_input_len)
@@ -408,10 +323,15 @@ class SkippdPvDataset(Dataset):
         if tol_m < 0:
             raise ValueError("test_collect_time_match_tolerance_min must be >= 0")
         self._test_collect_time_match_tolerance_min = tol_m
+        self._test_collect_tolerance_ns = tol_m * 60 * 1_000_000_000
 
-        # Site config: read from per-instance YAML. SKIPP'd doesn't use info.yaml.
+        # Site: read from the dataset YAML's ``site:`` block. SKIPP'd has no
+        # ``<data_dir>/info.yaml`` (Folsom reads coords from that file); fall back
+        # to the Stanford rooftop defaults with a warning when site.lat/lon are
+        # missing so the dataset can still construct.
         with self._config_path.open() as f:
             conf = yaml.safe_load(f) or {}
+        paths_cfg = conf.get("paths") or {}
         site_cfg = conf.get("site") or {}
         lat = site_cfg.get("latitude")
         lon = site_cfg.get("longitude")
@@ -426,21 +346,10 @@ class SkippdPvDataset(Dataset):
             lon = _DEFAULT_SKIPPD_LON
         self.latitude = float(lat)
         self.longitude = float(lon)
-        self._tilt_deg = float(site_cfg.get("tilt_deg", 0.0))
-        self._surface_azimuth_deg = float(site_cfg.get("surface_azimuth_deg", 180.0))
-        # rated_capacity_kw is currently informational on the dataset side; the
-        # actual normalization / p_mean uses the module-level constant so trainers
-        # and the dataset agree on a single source of truth. If you change one,
-        # change the other (the YAML field is here for documentation / future use).
-        self._rated_capacity_kw = float(
-            site_cfg.get("rated_capacity_kw", _DEFAULT_SKIPPD_P_MEAN)
-        )
-        self.p_mean = _DEFAULT_SKIPPD_P_MEAN
 
-        paths_cfg = conf.get("paths") or {}
-        raw_sf = paths_cfg.get("sky_format", sky_format)
+        raw_sf = paths_cfg.get("sky_format", "zarr")
         sky_fmt = str(raw_sf).strip().lower()
-        if sky_fmt not in ("zarr",):
+        if sky_fmt != "zarr":
             raise ValueError(
                 f"paths.sky_format must be 'zarr' for SKIPP'd (got {raw_sf!r}) in {self._config_path}"
             )
@@ -449,7 +358,7 @@ class SkippdPvDataset(Dataset):
         # API parity with PVDataset / FolsomIrradianceDataset.
         self.devDn_list = [0]
 
-        # PV CSV: glob ``pv_dir`` for *.csv (PVDataset convention); SKIPP'd expects exactly one.
+        # CSV: glob ``pv_dir`` for *.csv (PVDataset convention); SKIPP'd expects exactly one.
         self.sample_files = list_csv_files(data_dir=pv_dir)
         if not self.sample_files:
             raise FileNotFoundError(f"No CSV files in {pv_dir!r}")
@@ -460,38 +369,46 @@ class SkippdPvDataset(Dataset):
                 f"found {len(self.sample_files)}: {names}"
             )
         self._csv_path = self.sample_files[0].resolve()
-        _skippd_progress(
-            f"dataset split={split!r}: preparing {self._csv_path.name} ..."
-        )
+        _skippd_progress(f"dataset split={split!r}: preparing {self._csv_path.name} ...")
 
-        # Sky Zarr: open once per process and cache the xr.Dataset handle.
+        # Sky: Zarr only (SKIPP'd has no JPG path). Direct mirror of Folsom's Zarr branch.
         self._sky_gap_threshold = pd.Timedelta(minutes=5)
         self._sky_anchor_max_lag = pd.Timedelta(minutes=5)
         if xr is None:
             raise ImportError(
-                "SkippdPvDataset requires ``xarray`` (and a Zarr backend such as ``zarr``)."
+                "paths.sky_format=zarr requires ``xarray`` (and a Zarr backend such as ``zarr``). "
+                "Install them."
             )
         zp = self._skyimg_dir
         if not zp.exists():
             raise FileNotFoundError(f"sky Zarr path not found: {zp}")
         zkey = zp.resolve().as_posix()
-        if zkey not in _SKIPPD_ZARR_DS_CACHE:
-            _SKIPPD_ZARR_DS_CACHE[zkey] = xr.open_zarr(zp)
-        self._skyimg_ds = _SKIPPD_ZARR_DS_CACHE[zkey]
+        if zkey not in _ZARR_SKY_DS_CACHE:
+            _ZARR_SKY_DS_CACHE[zkey] = xr.open_zarr(zp)
+        self._skyimg_ds = _ZARR_SKY_DS_CACHE[zkey]
         self._validate_sky_zarr_schema(self._skyimg_ds)
         try:
             nt = _folsom_sky_zarr_len_time_utc(self._skyimg_ds)
         except Exception:
             nt = 0
-        _skippd_progress(f"sky Zarr: {zp}  (time steps ~ {nt:,})")
+        _skippd_progress(f"sky Zarr: {zp}  (time steps ≈ {nt:,})")
 
         # PV CSV: one in-memory table (Luoyang ``_csv_cache`` style).
-        self._df, self._time_ns, self._pv_kw = _load_skippd_pv_csv(self._csv_path)
-        self._time_col = _SKIPPD_TIME_COL
-        self._pv_col = _SKIPPD_PV_COL
+        self._df, self._time_col, self._pv_col = _load_skippd_pv_csv(self._csv_path)
         self._n = int(len(self._df))
         if self._n < 1:
             raise RuntimeError(f"{self._csv_path.name}: expected at least one data row")
+
+        # Precompute normalized clear-sky GHI per CSV row once. Direct mirror of
+        # Folsom's per-row pvlib (ineichen) precomputation. No POA transposition.
+        _skippd_progress("computing per-row clear-sky GHI via pvlib (ineichen) ...")
+        _times_utc = pd.DatetimeIndex(
+            pd.to_datetime(self._df[self._time_col].to_numpy(), utc=True)
+        )
+        self._p_cs_full = _compute_skippd_p_cs(self.latitude, self.longitude, _times_utc)
+        _skippd_progress(
+            f"p_cs ready: {len(self._p_cs_full):,} rows, max={float(self._p_cs_full.max()):.3f}"
+        )
 
         # Anchor bookkeeping (Luoyang / Folsom convention: anchor = last input row index).
         n = self._n
@@ -506,14 +423,10 @@ class SkippdPvDataset(Dataset):
                 f"(n={n}, need {amin}<=anchor<={amax}); check row count and window lengths"
             )
         self._anchors = np.arange(amin, amax + 1, dtype=np.intp)
-        self._x_tail_1d = (
-            -(lx - 1) * sx + np.arange(lx, dtype=np.intp) * sx
-        ).astype(np.intp, copy=False)
-        self._y_off_1d = (sy + np.arange(ly, dtype=np.intp) * sy).astype(
-            np.intp, copy=False
-        )
+        self._x_tail_1d = (-(lx - 1) * sx + np.arange(lx, dtype=np.intp) * sx).astype(np.intp, copy=False)
+        self._y_off_1d = (sy + np.arange(ly, dtype=np.intp) * sy).astype(np.intp, copy=False)
 
-        # Fixed 60% / 10% / 30% train/val/test split (same as Folsom / PVDataset).
+        # Fixed 60% / 10% / 30% train/val/test split (matches Folsom / PVDataset).
         split_train_end = int(n * 0.6)
         split_val_end = int(n * 0.7)
         if not (0 < split_train_end < split_val_end < n):
@@ -547,9 +460,7 @@ class SkippdPvDataset(Dataset):
         self._num_train_anchors = int(train_positions.size)
 
         val_positions = np.nonzero(self._val_anchor_mask)[0]
-        self._val_r_indices = val_positions[:: self._val_anchor_stride_rows].astype(
-            np.intp, copy=False
-        )
+        self._val_r_indices = val_positions[::self._val_anchor_stride_rows].astype(np.intp, copy=False)
         self._num_val_windows = int(self._val_r_indices.size)
         if self.split == "val" and self._num_val_windows == 0:
             raise RuntimeError(
@@ -558,9 +469,7 @@ class SkippdPvDataset(Dataset):
             )
 
         test_positions = np.nonzero(self._test_anchor_mask)[0]
-        self._test_r_indices = test_positions[:: self._test_anchor_stride_rows].astype(
-            np.intp, copy=False
-        )
+        self._test_r_indices = test_positions[::self._test_anchor_stride_rows].astype(np.intp, copy=False)
         self._num_test_windows = int(self._test_r_indices.size)
         if self.split == "test" and self._num_test_windows == 0:
             raise RuntimeError(
@@ -568,54 +477,39 @@ class SkippdPvDataset(Dataset):
                 "(reduce test_anchor_stride_min or widen the test segment)"
             )
 
-        # Random-anchor epoch length (Builders may override on the train instance).
+        # Internal: train epoch length (random anchors per epoch). Builders may override.
         self._train_epoch_len = _DEFAULT_SKIPPD_TRAIN_EPOCH_LEN
 
-        # Clear-sky p_cs on full CSV time index (cached). Built once per (lat, lon,
-        # csv_path, tilt, azimuth) tuple so train/val/test share the same array.
-        csv_time_index = pd.DatetimeIndex(self._df[self._time_col])
-        self._p_cs_full = _compute_skippd_p_cs_on_csv_index(
-            self.latitude,
-            self.longitude,
-            self._csv_path,
-            csv_time_index,
-            tilt_deg=self._tilt_deg,
-            surface_azimuth_deg=self._surface_azimuth_deg,
-        )
-        if self._p_cs_full.shape[0] != self._n:
-            raise RuntimeError(
-                f"p_cs length {self._p_cs_full.shape[0]} != CSV rows {self._n}"
-            )
-        # Pre-derive the daytime mask (per CSV row) so anchor filtering is one lookup.
-        self._kt_mask_full = (self._p_cs_full > 0.1).astype(np.float32, copy=False)
-
         # Train anchor validity filter: keep only anchors whose Y window has at least
-        # one daytime step (``kt_mask == 1``). Replaces Folsom's GHI > 10 filter.
+        # one daytime row (kt_mask == 1, i.e. p_cs > _SKIPPD_KT_DAYTIME_THRESHOLD).
+        # Mirrors Folsom's GHI > 10 W/m² filter in intent (avoid all-night windows);
+        # SKIPP'd uses kt_mask because the CSV has no GHI column to threshold on.
         if self.split == "train":
-            self._train_anchor_valid_positions = (
-                self._compute_train_anchor_valid_positions()
-            )
+            self._train_anchor_valid_positions = self._compute_train_anchor_valid_positions()
         else:
             self._train_anchor_valid_positions = self._train_anchor_positions
 
-    # ------------------------------------------------------------------ #
-    # Train anchor filter                                                #
-    # ------------------------------------------------------------------ #
     def _compute_train_anchor_valid_positions(self) -> np.ndarray:
         """
-        Return the subset of ``_train_anchor_positions`` whose Y window has any
-        ``kt_mask == 1`` step. Mirrors Folsom's GHI-daytime filter so random
-        anchors don't land on all-night windows.
+        Scan the per-row kt_mask once and return the subset of
+        ``self._train_anchor_positions`` whose Y window has any ``kt_mask == 1`` row.
+
+        Direct analog of :meth:`FolsomIrradianceDataset._compute_train_anchor_valid_positions`;
+        SKIPP'd uses the clear-sky daytime mask instead of GHI > 10 W/m² because the
+        SKIPP'd CSV has no GHI column.
         """
         _skippd_progress(
-            "train anchor filter: scanning kt_mask (p_cs > 0.1) for daytime Y windows ..."
+            f"train anchor filter: scanning kt_mask (p_cs > {_SKIPPD_KT_DAYTIME_THRESHOLD:g}) "
+            "for daytime Y windows ..."
         )
-        train_anchor_rows = self._anchors[self._train_anchor_positions]
+        kt_mask_full = (self._p_cs_full > _SKIPPD_KT_DAYTIME_THRESHOLD).astype(np.float32, copy=False)
+
+        train_anchor_rows = self._anchors[self._train_anchor_positions]  # [N_train]
         if train_anchor_rows.size == 0:
             return self._train_anchor_positions
         y_rows = train_anchor_rows[:, None] + self._y_off_1d[None, :]
-        y_kt_mask = self._kt_mask_full[y_rows]
-        has_daytime = (y_kt_mask > 0.5).any(axis=1)
+        y_kt = kt_mask_full[y_rows]
+        has_daytime = (y_kt > _SKIPPD_TRAIN_DAYTIME_KT_MASK_THRESHOLD).any(axis=1)
         kept = self._train_anchor_positions[has_daytime].astype(np.intp, copy=False)
         n_kept = int(kept.size)
         n_total = int(train_anchor_rows.size)
@@ -631,25 +525,26 @@ class SkippdPvDataset(Dataset):
         return kept
 
     # ------------------------------------------------------------------ #
-    # Sky-Zarr helpers - Copied from dataloader/folsom.py (instance methods   #
-    # can't be cleanly imported; the module-level _folsom_* helpers are      #
-    # imported above).                                                       #
+    # Sky-Zarr helpers — copied verbatim from dataloader/folsom.py        #
+    # (module-level _folsom_* helpers are imported above; the instance   #
+    # methods below mirror Folsom line-by-line, only the class name      #
+    # differs).                                                          #
     # ------------------------------------------------------------------ #
     def _black_sky_tensor(self) -> torch.Tensor:
-        # Copied from dataloader/folsom.py:808-811
+        """Return ``[3, s, s]`` float32 (zeros). Same convention as Folsom."""
         s = self._skyimg_spatial_size
         return torch.zeros((3, s, s), dtype=torch.float32)
 
     @staticmethod
     def _sky_filename_ts(ts_raw) -> pd.Timestamp:
-        # Copied from dataloader/folsom.py:813-819
+        """Naive UTC timestamp for sky frame alignment; seconds floored to 0."""
         ts = pd.Timestamp(ts_raw)
         if ts.tzinfo is not None:
             ts = ts.tz_convert("UTC").tz_localize(None)
         return ts.replace(second=0, microsecond=0, nanosecond=0)
 
     def _validate_sky_zarr_schema(self, ds: Any) -> None:
-        # Copied from dataloader/folsom.py:821-833
+        """Require ``images`` plus an alignable ``time_utc`` timeline (mirror Folsom)."""
         if "images" not in ds.data_vars:
             raise KeyError(
                 "SKIPP'd sky Zarr must define data variable ``images`` "
@@ -658,14 +553,14 @@ class SkippdPvDataset(Dataset):
         _folsom_sky_zarr_time_dim_and_values(ds, ds["images"])
 
     def _nominal_sky_frame_times(self, t_end_wall: Any) -> list[pd.Timestamp]:
-        # Copied from dataloader/folsom.py:835-840
+        """Oldest→newest ``skyimg_window_size`` timestamps spaced by ``_skyimg_dt_min``."""
         t_end = self._sky_filename_ts(t_end_wall)
         w = self.skyimg_window_size
         dt = self._skyimg_dt_min
         return [t_end - timedelta(minutes=(w - 1 - i) * dt) for i in range(w)]
 
     def _resize_sky_chw(self, chw: torch.Tensor) -> torch.Tensor:
-        # Copied from dataloader/folsom.py:842-849
+        """``[3,H,W]`` float32 → ``[3,s,s]`` bilinear."""
         s = self._skyimg_spatial_size
         if chw.shape[-2:] == (s, s):
             return chw
@@ -674,12 +569,10 @@ class SkippdPvDataset(Dataset):
         return y.squeeze(0)
 
     def _tensor_from_zarr_image_tile(self, tile: np.ndarray) -> torch.Tensor:
-        # Copied from dataloader/folsom.py:851-867
+        """One Zarr timestep tile (HWC or CHW) → ``[3, s, s]`` float32 in ``[0, 1]``."""
         t = torch.from_numpy(np.asarray(tile, dtype=np.float32))
         if t.ndim != 3:
-            raise ValueError(
-                f"sky Zarr ``images`` tile must be 3D, got shape {tuple(tile.shape)}"
-            )
+            raise ValueError(f"sky Zarr ``images`` tile must be 3D, got shape {tuple(tile.shape)}")
         if t.shape[-1] == 3 and t.shape[0] != 3:
             t = t.permute(2, 0, 1).contiguous()
         elif t.shape[0] != 3:
@@ -694,7 +587,11 @@ class SkippdPvDataset(Dataset):
         return self._resize_sky_chw(t)
 
     def _stack_sky_from_zarr(self, t_end_wall: Any) -> torch.Tensor:
-        # Copied from dataloader/folsom.py:869-917
+        """
+        Stack ``[W, 3, H, W]`` from Zarr using the same nominal UTC grid as Folsom's
+        JPEG loader. Black frames when no Zarr row falls within the nominal window
+        or the newest kept row is too far before the anchor.
+        """
         w = self.skyimg_window_size
         nominal = self._nominal_sky_frame_times(t_end_wall)
         black = torch.stack([self._black_sky_tensor()] * w, dim=0)
@@ -737,6 +634,23 @@ class SkippdPvDataset(Dataset):
         return torch.stack(frames, dim=0)
 
     # ------------------------------------------------------------------ #
+    # NWP: SKIPP'd has none. Emit zeros + invalid mask of Folsom's shape #
+    # so the model's nwp_tensor[:, :, 0|2|-1] indexing doesn't crash and #
+    # the trainer can drop --use-nwp / NWP-remap code paths entirely.    #
+    # ------------------------------------------------------------------ #
+    def _zero_nwp_tensor(self) -> torch.Tensor:
+        """Zeros features + ones mask, ``[T_out, len(_FOLSOM_NWP_FEATURE_COLS) + 1]``.
+
+        Mirrors :meth:`FolsomIrradianceDataset._interpolate_nwp` when its merged-NWP
+        CSV is missing (zeros for features, ones for the per-step invalid mask).
+        """
+        t_out = self.pv_output_len
+        c = len(_FOLSOM_NWP_FEATURE_COLS)
+        zeros = np.zeros((t_out, c), dtype=np.float32)
+        ones_mask = np.ones((t_out, 1), dtype=np.float32)
+        return torch.from_numpy(np.concatenate([zeros, ones_mask], axis=1))
+
+    # ------------------------------------------------------------------ #
     # Sample building                                                     #
     # ------------------------------------------------------------------ #
     def __len__(self) -> int:
@@ -745,115 +659,6 @@ class SkippdPvDataset(Dataset):
         if self.split == "val":
             return self._num_val_windows
         return self._num_test_windows
-
-    def _build_tensors(self, anchor: int) -> dict[str, Any]:
-        x_idx = anchor + self._x_tail_1d
-        y_idx = anchor + self._y_off_1d
-        sub_x = self._df.iloc[x_idx]
-        sub_y = self._df.iloc[y_idx]
-
-        pow_x = sub_x[self._pv_col].to_numpy(dtype=np.float32, copy=False)
-        pow_y = sub_y[self._pv_col].to_numpy(dtype=np.float32, copy=False)
-        p_cs_x = self._p_cs_full[x_idx]
-        p_cs_y = self._p_cs_full[y_idx]
-        kt_mask_x = self._kt_mask_full[x_idx]
-        kt_mask_y = self._kt_mask_full[y_idx]
-
-        # kt = pv / (p_cs * p_mean + 1e-6) * kt_mask. pv is raw kW (NOT normalized).
-        denom_x = p_cs_x * self.p_mean + 1e-6
-        kt_x = np.nan_to_num(
-            (pow_x / denom_x) * kt_mask_x, nan=0.0, posinf=0.0, neginf=0.0
-        ).astype(np.float32, copy=False)
-
-        # Normalized PV (divide by capacity for input + target). Folsom-equivalent of /1100.
-        pv_norm_x = (pow_x / _SKIPPD_PV_KW_SCALE).astype(np.float32, copy=False)
-        pv_norm_y = (pow_y / _SKIPPD_PV_KW_SCALE).astype(np.float32, copy=False)
-        pv_norm_x = np.nan_to_num(pv_norm_x, nan=0.0, posinf=0.0, neginf=0.0)
-        pv_norm_y = np.nan_to_num(pv_norm_y, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # Target mask: isfinite(pv) AND kt_mask>0 (daytime). pv is finite (no NaN in CSV),
-        # so this reduces to the daytime mask but isfinite() guards against future drift.
-        finite_y = np.isfinite(pow_y)
-        target_mask_np = (finite_y & (kt_mask_y > 0.5)).astype(np.float32)
-
-        # Tensor shapes match dataloader.luoyang_zarr / collate_batched contract:
-        #   pv, kt, kt_mask, p_cs: [1, T_in]; target_pv, target_mask, target_p_cs: [T_out].
-        pv_tensor = torch.from_numpy(pv_norm_x).unsqueeze(0)
-        kt_tensor = torch.from_numpy(kt_x).unsqueeze(0)
-        kt_mask_tensor = torch.from_numpy(kt_mask_x).unsqueeze(0)
-        p_cs_tensor = torch.from_numpy(p_cs_x.astype(np.float32, copy=False)).unsqueeze(0)
-        p_mean_tensor = torch.tensor(float(self.p_mean), dtype=torch.float32)
-        # pv_mask: spec says "all-ones for now". Shape mirrors Folsom's input_mask: [1, T_in].
-        pv_mask_tensor = torch.ones((1, self.pv_input_len), dtype=torch.float32)
-
-        target_pv_tensor = torch.from_numpy(pv_norm_y)
-        target_mask_tensor = torch.from_numpy(target_mask_np)
-        target_p_cs_tensor = torch.from_numpy(p_cs_y.astype(np.float32, copy=False))
-
-        # Time features.
-        x_times = sub_x[self._time_col]
-        if bool(x_times.isna().any()):
-            raise ValueError(f"NaT in {self._time_col!r} for input window")
-        timestamps = [pd.Timestamp(v) for v in x_times.tolist()]
-        time0 = timestamps[-1]
-        forecast_timestamps = [
-            time0 + pd.Timedelta(minutes=self.pv_output_interval_min * (i + 1))
-            for i in range(self.pv_output_len)
-        ]
-
-        pv_solar = compute_solar_features(timestamps, self.latitude, self.longitude)
-        pv_tf = solar_features_encoder(pv_solar)
-        pv_dtf = delta_time_encoder(timestamps, time0)
-        pv_timefeats = torch.cat([pv_tf, pv_dtf.unsqueeze(1)], dim=1)
-
-        forecast_solar = compute_solar_features(
-            forecast_timestamps, self.latitude, self.longitude
-        )
-        f_tf = solar_features_encoder(forecast_solar)
-        f_dtf = delta_time_encoder(forecast_timestamps, time0)
-        forecast_timefeats = torch.cat([f_tf, f_dtf.unsqueeze(1)], dim=1)
-
-        # Sky stack: nominal UTC grid ending at anchor (oldest -> newest).
-        t_x_end = x_times.iloc[-1]
-        nominal = self._nominal_sky_frame_times(t_x_end)
-        skimg_tensor = self._stack_sky_from_zarr(t_x_end)
-        skimg_solar = compute_solar_features(nominal, self.latitude, self.longitude)
-        skimg_tf = solar_features_encoder(skimg_solar)
-        skimg_dtf = delta_time_encoder(nominal, time0)
-        skimg_timefeats = torch.cat([skimg_tf, skimg_dtf.unsqueeze(1)], dim=1)
-        skimg_timestamps = [t.strftime("%Y%m%d%H%M%S") for t in nominal]
-
-        # NWP: SKIPP'd has none. Emit zeros of the shape the model indexes ([T_out, 3]);
-        # the SKIPP'd trainer rewrites slots [:, :, 0] / [:, :, 2] before forward so the
-        # model's (x/1000 - 0.5)*2 and (x - 288.15)/10 normalizations see sensible values.
-        nwp_tensor = torch.zeros((self.pv_output_len, 3), dtype=torch.float32)
-
-        input_timestamps_utc = [str(pd.Timestamp(t)) for t in timestamps]
-        forecast_timestamps_utc = [str(pd.Timestamp(t)) for t in forecast_timestamps]
-        dev_idx = torch.tensor(0, dtype=torch.long)
-
-        return {
-            "dev_idx": dev_idx,
-            "pv": pv_tensor,
-            "pv_mask": pv_mask_tensor,
-            "pv_timefeats": pv_timefeats,
-            "forecast_timefeats": forecast_timefeats,
-            "kt": kt_tensor,
-            "kt_mask": kt_mask_tensor,
-            "p_cs": p_cs_tensor,
-            "p_mean": p_mean_tensor,
-            "target_p_cs": target_p_cs_tensor,
-            "target_pv": target_pv_tensor,
-            "target_mask": target_mask_tensor,
-            "sat_tensor": None,
-            "sat_timefeats": None,
-            "skimg_tensor": skimg_tensor,
-            "skimg_timefeats": skimg_timefeats,
-            "nwp_tensor": nwp_tensor,
-            "input_timestamps_utc": input_timestamps_utc,
-            "forecast_timestamps_utc": forecast_timestamps_utc,
-            "skimg_timestamps": skimg_timestamps,
-        }
 
     def sky_inspect(self, anchor: int) -> dict:
         """Resolve the sky-Zarr slice covering ``anchor`` without building tensors."""
@@ -881,6 +686,113 @@ class SkippdPvDataset(Dataset):
             "zarr_slice_timesteps": n_z,
         }
 
+    def _build_tensors(self, anchor: int) -> dict[str, Any]:
+        x_idx = anchor + self._x_tail_1d
+        y_idx = anchor + self._y_off_1d
+        sub_x = self._df.iloc[x_idx]
+        sub_y = self._df.iloc[y_idx]
+
+        # Raw PV (kW) input + target.
+        pow_x = sub_x[self._pv_col].to_numpy(dtype=np.float32, copy=False)
+        pow_y = sub_y[self._pv_col].to_numpy(dtype=np.float32, copy=False)
+        pow_x = np.nan_to_num(pow_x, nan=0.0, posinf=0.0, neginf=0.0)
+        pow_y_raw = pow_y  # keep pre-sanitization for the target mask (isfinite)
+        pow_y = np.nan_to_num(pow_y, nan=0.0, posinf=0.0, neginf=0.0)
+
+        valid_in = np.isfinite(sub_x[self._pv_col].to_numpy())
+        input_mask = torch.from_numpy(valid_in.astype(np.float32)).unsqueeze(0)
+        valid_out = np.isfinite(pow_y_raw)
+        target_mask = torch.from_numpy(valid_out.astype(np.float32))
+
+        # Clear-sky / kt fields. Direct mirror of Folsom's recipe — the only
+        # difference is the normalization constants (Folsom: /1100 for both PV
+        # and clear-sky GHI; SKIPP'd: /30 for PV and /1000 for clear-sky GHI
+        # because PV/GHI live in different unit spaces).
+        p_cs_x = self._p_cs_full[x_idx]
+        p_cs_y = self._p_cs_full[y_idx]
+        kt_mask_np = (p_cs_x > _SKIPPD_KT_DAYTIME_THRESHOLD).astype(np.float32)
+        pv_norm_x = pow_x / _SKIPPD_PV_SCALE
+        kt_np = (pv_norm_x / (p_cs_x + _SKIPPD_KT_EPS)) * kt_mask_np
+        kt = torch.from_numpy(kt_np.astype(np.float32)).unsqueeze(0)
+        kt_mask = torch.from_numpy(kt_mask_np).unsqueeze(0)
+        p_cs = torch.from_numpy(p_cs_x.astype(np.float32)).unsqueeze(0)
+        target_p_cs = torch.from_numpy(p_cs_y.astype(np.float32))
+        # p_mean is literally Folsom's constant 1.0 (NOT the SKIPP'd rated 30 kW).
+        # Reason: Folsom's trainer reconstruction is
+        #     pv_pred = kt_pred * target_p_cs * p_mean ≈ target_pv
+        # which is an algebraic identity in the normalized space iff p_mean = 1.0.
+        # SKIPP'd target_pv = pv_kW / 30 is also in normalized space, so p_mean
+        # must stay 1.0 for the trainer's pv_pred ≈ target_pv reconstruction to
+        # hold. The user's "use 30 for p_mean" suggestion in the task brief would
+        # require target_pv to be in raw kW, which conflicts with the trainer-side
+        # "1100 → 30" substitution (the trainer multiplies the normalized MAE by
+        # the capacity = 30 kW; that only makes sense when target_pv is /30).
+        p_mean = torch.tensor(1.0, dtype=torch.float32)
+
+        x_times = sub_x[self._time_col]
+        if bool(x_times.isna().any()):
+            raise ValueError(f"NaT in {self._time_col!r} for input window")
+        timestamps = _skippd_to_timestamps(x_times.tolist())
+        time0 = timestamps[-1]
+        forecast_timestamps = [
+            time0 + pd.Timedelta(minutes=self.pv_output_interval_min * (i + 1))
+            for i in range(self.pv_output_len)
+        ]
+        nwp_tensor = self._zero_nwp_tensor()
+
+        pv_solar = compute_solar_features(timestamps, self.latitude, self.longitude)
+        pv_tf = solar_features_encoder(pv_solar)
+        pv_dtf = delta_time_encoder(timestamps, time0)
+        pv_timefeats = torch.cat([pv_tf, pv_dtf.unsqueeze(1)], dim=1)
+
+        forecast_solar = compute_solar_features(forecast_timestamps, self.latitude, self.longitude)
+        f_tf = solar_features_encoder(forecast_solar)
+        f_dtf = delta_time_encoder(forecast_timestamps, time0)
+        forecast_timefeats = torch.cat([f_tf, f_dtf.unsqueeze(1)], dim=1)
+
+        t_x_end = sub_x[self._time_col].iloc[-1]
+        nominal = self._nominal_sky_frame_times(t_x_end)
+        skimg_tensor = self._stack_sky_from_zarr(t_x_end)
+        skimg_solar = compute_solar_features(nominal, self.latitude, self.longitude)
+        skimg_tf = solar_features_encoder(skimg_solar)
+        skimg_dtf = delta_time_encoder(nominal, time0)
+        skimg_timefeats = torch.cat([skimg_tf, skimg_dtf.unsqueeze(1)], dim=1)
+        skimg_timestamps = [t.strftime("%Y%m%d%H%M%S") for t in nominal]
+
+        input_timestamps_utc = [str(pd.Timestamp(t)) for t in timestamps]
+        forecast_timestamps_utc = [str(pd.Timestamp(t)) for t in forecast_timestamps]
+        # ``dev_idx = 700`` literally mirrors Folsom (arbitrary slot inside the
+        # model's ``nn.Embedding(1000)`` device-id table; SKIPP'd is single-sensor).
+        dev_idx = torch.tensor(700, dtype=torch.long)
+
+        # PV input / target in normalized space (analog of Folsom's ghi / 1100).
+        pv_tensor = torch.from_numpy(pv_norm_x.astype(np.float32)).unsqueeze(0)
+        target_pv_tensor = torch.from_numpy((pow_y / _SKIPPD_PV_SCALE).astype(np.float32))
+
+        return {
+            "dev_idx": dev_idx,
+            "pv": pv_tensor,
+            "pv_mask": input_mask,
+            "pv_timefeats": pv_timefeats,
+            "kt": kt,
+            "kt_mask": kt_mask,
+            "p_cs": p_cs,
+            "p_mean": p_mean,
+            "input_mask": input_mask,
+            "forecast_timefeats": forecast_timefeats,
+            "target_pv": target_pv_tensor,
+            "target_mask": target_mask,
+            "target_p_cs": target_p_cs,
+            "sat_tensor": None,
+            "sat_timefeats": None,
+            "skimg_tensor": skimg_tensor,
+            "skimg_timefeats": skimg_timefeats,
+            "nwp_tensor": nwp_tensor,
+            "input_timestamps_utc": input_timestamps_utc,
+            "forecast_timestamps_utc": forecast_timestamps_utc,
+            "skimg_timestamps": skimg_timestamps,
+        }
+
     def __getitem__(self, idx: int) -> dict[str, Any]:
         if self.split == "train":
             r = int(np.random.choice(self._train_anchor_valid_positions))
@@ -892,19 +804,11 @@ class SkippdPvDataset(Dataset):
         return self._build_tensors(anchor)
 
 
-__all__ = [
-    "SkippdPvDataset",
-    "_DEFAULT_SKIPPD_P_MEAN",
-    "_DEFAULT_SKIPPD_TRAIN_EPOCH_LEN",
-    "_SKIPPD_PV_KW_SCALE",
-]
-
-
-# ---------------------------------------------------------------------------- #
-# Smoke entry: instantiate the dataset and print one sample's shapes.          #
-# ---------------------------------------------------------------------------- #
 def _resolve_skippd_dataset_paths(conf: dict, conf_path: Path) -> tuple[Path, Path, Path]:
-    """Return ``(pv_dir, skyimg_dir, satimg_dir)`` from a SKIPP'd dataset YAML."""
+    """Return ``(pv_dir, skyimg_dir, satimg_dir)`` from a SKIPP'd dataset YAML.
+
+    Mirrors :func:`dataloader.folsom._resolve_folsom_dataset_paths`.
+    """
     paths_cfg = conf.get("paths") or {}
     raw_dd = paths_cfg.get("data_dir")
     if raw_dd is None or str(raw_dd).strip() == "":
@@ -918,55 +822,101 @@ def _resolve_skippd_dataset_paths(conf: dict, conf_path: Path) -> tuple[Path, Pa
             raise KeyError(f"dataset config paths.{key} is required (in {conf_path})")
         return (data_dir / Path(str(v))).resolve()
 
-    sat_v = paths_cfg.get("sat_path", "sat")
-    sat_dir = (data_dir / Path(str(sat_v))).resolve()
-    return _req("pv_path"), _req("sky_image_path"), sat_dir
+    return _req("pv_path"), _req("sky_image_path"), _req("sat_path")
 
 
-def _build_skippd_kwargs(conf: dict, cfg_path: Path, split: str) -> dict:
+def _skippd_kwargs_from_conf(conf: dict, cfg_path: Path) -> dict:
+    """Shared kwargs builder for ``build_skippd_pv_datasets_from_conf`` and the smoke CLI.
+
+    Returns the full ``SkippdPvDataset.__init__`` kwargs **without** ``split``; callers
+    add ``split=...`` before instantiating. Mirrors Folsom's pattern.
+    """
     sampling_cfg = conf.get("sampling") or {}
     if not sampling_cfg:
         raise KeyError(f"dataset config {cfg_path} is missing a non-empty 'sampling:' section")
-    pv_dir, skyimg_dir, satimg_dir = _resolve_skippd_dataset_paths(conf, cfg_path)
-    shwc = sampling_cfg.get("satimg_npy_shape_hwc", [100, 100, 3])
-    if not isinstance(shwc, (list, tuple)) or len(shwc) != 3:
-        raise ValueError(f"sampling.satimg_npy_shape_hwc must be [H, W, C] (in {cfg_path})")
 
-    def _req(key: str):
+    def _req_s(key: str):
         if key not in sampling_cfg:
             raise KeyError(f"dataset config sampling.{key} is required (in {cfg_path})")
         return sampling_cfg[key]
 
+    pv_dir, skyimg_dir, satimg_dir = _resolve_skippd_dataset_paths(conf, cfg_path)
+    shwc = _req_s("satimg_npy_shape_hwc")
+    if not isinstance(shwc, (list, tuple)) or len(shwc) != 3:
+        raise ValueError(f"sampling.satimg_npy_shape_hwc must be [H, W, C] (in {cfg_path})")
     return dict(
         config_path=str(cfg_path),
         pv_dir=str(pv_dir),
         skyimg_dir=str(skyimg_dir),
         satimg_dir=str(satimg_dir),
-        split=split,
-        csv_interval_min=int(_req("csv_interval_min")),
-        pv_input_interval_min=int(_req("pv_input_interval_min")),
-        pv_input_len=int(_req("pv_input_len")),
-        pv_output_interval_min=int(_req("pv_output_interval_min")),
-        pv_output_len=int(_req("pv_output_len")),
-        pv_train_time_fraction=float(_req("pv_train_time_fraction")),
-        test_anchor_stride_min=int(_req("test_anchor_stride_min")),
-        val_anchor_stride_min=int(_req("val_anchor_stride_min")),
-        test_collect_time_match_tolerance_min=int(_req("test_collect_time_match_tolerance_min")),
-        skyimg_window_size=int(_req("skyimg_window_size")),
-        skyimg_time_resolution_min=int(_req("skyimg_time_resolution_min")),
-        skyimg_spatial_size=int(_req("skyimg_spatial_size")),
-        satimg_window_size=int(_req("satimg_window_size")),
-        satimg_time_resolution_min=int(_req("satimg_time_resolution_min")),
+        csv_interval_min=int(_req_s("csv_interval_min")),
+        pv_input_interval_min=int(_req_s("pv_input_interval_min")),
+        pv_input_len=int(_req_s("pv_input_len")),
+        pv_output_interval_min=int(_req_s("pv_output_interval_min")),
+        pv_output_len=int(_req_s("pv_output_len")),
+        pv_train_time_fraction=float(_req_s("pv_train_time_fraction")),
+        test_anchor_stride_min=int(_req_s("test_anchor_stride_min")),
+        val_anchor_stride_min=int(_req_s("val_anchor_stride_min")),
+        test_collect_time_match_tolerance_min=int(_req_s("test_collect_time_match_tolerance_min")),
+        skyimg_window_size=int(_req_s("skyimg_window_size")),
+        skyimg_time_resolution_min=int(_req_s("skyimg_time_resolution_min")),
+        skyimg_spatial_size=int(_req_s("skyimg_spatial_size")),
+        satimg_window_size=int(_req_s("satimg_window_size")),
+        satimg_time_resolution_min=int(_req_s("satimg_time_resolution_min")),
         satimg_npy_shape_hwc=tuple(int(x) for x in shwc),
     )
 
 
+def build_skippd_pv_datasets_from_conf(
+    conf: dict | None = None,
+    *,
+    conf_path: Path | str | None = None,
+    train_epoch_len: int = 50_000,
+    skyimg_window_size: int | None = None,
+) -> tuple[SkippdPvDataset, SkippdPvDataset]:
+    """
+    Build train/test :class:`SkippdPvDataset` from a SKIPP'd dataset YAML.
+
+    Mirrors :func:`dataloader.folsom.build_folsom_irradiance_datasets_from_conf`.
+    Reads ``paths.{data_dir, pv_path, sky_image_path, sat_path, sky_format}`` and the
+    ``sampling:`` section. Site lat/lon come from the YAML's ``site:`` block.
+    """
+    if conf_path is None:
+        raise TypeError("build_skippd_pv_datasets_from_conf: conf_path is required")
+    cfg_path = Path(conf_path)
+    if conf is None:
+        conf = load_skippd_conf(cfg_path)
+
+    kwargs = _skippd_kwargs_from_conf(conf, cfg_path)
+    if skyimg_window_size is not None:
+        kwargs["skyimg_window_size"] = int(skyimg_window_size)
+    train_ds = SkippdPvDataset(split="train", **kwargs)
+    test_ds = SkippdPvDataset(split="test", **kwargs)
+    train_ds._train_epoch_len = max(1, int(train_epoch_len))
+    return train_ds, test_ds
+
+
+__all__ = [
+    "SkippdPvDataset",
+    "build_skippd_pv_datasets_from_conf",
+    "load_skippd_conf",
+    "run_smoke_cli",
+    "_SKIPPD_PV_SCALE",
+    "_SKIPPD_CS_GHI_SCALE",
+    "_SKIPPD_KT_DAYTIME_THRESHOLD",
+    "_SKIPPD_KT_EPS",
+]
+
+
+# ---------------------------------------------------------------------------- #
+# Smoke entry: instantiate the dataset and print one sample's shapes.          #
+# ---------------------------------------------------------------------------- #
 def run_smoke_cli(argv: list[str] | None = None) -> int:
     """
     Smoke: instantiate ``SkippdPvDataset`` from the YAML, pull one sample, print shapes.
 
-    Mirrors Folsom's smoke but kept minimal (no per-anchor irradiance / NWP report;
-    SKIPP'd has neither).
+    Mirrors the Folsom smoke in spirit but minimal — SKIPP'd has no per-anchor
+    irradiance / NWP report to render.
     """
     parser = argparse.ArgumentParser(
         description="Smoke-test SkippdPvDataset (reads paths from YAML)"
@@ -985,15 +935,17 @@ def run_smoke_cli(argv: list[str] | None = None) -> int:
     try:
         with open(args.conf) as f:
             conf = yaml.safe_load(f) or {}
-        kwargs = _build_skippd_kwargs(conf, args.conf, args.split)
-        ds = SkippdPvDataset(**kwargs)
+        kwargs = _skippd_kwargs_from_conf(conf, Path(args.conf))
+        ds = SkippdPvDataset(split=args.split, **kwargs)
     except (FileNotFoundError, KeyError, ValueError) as e:
         print(f"Failed to load SKIPP'd data from {args.conf.resolve()}:\n  {e}", file=sys.stderr)
         return 1
 
     print(f"[conf] {args.conf.resolve()}")
     print(f"  csv={ds._csv_path}  split={args.split}  len(ds)={len(ds)}")
-    s = ds[max(0, min(int(args.index), len(ds) - 1))]
+    n_ds = len(ds)
+    idx = max(0, min(int(args.index), max(0, n_ds - 1)))
+    s = ds[idx]
     shapes: dict[str, str] = {}
     for k, v in s.items():
         if hasattr(v, "shape"):
@@ -1037,6 +989,20 @@ def run_smoke_cli(argv: list[str] | None = None) -> int:
         f"  kt_mask sum(input)={float(s['kt_mask'].sum()):.0f}/{s['kt_mask'].numel()}  "
         f"target_mask sum={float(s['target_mask'].sum()):.0f}/{s['target_mask'].numel()}"
     )
+
+    # One collated batch via the same collate the trainer uses.
+    from dataloader.luoyang_zarr import collate_batched
+    bs = min(2, n_ds) if n_ds > 0 else 1
+    loader = DataLoader(ds, batch_size=bs, shuffle=False, collate_fn=collate_batched, num_workers=0)
+    batch = next(iter(loader))
+    print("DATALOADER (first batch):")
+    for k in ("pv", "kt", "kt_mask", "p_cs", "target_pv", "target_mask",
+              "target_p_cs", "skimg_tensor", "skimg_timefeats", "nwp_tensor"):
+        v = batch.get(k)
+        if v is None:
+            print(f"  {k}: None")
+        else:
+            print(f"  {k}: shape={tuple(v.shape)} dtype={v.dtype}")
     print("smoke OK")
     return 0
 
