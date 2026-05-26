@@ -317,8 +317,8 @@ def main() -> None:
             _prepare_sky_for_vit(d, zero_sky=zero_sky)
 
             with autocast_ctx:
-                pv_pred = forward_vit(model, d)
-            pv_pred = pv_pred.float()  # [B, T_out]
+                kt_pred = forward_vit(model, d) * 20.0
+            pv_pred = (kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)).float()  # [B, T_out]
 
             pred_np = pv_pred.detach().cpu().numpy()
             tgt_np = d["target_pv"].detach().cpu().numpy()
