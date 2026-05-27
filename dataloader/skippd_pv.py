@@ -30,8 +30,8 @@ Everything else — Folsom-style 60/10/30 row split, random train anchors per ep
 strided val/test anchors, Ineichen clear-sky model, sky-Zarr nearest-frame stacking
 with the same ``_sky_anchor_max_lag`` / 90s tolerance, ``kt = pv_norm / (p_cs + eps) *
 kt_mask``, ``kt_mask = (p_cs > 0.1)``, ``p_mean = 1.0`` (literal mirror of Folsom),
-``dev_idx = 700``, time features via ``compute_solar_features`` / encoders — is a
-direct mirror.
+``dev_idx = 800`` (distinct slot from luoyang 0-625 and Folsom 700), time features
+via ``compute_solar_features`` / encoders — is a direct mirror.
 
 Sky-Zarr helpers (``_folsom_*``) are imported from :mod:`dataloader.folsom` to avoid
 code duplication; the instance methods that wrap them (``_stack_sky_from_zarr``,
@@ -355,8 +355,10 @@ class SkippdPvDataset(Dataset):
             )
         self._sky_format = sky_fmt
 
-        # API parity with PVDataset / FolsomIrradianceDataset.
-        self.devDn_list = [0]
+        # API parity with PVDataset / FolsomIrradianceDataset. SKIPP'd is assigned
+        # device-id 800 in the shared nn.Embedding(1000) table (luoyang uses 0-625,
+        # Folsom uses 700; 800 keeps SKIPP'd cleanly separated from both).
+        self.devDn_list = [800]
 
         # CSV: glob ``pv_dir`` for *.csv (PVDataset convention); SKIPP'd expects exactly one.
         self.sample_files = list_csv_files(data_dir=pv_dir)
@@ -761,9 +763,10 @@ class SkippdPvDataset(Dataset):
 
         input_timestamps_utc = [str(pd.Timestamp(t)) for t in timestamps]
         forecast_timestamps_utc = [str(pd.Timestamp(t)) for t in forecast_timestamps]
-        # ``dev_idx = 700`` literally mirrors Folsom (arbitrary slot inside the
-        # model's ``nn.Embedding(1000)`` device-id table; SKIPP'd is single-sensor).
-        dev_idx = torch.tensor(700, dtype=torch.long)
+        # SKIPP'd is single-sensor and gets its own slot (800) in the model's
+        # ``nn.Embedding(1000)`` device-id table — distinct from luoyang's 0-625
+        # range and Folsom's 700, so embeddings don't collide across datasets.
+        dev_idx = torch.tensor(800, dtype=torch.long)
 
         # PV input / target in normalized space (analog of Folsom's ghi / 1100).
         pv_tensor = torch.from_numpy(pv_norm_x.astype(np.float32)).unsqueeze(0)

@@ -111,3 +111,6 @@ runs/
 # NFS silly-rename stubs (created when a file is deleted while still open)
 .nfs*
 **/.nfs*
+
+# Cursor IDE local settings / skills
+.cursor/
