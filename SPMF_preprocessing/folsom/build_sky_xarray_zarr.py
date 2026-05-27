@@ -197,14 +197,11 @@ def main() -> int:
 
     time_coord = pd.DatetimeIndex(times).astype("datetime64[ns]")
     solar_features = compute_solar_features(time_coord, latitude, longitude)
-    local_solar_time = np.asarray(
-        [pd.Timestamp(row["local_solar_time"]).to_datetime64() for row in solar_features],
-        dtype="datetime64[ns]",
-    )
-    azimuth = np.asarray([row["azimuth"] for row in solar_features], dtype=np.float32)
-    zenith = np.asarray([row["zenith"] for row in solar_features], dtype=np.float32)
-    day_of_year = np.asarray([row["day_of_year"] for row in solar_features], dtype=np.int16)
-    hour_of_day = np.asarray([row["hour_of_day"] for row in solar_features], dtype=np.float32)
+    local_solar_time = np.asarray(solar_features["local_solar_time"], dtype="datetime64[ns]")
+    azimuth = np.asarray(solar_features["azimuth"], dtype=np.float32)
+    zenith = np.asarray(solar_features["zenith"], dtype=np.float32)
+    day_of_year = np.asarray(solar_features["day_of_year"], dtype=np.int16)
+    hour_of_day = np.asarray(solar_features["hour_of_day"], dtype=np.float32)
 
     compressor = _build_compressor(args.compressor, args.clevel)
     one_d_chunk = min(n_total, 1 << 16)
