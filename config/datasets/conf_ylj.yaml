@@ -1,0 +1,24 @@
+# YLJ parquet dataset (single site, pre-augmented rows).
+
+site:
+  name: YLJ
+  latitude: 29.94
+  longitude: 100.62
+
+paths:
+  data_dir: "/dev/shm/ylj_dataset"
+  ylj_train_val_parquet: "ds_v322_2024_with_kt_example.parquet"
+  ylj_test_parquet: "ds_v322_2025_with_kt.parquet"
+  sat_path: "yalongjiang_500km"
+
+sampling:
+  pv_input_len: 576
+  pv_output_len: 192
+  train_time_fraction: 0.80
+  val_time_fraction: 0.20
+  train_epoch_len: 20000
+  nwp_ssrd_col: ssrd_100_6_29_9_predict
+  nwp_t2m_col: t2m_100_6_29_9_predict
+  satimg_window_size: 24
+  satimg_time_resolution_min: 10
+  satimg_npy_shape_hwc: [100, 100, 3]

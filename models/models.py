@@ -619,15 +619,22 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         KV_hist_mem_compressed = KV_hist_mem_compressed + corase_queries + self.pv_mod_embed
 
         # Forecast queries
-        ssrd_normalized = (nwp_tensor[:,:,0]/1000 - 0.5)*2
-        # msl_normalized = (nwp_tensor[:,:,1]-101325)/1000
-        t2m_normalized = (nwp_tensor[:,:,2]-288.15)/10
+        if nwp_tensor is not None and nwp_tensor.max() != 0:
+            ssrd_normalized = (nwp_tensor[:,:,0]/1000 - 0.5)*2
+            # msl_normalized = (nwp_tensor[:,:,1]-101325)/1000
+            t2m_normalized = (nwp_tensor[:,:,2]-288.15)/10
+        else:
+            ssrd_normalized = torch.zeros(forecast_timefeats.shape[0], forecast_timefeats.shape[1], device=pv.device, dtype=pv.dtype)
+            t2m_normalized = torch.zeros(forecast_timefeats.shape[0], forecast_timefeats.shape[1], device=pv.device, dtype=pv.dtype)
+
         forecast_ssrd_timefeats = torch.cat([forecast_timefeats, ssrd_normalized.unsqueeze(2), t2m_normalized.unsqueeze(2)], dim=2)
         forecast_query = self.query_mlp(forecast_ssrd_timefeats)
 
         # satellite images encoder
         B, T_out, _ = forecast_query.shape
         pv_mask = torch.ones(B, 48, device=pv.device, dtype=pv.dtype)
+        # pv_mask = torch.zeros(B, 48, device=pv.device, dtype=pv.dtype)
+
 
         if sat_tensor is None or sat_tensor.max() == 0:
             sat_compressed = torch.zeros(B, 48, 64, device=pv.device, dtype=pv.dtype) + self.sat_mod_embed
