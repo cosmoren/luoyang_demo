@@ -123,11 +123,13 @@ _FOLSOM_TRAIN_GHI_DAYTIME_THRESHOLD = 10.0
 
 # GHI scaling factor used ONLY for ``p_cs = clearsky_ghi / _FOLSOM_GHI_SCALE`` (mirrors
 # Luoyang's ``poa_global / 1000`` recipe in
-# ``SPMF_preprocessing/luoyang/aggregate_by_devdn_solarfeats.py``). The raw GHI signal
-# (``pv`` / ``target_pv`` / numerator of ``kt``) is NOT divided by this constant; the
-# normalization role on the active signal is played by ``self._p_mean_scalar`` (raw GHI
-# mean over the full CSV), matching Luoyang's ``kt = active_power / (p_cs * p_mean + eps)``.
-_FOLSOM_GHI_SCALE = 1100.0
+# ``SPMF_preprocessing/luoyang/aggregate_by_devdn_solarfeats.py``). 1000 W/m^2 is the
+# standard "1 sun" reference irradiance (STC), so ``p_cs`` is dimensionless and ~1.0 at
+# a perfectly clear noon. The raw GHI signal (``pv`` / ``target_pv`` / numerator of
+# ``kt``) is NOT divided by this constant; ``p_mean`` is held at 1.0 (see ``__init__``),
+# so ``kt = ghi_raw / (p_cs + eps) * kt_mask`` is in W/m^2-ish units and the ViT input
+# rescale is handled trainer-side (``kt / 4000`` and ``* 4000``).
+_FOLSOM_GHI_SCALE = 1000.0
 # Daytime guard: matches Luoyang's preprocessing ``kt_mask = (p_cs > 0.1)`` rule. Anchors
 # where ``p_cs <= 0.1`` (nighttime / very low sun) get ``kt = 0`` via the mask product.
 _FOLSOM_KT_DAYTIME_THRESHOLD = 0.1
@@ -688,19 +690,13 @@ class FolsomIrradianceDataset(Dataset):
         if self._n < 1:
             raise RuntimeError(f"{self._csv_path.name}: expected at least one data row")
 
-        # Luoyang-parity ``p_mean``: scalar mean of the raw GHI column over ALL CSV rows
-        # (no day/night filtering, no split filtering). Mirrors
-        # ``SPMF_preprocessing/luoyang/aggregate_by_devdn_solarfeats.py``'s
-        # ``p_mean = float(active_power_arr.mean())``. The reconstruction
-        # ``pv = kt * p_cs * p_mean`` then recovers raw GHI in W/m^2, and ``kt`` lands
-        # in roughly Luoyang's natural [0, ~6] range instead of [0, ~1.2].
-        _ghi_full_for_pmean = self._df[self._ghi_dni_dhi_cols[0]].to_numpy(dtype=np.float64, copy=False)
-        _ghi_full_for_pmean = np.where(np.isfinite(_ghi_full_for_pmean), _ghi_full_for_pmean, 0.0)
-        self._p_mean_scalar = float(_ghi_full_for_pmean.mean())
-        _folsom_progress(
-            f"p_mean (raw GHI mean over full CSV, nights included): "
-            f"{self._p_mean_scalar:.4f} W/m^2 over {self._n:,} rows"
-        )
+        # ``p_mean`` is held at 1.0 for Folsom (single GHI sensor; the reconstruction
+        # ``pv_pred = kt_pred * target_p_cs * p_mean`` therefore reduces to
+        # ``pv_pred = kt_pred * target_p_cs``). Other normalization choices (raw-GHI mean,
+        # capacity, daytime-only mean) are intentionally NOT used here yet -- this is the
+        # first surgical step in a wider Folsom-vs-Luoyang alignment pass; the kt-input
+        # rescale and loss-space changes are tracked separately.
+        self._p_mean_scalar = 1.0
 
         # Precompute normalized clear-sky GHI per CSV row once (1.5M rows for Folsom is fast
         # in pvlib). ``_build_tensors`` slices into this array for both the input window and
@@ -1156,12 +1152,13 @@ class FolsomIrradianceDataset(Dataset):
         ghi, dni, dhi = x_stack[0], x_stack[1], x_stack[2]
         tg, td, th = y_stack[0], y_stack[1], y_stack[2]
 
-        # Clear-sky / kt fields (Luoyang-parity: see ``dataloader/luoyang_zarr.py::_build_sample``
-        # and ``SPMF_preprocessing/luoyang/aggregate_by_devdn_solarfeats.py``). ``p_cs`` is still
-        # the normalized clear-sky GHI ``clearsky_ghi / _FOLSOM_GHI_SCALE``; ``p_mean`` is the raw
-        # GHI mean computed once in ``__init__``. ``kt`` mirrors Luoyang exactly:
-        # ``kt = ghi_raw / (p_cs * p_mean + eps) * kt_mask``, so the reconstruction
-        # ``pv = kt * p_cs * p_mean`` recovers raw GHI in W/m^2.
+        # Clear-sky / kt fields. ``p_cs`` is the normalized clear-sky GHI
+        # ``clearsky_ghi / _FOLSOM_GHI_SCALE``; ``p_mean`` is held at 1.0 (see ``__init__``)
+        # so ``kt = ghi_raw / (p_cs + eps) * kt_mask`` and the reconstruction
+        # ``pv_pred = kt_pred * target_p_cs * p_mean`` reduces to
+        # ``pv_pred = kt_pred * target_p_cs``. Note: ``ghi_raw`` is in W/m^2, so ``kt`` here
+        # is unbounded (~up to a few thousand) until the kt-input rescale is added in a
+        # follow-up change.
         p_cs_x = self._p_cs_full[x_idx]
         p_cs_y = self._p_cs_full[y_idx]
         kt_mask_np = (p_cs_x > _FOLSOM_KT_DAYTIME_THRESHOLD).astype(np.float32)

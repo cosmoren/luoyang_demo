@@ -161,11 +161,15 @@ def _prepare_sky_for_vit(d: dict, *, zero_sky: bool) -> dict:
 
 def forward_vit(model: nn.Module, d: dict) -> torch.Tensor:
     """Mirrors ``training/train_vit_test.py::forward_vit``: the ViT is fed normalized
-    ``kt`` (clear-sky index / 20.0) and the daytime ``kt_mask``; the caller scales the
-    output back to ``kt`` and multiplies by ``target_p_cs * p_mean`` to recover ``pv``."""
+    ``kt`` (clear-sky index / 4000.0) and the daytime ``kt_mask``; the caller scales the
+    output back to ``kt`` and multiplies by ``target_p_cs * p_mean`` to recover ``pv``.
+    Folsom's divisor is 4000 (vs Luoyang's 20) because Folsom kt is in W/m^2-ish units
+    (numerator is raw GHI ~1100 W/m^2, denominator is dimensionless ``p_cs``) so empirical
+    kt p99 ~= 1434 / max ~= 2630; ``/4000`` lands the ViT input at p99 ~= 0.36 and max ~=
+    0.66, matching Luoyang's headroom (Luoyang p99/20 = 0.38, max/20 = 0.60)."""
     return model(
         d["device_id"],
-        d["kt"] / 20.0,
+        d["kt"] / 4000.0,
         pv_mask=d["kt_mask"],
         pv_timefeats=d["pv_timefeats"],
         forecast_timefeats=d["forecast_timefeats"],
@@ -235,7 +239,7 @@ def train_one_epoch(
         _prepare_sky_for_vit(d, zero_sky=zero_sky)
         B = d["device_id"].size(0)
         optimizer.zero_grad()
-        kt_pred = forward_vit(model, d) * 20.0
+        kt_pred = forward_vit(model, d) * 4000.0
         pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
         t_out = int(pv_pred.shape[1])
         assert d["target_pv"].shape[1] == t_out, (pv_pred.shape, d["target_pv"].shape)
@@ -285,7 +289,7 @@ def evaluate(
             d = _batch_to_device(batch, device)
             _prepare_nwp_for_vit(d, use_nwp=use_nwp)
             _prepare_sky_for_vit(d, zero_sky=zero_sky)
-            kt_pred = forward_vit(model, d) * 20.0
+            kt_pred = forward_vit(model, d) * 4000.0
             pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
             t_out = int(pv_pred.shape[1])
             h = min(_LOSS_METRIC_HORIZON, t_out)
@@ -601,7 +605,11 @@ def main() -> None:
         warmup_epochs=args.warmup_epochs,
         lr_min=args.lr_min,
     )
-    criterion = nn.HuberLoss(delta=1.0)
+    # delta is sized to Folsom's W/m^2 residual scale (Luoyang uses delta=1 kW
+    # ~= 3% of 33 kW peak; Folsom analog is 3% of 1100 W/m^2 peak ~= 33 W/m^2,
+    # rounded to 30). Keeps the Huber MSE region active for "good" predictions
+    # and the MAE region for outliers, matching Luoyang's effective behavior.
+    criterion = nn.HuberLoss(delta=30.0)
     ema: ModelEMA | None = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
     print(
         f"EMA: {'enabled' if args.use_ema else 'disabled'}"
