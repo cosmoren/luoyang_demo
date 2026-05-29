@@ -49,9 +49,9 @@ ylj_raw_parquet:
   fut_len: 192 # length of observe_power_future per row
   native_interval_min: 15 # minutes per native index; X/Y strides must be multiples of this
   naive_tz: "Asia/Shanghai" # timestamp_win is naive local; converted to UTC for solar features
-  train_parquet: "ds_v322_2024.parquet"
+  train_parquet: "synthetic_real.parquet" #"ds_v322_2024.parquet"
   test_parquet: "ds_v322_1219_2025_1-12.parquet"
-  solar_features_csv: "solar_features_ylj_2024_2025_15min.csv" # china_local_time join; missing -> solar mask 0
+  solar_features_csv: "solar_features_ylj_2017_2025_15min.csv" # "solar_features_ylj_2024_2025_15min.csv" # china_local_time join; missing -> solar mask 0
 
 # Hyperparameters for training/train.py (CLI flags override these when passed)
 training:
@@ -61,7 +61,7 @@ training:
   pv_input_len: 192
   t_off_min: 15 # single-horizon forecast offset (minutes)
   pv_output_interval_min: 15 # multiple of 5 or csv_interval_min
-  pv_output_len: 192 # 16 hours
+  pv_output_len: 16 # 16 hours
   pv_output_rand: false #true # when pv_output_len>1: true=random sparse samples, false=deterministic interval grid
   # Chronological split per CSV: first N rows = train, rest = test; N = int(n_rows * fraction)
   pv_train_time_fraction: 0.7
@@ -78,7 +78,7 @@ training:
   satimg_time_resolution_min: 10 # multiple of 10
   satimg_npy_shape_hwc: [100, 100, 3] # expected np.load array layout (height, width, channels)
   # Optimization and training loop
-  epochs: 5
+  epochs: 10
   lr: 5e-4
   batch_size: 64 # 32
   save_every: 1

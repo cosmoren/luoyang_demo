@@ -106,10 +106,10 @@ def load_satellite_from_zarr(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Himawari Zarr slice aligned to Luoyang: ``[time0 - 275min, time0 - 30min]`` UTC,
-    pad/trim to 24 frames, solar timefeats without DOY when ``include_doy=False``.
+    pad/trim to 24 frames; solar timefeats ``[T, 9]`` (DOY included, Luoyang-aligned).
 
     Returns:
-        ``sat_tensor`` ``[T=24, C=3, H, W]``, ``sat_timefeats`` ``[T=24, F]`` (F=7 for YLJ).
+        ``sat_tensor`` ``[T=24, C=3, H, W]``, ``sat_timefeats`` ``[T=24, F=9]``.
     """
     t0 = pd.Timestamp(time0_utc)
     if t0.tzinfo is None:
@@ -263,9 +263,9 @@ def _build_solar_timefeats(
     ts_utc: list[pd.Timestamp],
     t0_utc_naive: pd.Timestamp,
 ) -> torch.Tensor:
-    """``[T, 7]`` = masked solar encoder (6) + ``delta_time_encoder`` (1)."""
+    """``[T, 9]`` = masked solar encoder (8, with DOY) + ``delta_time_encoder`` (1)."""
     feats, solar_mask = _solar_features_for_local_times(solar_map, ts_local)
-    enc = solar_features_encoder(feats, include_doy=False)
+    enc = solar_features_encoder(feats, include_doy=True)
     m = torch.from_numpy(solar_mask).to(dtype=enc.dtype).unsqueeze(-1)
     enc = enc * m
     dt = delta_time_encoder(ts_utc, t0_utc_naive)
@@ -518,7 +518,7 @@ class YljRawParquetDataset(Dataset):
         sat_timefeats: torch.Tensor | None = None
         if self._use_sat_zarr and self._sat_ds is not None:
             sat_tensor, sat_timefeats = load_satellite_from_zarr(
-                self._sat_ds, t_win_utc, include_doy=False
+                self._sat_ds, t_win_utc, include_doy=True
             )
 
         nwp_tensor: torch.Tensor | None = None

@@ -357,6 +357,16 @@ class pv_forecasting_model_vit(nn.Module):
         return pv.squeeze(-1)
 
 
+# Luoyang ``vit_imgs``: dataloader emits [T, 9] solar+dt; model uses sin/cos zenith + dt only.
+_PV_SOLAR_FEAT_IDX = (2, 3, 8)
+
+
+def _slice_luoyang_pv_solar_timefeats(feats: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if feats is None:
+        return None
+    return feats[:, :, _PV_SOLAR_FEAT_IDX]
+
+
 # Using PV history and NWP to forecast PV, solar features and NWP features are used as query
 class pv_forecasting_model_vit_nwp(nn.Module):
     def __init__(self, use_batchnorm: bool = True, dropout: float = 0.0, dev_dn_list: Optional[list] = None):
@@ -369,8 +379,8 @@ class pv_forecasting_model_vit_nwp(nn.Module):
         self.sat_mod_embed = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
 
         self.inverter_embedding = nn.Embedding(num_embeddings=1000, embedding_dim=16)
-        # YLJ only: TCN 2+7=9; query MLP 7+3=10 (full T=192 PV keys, no coarse compression)
-        self._pv_timefeat_dim = 7
+        # YLJ / Luoyang yr: TCN 2+3=5 (kt, mask, sin_ze, cos_ze, dt); query MLP 3+3=6
+        self._pv_timefeat_dim = 3
         self.TCN = TemporalCNN1d(in_channels=2 + self._pv_timefeat_dim, out_channels=64, use_batchnorm=use_batchnorm, dropout=dropout)
         self.query_mlp = MLP(in_dim=self._pv_timefeat_dim + 3, hidden_dims=(64, 64), out_dim=64, dropout=0.0)
         self.cross_attention_pv = CrossAttention(query_dim=64, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
@@ -413,21 +423,9 @@ class pv_forecasting_model_vit_nwp(nn.Module):
                 nwp_tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
         
         pv_masked = pv * pv_mask.to(pv.dtype)
-        if pv_timefeats is not None and pv_timefeats.shape[-1] != self._pv_timefeat_dim:
-            c = pv_timefeats.shape[-1]
-            if c > self._pv_timefeat_dim:
-                pv_timefeats = pv_timefeats[..., : self._pv_timefeat_dim]
-            else:
-                pv_timefeats = torch.nn.functional.pad(pv_timefeats, (0, self._pv_timefeat_dim - c))
-        if forecast_timefeats is not None and forecast_timefeats.shape[-1] != self._pv_timefeat_dim:
-            c = forecast_timefeats.shape[-1]
-            if c > self._pv_timefeat_dim:
-                forecast_timefeats = forecast_timefeats[..., : self._pv_timefeat_dim]
-            else:
-                forecast_timefeats = torch.nn.functional.pad(
-                    forecast_timefeats, (0, self._pv_timefeat_dim - c)
-                )
-        pv_history = torch.cat([pv_masked, pv_mask, pv_timefeats.permute(0, 2, 1)], dim=1)  # [B, C=9, T] for YLJ
+        pv_timefeats = _slice_luoyang_pv_solar_timefeats(pv_timefeats)
+        forecast_timefeats = _slice_luoyang_pv_solar_timefeats(forecast_timefeats)
+        pv_history = torch.cat([pv_masked, pv_mask, pv_timefeats.permute(0, 2, 1)], dim=1)  # [B, C=5, T]
         pv_hist_mem = self.TCN(pv_history, pv_mask)
         KV_hist_mem = pv_hist_mem.permute(0, 2, 1)  # [B, T=192, 64]
 
@@ -461,6 +459,7 @@ class pv_forecasting_model_vit_nwp(nn.Module):
             B_sat, T_sat, C_sat, H_sat, W_sat = sat_tensor.shape
             if C_sat != 3:
                 raise ValueError(f"sat_tensor expected 3 channels, got {C_sat}")
+            sat_timefeats = _slice_luoyang_pv_solar_timefeats(sat_timefeats)
             sat_hr = F.interpolate(
                 sat_tensor.reshape(B_sat * T_sat, C_sat, H_sat, W_sat),
                 size=(112, 112),

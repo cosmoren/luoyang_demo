@@ -235,7 +235,7 @@ def _export_parquet_test_sequence_pairs_csv(
     loader: DataLoader,
     out_path: Path,
 ) -> int:
-    """YLJ Parquet test export: ``collectTime`` = anchor UTC; ``gt_pred_pairs`` = ``[[gt_kw, pred_kw], ...]``."""
+    """YLJ Parquet test export: ``collectTime`` = anchor UTC; ``gt_pred_pairs`` = ``[[gt_kw, pred_kw, kt_pred], ...]``."""
     model.eval()
     ds = loader.dataset
     if not isinstance(ds, YljRawParquetDataset):
@@ -252,14 +252,16 @@ def _export_parquet_test_sequence_pairs_csv(
                     "Parquet test export requires csv_collect_time_utc on each batch; "
                     "ensure collate_ylj_batched is used and YljRawParquetDataset is current."
                 )
-            _, pv_pred_t = _ylj_forward_kt(model, batch, device)
+            kt_pred_t, pv_pred_t = _ylj_forward_kt(model, batch, device)
+            kt_np = kt_pred_t.detach().cpu().float().numpy()
             pred_np = pv_pred_t.detach().cpu().float().numpy()
             gt_np = batch["target_pv"].detach().cpu().float().numpy() * pv_scale
             collect_list = batch["csv_collect_time_utc"]
             B = int(pred_np.shape[0])
             for i in range(B):
                 pairs = [
-                    [float(gt_np[i, k]), float(pred_np[i, k])] for k in range(pred_np.shape[1])
+                    [float(gt_np[i, k]), float(pred_np[i, k]), float(kt_np[i, k])]
+                    for k in range(pred_np.shape[1])
                 ]
                 rows.append(
                     {
@@ -287,7 +289,7 @@ def _export_test_sequence_pairs_csv(
     loader: DataLoader,
     out_path: Path,
 ) -> int:
-    """YLJ test export: one row per anchor; each horizon step is ``[gt_kw, pred_kw]``."""
+    """YLJ test export: one row per anchor; each horizon step is ``[gt_kw, pred_kw, kt_pred]``."""
     ds = loader.dataset
     if isinstance(ds, YljRawParquetDataset):
         return _export_parquet_test_sequence_pairs_csv(model, device, loader, out_path)

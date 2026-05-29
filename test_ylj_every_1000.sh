@@ -3,12 +3,12 @@ set -euo pipefail
 
 ROOT="/data/luoyang_demo_0521"
 CFG="$ROOT/config/datasets/conf_ylj.yaml"
-CKPT_DIR="$ROOT/checkpoints_ylj_48h_48h_nwp_sat_kt_raw_parquet"
+CKPT_DIR="$ROOT/checkpoints_ylj_48h_4h_nwp_kt_raw_parquet_synthetic_real"
 OUT_DIR="$CKPT_DIR/test_csvs_every10_seqpairs"
 
 mkdir -p "$OUT_DIR"
 
-for epoch in $(seq 2 1 20); do
+for epoch in $(seq 2 1 10); do
   CKPT="$CKPT_DIR/pv_forecast_epoch_${epoch}.pt"
   if [[ ! -f "$CKPT" ]]; then
     echo "[skip] missing checkpoint: $CKPT"
@@ -22,7 +22,6 @@ for epoch in $(seq 2 1 20); do
     --config "$CFG" \
     --ylj_raw_parquet \
     --ylj_parquet_nwp \
-    --ylj_sat_zarr \
     --test_only \
     --checkpoint_dir "$CKPT_DIR" \
     --test_only_ckpt "$CKPT" \

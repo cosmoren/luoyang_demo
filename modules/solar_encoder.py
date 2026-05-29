@@ -119,7 +119,7 @@ def solar_features_encoder(
         day_of_year = np.asarray(solar_features["day_of_year"], dtype=np.float32)
         doy_rad = (2.0 * np.pi / 366.0) * day_of_year
         base.extend([np.sin(doy_rad), np.cos(doy_rad)])
-    # else: YLJ — no sin/cos DOY (see ``dataloader/ylj_zarr.py`` ``include_doy=False``).
+    # YLJ dataloader uses include_doy=True ([T, 9]); model slices [2, 3, 8] like Luoyang vit_imgs.
 
     base.extend([np.sin(hod_rad), np.cos(hod_rad)])
     feats = np.stack(base, axis=-1).astype(np.float32, copy=False)
