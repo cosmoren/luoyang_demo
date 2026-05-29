@@ -121,10 +121,12 @@ _DEFAULT_FOLSOM_TRAIN_EPOCH_LEN = 50_000
 # avoid sampling all-night windows where target_pv is uniformly 0.
 _FOLSOM_TRAIN_GHI_DAYTIME_THRESHOLD = 10.0
 
-# GHI scaling factor used for both ``target_pv`` and ``p_cs`` so that
-# ``pv_pred = kt_pred * target_p_cs * p_mean`` lives in the same normalized space as
-# ``target_pv = ghi / _FOLSOM_GHI_SCALE`` (mirrors Luoyang's ``poa_global / 1000`` recipe
-# in ``SPMF_preprocessing/luoyang/aggregate_by_devdn_solarfeats.py``).
+# GHI scaling factor used ONLY for ``p_cs = clearsky_ghi / _FOLSOM_GHI_SCALE`` (mirrors
+# Luoyang's ``poa_global / 1000`` recipe in
+# ``SPMF_preprocessing/luoyang/aggregate_by_devdn_solarfeats.py``). The raw GHI signal
+# (``pv`` / ``target_pv`` / numerator of ``kt``) is NOT divided by this constant; the
+# normalization role on the active signal is played by ``self._p_mean_scalar`` (raw GHI
+# mean over the full CSV), matching Luoyang's ``kt = active_power / (p_cs * p_mean + eps)``.
 _FOLSOM_GHI_SCALE = 1100.0
 # Daytime guard: matches Luoyang's preprocessing ``kt_mask = (p_cs > 0.1)`` rule. Anchors
 # where ``p_cs <= 0.1`` (nighttime / very low sun) get ``kt = 0`` via the mask product.
@@ -686,6 +688,20 @@ class FolsomIrradianceDataset(Dataset):
         if self._n < 1:
             raise RuntimeError(f"{self._csv_path.name}: expected at least one data row")
 
+        # Luoyang-parity ``p_mean``: scalar mean of the raw GHI column over ALL CSV rows
+        # (no day/night filtering, no split filtering). Mirrors
+        # ``SPMF_preprocessing/luoyang/aggregate_by_devdn_solarfeats.py``'s
+        # ``p_mean = float(active_power_arr.mean())``. The reconstruction
+        # ``pv = kt * p_cs * p_mean`` then recovers raw GHI in W/m^2, and ``kt`` lands
+        # in roughly Luoyang's natural [0, ~6] range instead of [0, ~1.2].
+        _ghi_full_for_pmean = self._df[self._ghi_dni_dhi_cols[0]].to_numpy(dtype=np.float64, copy=False)
+        _ghi_full_for_pmean = np.where(np.isfinite(_ghi_full_for_pmean), _ghi_full_for_pmean, 0.0)
+        self._p_mean_scalar = float(_ghi_full_for_pmean.mean())
+        _folsom_progress(
+            f"p_mean (raw GHI mean over full CSV, nights included): "
+            f"{self._p_mean_scalar:.4f} W/m^2 over {self._n:,} rows"
+        )
+
         # Precompute normalized clear-sky GHI per CSV row once (1.5M rows for Folsom is fast
         # in pvlib). ``_build_tensors`` slices into this array for both the input window and
         # the forecast window (both are integer CSV row offsets from the anchor), so no
@@ -1141,18 +1157,20 @@ class FolsomIrradianceDataset(Dataset):
         tg, td, th = y_stack[0], y_stack[1], y_stack[2]
 
         # Clear-sky / kt fields (Luoyang-parity: see ``dataloader/luoyang_zarr.py::_build_sample``
-        # and ``SPMF_preprocessing/luoyang/aggregate_by_devdn_solarfeats.py``). Folsom is a
-        # single GHI sensor, so ``p_mean = 1.0`` and ``p_cs = clearsky_ghi / _FOLSOM_GHI_SCALE``.
+        # and ``SPMF_preprocessing/luoyang/aggregate_by_devdn_solarfeats.py``). ``p_cs`` is still
+        # the normalized clear-sky GHI ``clearsky_ghi / _FOLSOM_GHI_SCALE``; ``p_mean`` is the raw
+        # GHI mean computed once in ``__init__``. ``kt`` mirrors Luoyang exactly:
+        # ``kt = ghi_raw / (p_cs * p_mean + eps) * kt_mask``, so the reconstruction
+        # ``pv = kt * p_cs * p_mean`` recovers raw GHI in W/m^2.
         p_cs_x = self._p_cs_full[x_idx]
         p_cs_y = self._p_cs_full[y_idx]
         kt_mask_np = (p_cs_x > _FOLSOM_KT_DAYTIME_THRESHOLD).astype(np.float32)
-        ghi_norm = ghi / _FOLSOM_GHI_SCALE
-        kt_np = (ghi_norm / (p_cs_x + _FOLSOM_KT_EPS)) * kt_mask_np
+        kt_np = (ghi / (p_cs_x * self._p_mean_scalar + _FOLSOM_KT_EPS)) * kt_mask_np
         kt = torch.from_numpy(kt_np.astype(np.float32)).unsqueeze(0)
         kt_mask = torch.from_numpy(kt_mask_np).unsqueeze(0)
         p_cs = torch.from_numpy(p_cs_x.astype(np.float32)).unsqueeze(0)
         target_p_cs = torch.from_numpy(p_cs_y.astype(np.float32))
-        p_mean = torch.tensor(1.0, dtype=torch.float32)
+        p_mean = torch.tensor(self._p_mean_scalar, dtype=torch.float32)
 
         x_times = sub_x[self._time_col]
         if bool(x_times.isna().any()):
@@ -1204,8 +1222,12 @@ class FolsomIrradianceDataset(Dataset):
         dev_idx = torch.tensor(700, dtype=torch.long)
 
         # Match PVDataset: pv is [1, T_in] (sensor/dev dim leading), target_pv is [T_out].
-        pv_tensor = torch.from_numpy((ghi / _FOLSOM_GHI_SCALE).astype(np.float32)).unsqueeze(0)
-        target_pv_tensor = torch.from_numpy((tg / _FOLSOM_GHI_SCALE).astype(np.float32))
+        # Luoyang-parity: pv / target_pv are the RAW signal (W/m^2 for Folsom GHI). The
+        # normalization role is played by ``p_mean`` inside the ``kt`` denominator, not by
+        # dividing the signal here. Reconstruction ``pv = kt * p_cs * p_mean`` then recovers
+        # raw GHI in W/m^2, and the loss ``criterion(pv_pred, target_pv)`` is in raw W/m^2.
+        pv_tensor = torch.from_numpy(ghi.astype(np.float32)).unsqueeze(0)
+        target_pv_tensor = torch.from_numpy(tg.astype(np.float32))
         return {
             "dev_idx": dev_idx,
             "pv": pv_tensor,

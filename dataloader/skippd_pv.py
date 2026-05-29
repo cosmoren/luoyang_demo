@@ -9,14 +9,14 @@ This module is a near-1:1 port of :class:`dataloader.folsom.FolsomIrradianceData
   fixed names.
 * Site lat/lon: read from the dataset YAML's ``site.{latitude, longitude}`` (with a
   hardcoded Stanford rooftop fallback) — SKIPP'd has no ``<data_dir>/info.yaml``.
-* PV normalization: ``pv_norm = pv_kW / _SKIPPD_PV_SCALE`` with ``_SKIPPD_PV_SCALE = 30``
-  kW (analog of Folsom's ``_FOLSOM_GHI_SCALE = 1100`` W/m²).
-* Clear-sky scale: ``p_cs = clearsky_ghi / _SKIPPD_CS_GHI_SCALE`` with
-  ``_SKIPPD_CS_GHI_SCALE = 1000`` W/m². The PV scale (30 kW) and clear-sky GHI scale
-  (1000 W/m²) MUST decouple because PV is in kW and GHI is in W/m² — the user's
-  trainer-side "1100 → 30" substitution applies only to the PV normalization, not the
-  clear-sky scale (see the head-of-file note in
-  ``training/train_vit_test_skippd.py`` for the trainer-side math).
+* PV signal: raw kW (negatives clipped to 0 in ``__init__``). ``pv`` / ``target_pv``
+  are NOT divided by a capacity constant any more — Luoyang-parity: the normalization
+  role is played by ``p_mean`` (raw-PV-kW mean over the full CSV) inside the ``kt``
+  denominator, exactly like Folsom and Luoyang.
+* Clear-sky: POA (plane-of-array) transposition, mirroring Luoyang's
+  ``compute_clearsky_power``: Ineichen GHI/DNI/DHI ->
+  ``pvlib.irradiance.get_total_irradiance(tilt=abs(lat), azimuth=180, albedo=0.2)``
+  -> ``p_cs = poa_global / _SKIPPD_POA_SCALE`` clipped to ``[0, 1.2]``.
 * No NWP merged CSV: ``nwp_tensor`` is emitted as zeros + invalid-mask ones, with the
   same ``[T_out, len(_FOLSOM_NWP_FEATURE_COLS) + 1]`` shape Folsom emits when its NWP
   file is missing. The SKIPP'd trainer never reads it (the trainer drops the
@@ -28,10 +28,11 @@ This module is a near-1:1 port of :class:`dataloader.folsom.FolsomIrradianceData
 
 Everything else — Folsom-style 60/10/30 row split, random train anchors per epoch,
 strided val/test anchors, Ineichen clear-sky model, sky-Zarr nearest-frame stacking
-with the same ``_sky_anchor_max_lag`` / 90s tolerance, ``kt = pv_norm / (p_cs + eps) *
-kt_mask``, ``kt_mask = (p_cs > 0.1)``, ``p_mean = 1.0`` (literal mirror of Folsom),
-``dev_idx = 800`` (distinct slot from luoyang 0-625 and Folsom 700), time features
-via ``compute_solar_features`` / encoders — is a direct mirror.
+with the same ``_sky_anchor_max_lag`` / 90s tolerance,
+``kt = pv_kW / (p_cs * p_mean + eps) * kt_mask`` (Luoyang-parity),
+``kt_mask = (p_cs > 0.1)``, ``dev_idx = 800`` (distinct slot from luoyang 0-625 and
+Folsom 700), time features via ``compute_solar_features`` / encoders — is a direct
+mirror.
 
 Sky-Zarr helpers (``_folsom_*``) are imported from :mod:`dataloader.folsom` to avoid
 code duplication; the instance methods that wrap them (``_stack_sky_from_zarr``,
@@ -109,14 +110,17 @@ _DEFAULT_SKIPPD_TRAIN_EPOCH_LEN = 50_000
 # (i.e. clearsky-daytime). Replaces Folsom's GHI > 10 W/m² filter.
 _SKIPPD_TRAIN_DAYTIME_KT_MASK_THRESHOLD = 0.5
 
-# PV normalization scale (analog of Folsom's _FOLSOM_GHI_SCALE = 1100 W/m²).
-# Used to put pv_kW into the same normalized space as target_pv / pv_pred.
-_SKIPPD_PV_SCALE = 30.0
-# Clear-sky GHI normalization scale (Folsom uses 1100; SKIPP'd uses 1000 — a more
-# standard peak-GHI reference, matching the user's hint "p_cs based on clear-sky
-# GHI / 1000"). Decoupled from _SKIPPD_PV_SCALE because PV (kW) and GHI (W/m²)
-# live in different unit spaces.
-_SKIPPD_CS_GHI_SCALE = 1000.0
+# POA (plane-of-array) parameters for clear-sky transposition. Mirrors Luoyang
+# (``SPMF_preprocessing/luoyang/aggregate_by_devdn_solarfeats.py::compute_clearsky_power``).
+# These are safe defaults for a south-facing fixed array at the site latitude;
+# tweak here if you obtain actual Stanford Huang E4102 panel specs (tilt, azimuth).
+_SKIPPD_POA_TILT_USE_LAT = True        # if True, tilt = abs(site_lat); else use _SKIPPD_POA_TILT_DEG
+_SKIPPD_POA_TILT_DEG = 20.0            # used only if _SKIPPD_POA_TILT_USE_LAT = False
+_SKIPPD_POA_AZIMUTH_DEG = 180.0        # south-facing (northern hemisphere)
+_SKIPPD_POA_ALBEDO = 0.2               # Luoyang default
+# POA normalization scale (replaces the old ``_SKIPPD_CS_GHI_SCALE = 1000``); used
+# only inside ``_compute_skippd_p_cs`` for ``p_cs = poa_global / _SKIPPD_POA_SCALE``.
+_SKIPPD_POA_SCALE = 1000.0
 # Daytime guard (Luoyang/Folsom convention): kt_mask = (p_cs > 0.1).
 _SKIPPD_KT_DAYTIME_THRESHOLD = 0.1
 _SKIPPD_KT_EPS = 1e-6
@@ -139,21 +143,39 @@ def _compute_skippd_p_cs(
     utc_index: pd.DatetimeIndex,
 ) -> np.ndarray:
     """
-    Normalized clear-sky GHI (``clearsky_ghi / _SKIPPD_CS_GHI_SCALE``, clipped to
-    ``[0, 1.2]``).
+    Normalized clear-sky plane-of-array irradiance (``poa_global / _SKIPPD_POA_SCALE``,
+    clipped to ``[0, 1.2]``).
 
-    Direct mirror of :func:`dataloader.folsom._compute_folsom_p_cs`; only the
-    scaling constant differs (Folsom: 1100 W/m²; SKIPP'd: 1000 W/m²). NO POA
-    transposition (Folsom is GHI-only and so is the SKIPP'd port; tilt/azimuth
-    are explicitly NOT used here).
+    Direct mirror of
+    :func:`SPMF_preprocessing.luoyang.aggregate_by_devdn_solarfeats.compute_clearsky_power`:
+    Ineichen clear-sky GHI/DNI/DHI -> ``pvlib.irradiance.get_total_irradiance`` with
+    ``tilt = abs(lat)`` (or ``_SKIPPD_POA_TILT_DEG`` if ``_SKIPPD_POA_TILT_USE_LAT`` is
+    False), south-facing azimuth, albedo 0.2 -> ``poa_global / 1000``. The SKIPP'd
+    active signal is PV power (kW), so a POA model (not raw GHI) is the right
+    clear-sky reference — same recipe Luoyang uses.
     """
     idx = utc_index
     if getattr(idx, "tz", None) is None:
         idx = idx.tz_localize("UTC")
-    loc = pvlib.location.Location(float(lat), float(lon))
+    lat_f = float(lat)
+    lon_f = float(lon)
+    tilt = abs(lat_f) if _SKIPPD_POA_TILT_USE_LAT else float(_SKIPPD_POA_TILT_DEG)
+    azimuth = float(_SKIPPD_POA_AZIMUTH_DEG)
+    solpos = pvlib.solarposition.get_solarposition(idx, lat_f, lon_f)
+    loc = pvlib.location.Location(lat_f, lon_f)
     cs = loc.get_clearsky(idx, model="ineichen")
-    ghi_cs = np.asarray(cs["ghi"].values, dtype=np.float64)
-    p_cs = np.clip(ghi_cs / _SKIPPD_CS_GHI_SCALE, 0.0, 1.2)
+    poa = pvlib.irradiance.get_total_irradiance(
+        surface_tilt=tilt,
+        surface_azimuth=azimuth,
+        solar_zenith=solpos["apparent_zenith"],
+        solar_azimuth=solpos["azimuth"],
+        dni=cs["dni"],
+        ghi=cs["ghi"],
+        dhi=cs["dhi"],
+        albedo=_SKIPPD_POA_ALBEDO,
+    )
+    poa_global = np.asarray(poa["poa_global"].values, dtype=np.float64)
+    p_cs = np.clip(poa_global / _SKIPPD_POA_SCALE, 0.0, 1.2)
     return p_cs.astype(np.float32, copy=False)
 
 
@@ -401,9 +423,43 @@ class SkippdPvDataset(Dataset):
         if self._n < 1:
             raise RuntimeError(f"{self._csv_path.name}: expected at least one data row")
 
-        # Precompute normalized clear-sky GHI per CSV row once. Direct mirror of
-        # Folsom's per-row pvlib (ineichen) precomputation. No POA transposition.
-        _skippd_progress("computing per-row clear-sky GHI via pvlib (ineichen) ...")
+        # Clip negative PV (sensor / inverter idle artefacts) to 0. The clipped
+        # column then feeds EVERY downstream computation: input window slicing,
+        # target slicing, kt numerator, and the p_mean scalar below. Done in
+        # place on ``self._df[self._pv_col]`` so per-anchor ``iloc`` reads
+        # already see the clipped values.
+        _pv_kw_arr = self._df[self._pv_col].to_numpy(dtype=np.float64, copy=False)
+        _pv_finite = np.isfinite(_pv_kw_arr)
+        _pv_neg = _pv_finite & (_pv_kw_arr < 0.0)
+        n_neg = int(_pv_neg.sum())
+        n_total = int(_pv_kw_arr.size)
+        min_pv = float(_pv_kw_arr[_pv_finite].min()) if bool(_pv_finite.any()) else float("nan")
+        _pv_clipped = np.where(_pv_finite, np.maximum(_pv_kw_arr, 0.0), _pv_kw_arr)
+        self._df[self._pv_col] = _pv_clipped.astype(np.float32, copy=False)
+        _skippd_progress(
+            f"negative PV clip: {n_neg:,}/{n_total:,} rows had pv<0 "
+            f"(min was {min_pv:.3f} kW), clipped to 0"
+        )
+
+        # Luoyang-parity ``p_mean``: scalar mean of the raw PV (kW) column over ALL
+        # CSV rows (no day/night filtering, no split filtering, negatives clipped
+        # to 0). Mirrors
+        # ``SPMF_preprocessing/luoyang/aggregate_by_devdn_solarfeats.py``'s
+        # ``p_mean = float(active_power_arr.mean())``. The reconstruction
+        # ``pv = kt * p_cs * p_mean`` then recovers raw PV in kW, and ``kt``
+        # lands in roughly Luoyang's natural [0, ~6] range so the trainer's
+        # ``sigmoid * 1.2 * 20`` head sits in its sweet spot.
+        _pv_full_for_pmean = self._df[self._pv_col].to_numpy(dtype=np.float64, copy=False)
+        _pv_full_for_pmean = np.where(np.isfinite(_pv_full_for_pmean), _pv_full_for_pmean, 0.0)
+        self._p_mean_scalar = float(_pv_full_for_pmean.mean())
+        _skippd_progress(
+            f"p_mean (raw PV kW mean over full CSV, negatives clipped to 0, "
+            f"nights included): {self._p_mean_scalar:.4f} kW over {self._n:,} rows"
+        )
+
+        # Precompute normalized clear-sky POA per CSV row once. Direct mirror of
+        # Luoyang's per-row pvlib (ineichen -> get_total_irradiance) precomputation.
+        _skippd_progress("computing per-row clear-sky POA via pvlib (ineichen -> get_total_irradiance) ...")
         _times_utc = pd.DatetimeIndex(
             pd.to_datetime(self._df[self._time_col].to_numpy(), utc=True)
         )
@@ -706,30 +762,22 @@ class SkippdPvDataset(Dataset):
         valid_out = np.isfinite(pow_y_raw)
         target_mask = torch.from_numpy(valid_out.astype(np.float32))
 
-        # Clear-sky / kt fields. Direct mirror of Folsom's recipe — the only
-        # difference is the normalization constants (Folsom: /1100 for both PV
-        # and clear-sky GHI; SKIPP'd: /30 for PV and /1000 for clear-sky GHI
-        # because PV/GHI live in different unit spaces).
+        # Clear-sky / kt fields (Luoyang-parity: see
+        # ``SPMF_preprocessing/luoyang/aggregate_by_devdn_solarfeats.py``). ``p_cs`` is
+        # the normalized clear-sky POA ``poa_global / _SKIPPD_POA_SCALE``; ``p_mean`` is
+        # the raw PV (kW) mean computed once in ``__init__`` (negatives clipped to 0).
+        # ``kt`` mirrors Luoyang exactly:
+        # ``kt = pv_kW / (p_cs * p_mean + eps) * kt_mask``, so the reconstruction
+        # ``pv = kt * p_cs * p_mean`` recovers raw PV in kW.
         p_cs_x = self._p_cs_full[x_idx]
         p_cs_y = self._p_cs_full[y_idx]
         kt_mask_np = (p_cs_x > _SKIPPD_KT_DAYTIME_THRESHOLD).astype(np.float32)
-        pv_norm_x = pow_x / _SKIPPD_PV_SCALE
-        kt_np = (pv_norm_x / (p_cs_x + _SKIPPD_KT_EPS)) * kt_mask_np
+        kt_np = (pow_x / (p_cs_x * self._p_mean_scalar + _SKIPPD_KT_EPS)) * kt_mask_np
         kt = torch.from_numpy(kt_np.astype(np.float32)).unsqueeze(0)
         kt_mask = torch.from_numpy(kt_mask_np).unsqueeze(0)
         p_cs = torch.from_numpy(p_cs_x.astype(np.float32)).unsqueeze(0)
         target_p_cs = torch.from_numpy(p_cs_y.astype(np.float32))
-        # p_mean is literally Folsom's constant 1.0 (NOT the SKIPP'd rated 30 kW).
-        # Reason: Folsom's trainer reconstruction is
-        #     pv_pred = kt_pred * target_p_cs * p_mean ≈ target_pv
-        # which is an algebraic identity in the normalized space iff p_mean = 1.0.
-        # SKIPP'd target_pv = pv_kW / 30 is also in normalized space, so p_mean
-        # must stay 1.0 for the trainer's pv_pred ≈ target_pv reconstruction to
-        # hold. The user's "use 30 for p_mean" suggestion in the task brief would
-        # require target_pv to be in raw kW, which conflicts with the trainer-side
-        # "1100 → 30" substitution (the trainer multiplies the normalized MAE by
-        # the capacity = 30 kW; that only makes sense when target_pv is /30).
-        p_mean = torch.tensor(1.0, dtype=torch.float32)
+        p_mean = torch.tensor(self._p_mean_scalar, dtype=torch.float32)
 
         x_times = sub_x[self._time_col]
         if bool(x_times.isna().any()):
@@ -768,9 +816,13 @@ class SkippdPvDataset(Dataset):
         # range and Folsom's 700, so embeddings don't collide across datasets.
         dev_idx = torch.tensor(800, dtype=torch.long)
 
-        # PV input / target in normalized space (analog of Folsom's ghi / 1100).
-        pv_tensor = torch.from_numpy(pv_norm_x.astype(np.float32)).unsqueeze(0)
-        target_pv_tensor = torch.from_numpy((pow_y / _SKIPPD_PV_SCALE).astype(np.float32))
+        # Luoyang-parity: pv / target_pv are the RAW signal in kW (negatives already
+        # clipped to 0 in ``__init__``). The normalization role is played by
+        # ``p_mean`` inside the ``kt`` denominator, not by dividing the signal here.
+        # Reconstruction ``pv = kt * p_cs * p_mean`` then recovers raw PV in kW,
+        # and the loss ``criterion(pv_pred, target_pv)`` is in raw kW.
+        pv_tensor = torch.from_numpy(pow_x.astype(np.float32)).unsqueeze(0)
+        target_pv_tensor = torch.from_numpy(pow_y.astype(np.float32))
 
         return {
             "dev_idx": dev_idx,
@@ -904,8 +956,7 @@ __all__ = [
     "build_skippd_pv_datasets_from_conf",
     "load_skippd_conf",
     "run_smoke_cli",
-    "_SKIPPD_PV_SCALE",
-    "_SKIPPD_CS_GHI_SCALE",
+    "_SKIPPD_POA_SCALE",
     "_SKIPPD_KT_DAYTIME_THRESHOLD",
     "_SKIPPD_KT_EPS",
 ]
