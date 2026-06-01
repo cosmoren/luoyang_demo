@@ -30,11 +30,12 @@ paths:
 # Sampling / window keys for ``dataloader.folsom`` and ``training/train_vit_test_folsom.py``
 sampling:
   # Random anchor draws per training epoch from the valid-train pool.
-  # Folsom has ~925k valid train anchors; 200k/epoch over 20 epochs covers ~99%
-  # of them with 4x per-epoch wall-time vs the legacy 50k. CLI flag
-  # --train_epoch_len overrides this. Fallback if absent: dataloader constant
-  # _DEFAULT_FOLSOM_TRAIN_EPOCH_LEN.
-  train_epoch_len: 200000
+  # Folsom has ~925k valid train anchors; 100k/epoch over 40 epochs is 4M total
+  # draws -> ~99% unique-anchor coverage, ~4.3x average per-anchor revisits.
+  # Going past 4M total draws is mostly diminishing returns. CLI flag
+  # --train_epoch_len overrides this; fallback if absent is the dataloader
+  # constant _DEFAULT_FOLSOM_TRAIN_EPOCH_LEN.
+  train_epoch_len: 100000
   # CSV row spacing (Folsom is 1-min; Luoyang was 5-min).
   csv_interval_min: 1
   # PVDataset / FolsomIrradianceDataset input window (X) and forecast window (Y).

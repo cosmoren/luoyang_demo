@@ -1,0 +1,15 @@
+# Folsom-specific training config (single GHI station, ~925k valid train anchors).
+# Forked from `conf_train.yaml` so Folsom can pick a higher epoch count without
+# also bumping Luoyang / SKIPP'd defaults.
+#
+# Per-arm wall-clock at these defaults: ~9-10 h on one H100 80GB
+# (40 epochs * (100k/64 batches * ~0.5 s/batch + ~1 min val) ~= 14 min/epoch).
+# Hyperparameters mirror the shared `conf_train.yaml` except `epochs`.
+training:
+  epochs: 40
+  lr: 5e-4
+  batch_size: 64
+  save_every: 5
+  num_workers: 8
+  # null = run every batch in an epoch
+  train_max_batches_per_epoch: null

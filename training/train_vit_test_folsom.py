@@ -45,7 +45,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CONFIG_DIR = _PROJECT_ROOT / "config"
 _TRAIN_CONFIG_DIR = _CONFIG_DIR / "train"
 _DATASETS_CONFIG_DIR = _CONFIG_DIR / "datasets"
-_DEFAULT_TRAIN_CONF_NAME = "conf_train.yaml"
+_DEFAULT_TRAIN_CONF_NAME = "conf_train_folsom.yaml"
 _DEFAULT_FOLSOM_DATASET_CONFIG = "conf_folsom.yaml"
 # When the dataset YAML omits ``paths.sky_format``, ``dataloader.folsom`` would default to jpg;
 # this trainer injects ``zarr`` instead (JPEG users must set ``paths.sky_format: jpg``).
