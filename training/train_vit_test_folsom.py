@@ -483,6 +483,18 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
         help="If set, cap val/test ``evaluate()`` to the first N batches each call (default: full loader).",
     )
     parser.add_argument(
+        "--train_epoch_len",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Random anchor draws per epoch from the valid train pool. "
+            "Precedence: this flag > sampling.train_epoch_len in the dataset YAML > "
+            "dataloader default (_DEFAULT_FOLSOM_TRAIN_EPOCH_LEN). With replacement; "
+            "more draws -> better anchor coverage at the cost of per-epoch wall time."
+        ),
+    )
+    parser.add_argument(
         "--use-nwp",
         action="store_true",
         help=(
@@ -570,6 +582,24 @@ def _dataset_kwargs(dataset_config_name: str, split: str) -> dict:
     )
 
 
+def _resolve_train_epoch_len(dataset_config_name: str, cli_value: int | None) -> int | None:
+    """Pick ``train_epoch_len`` precedence: CLI flag > YAML ``sampling.train_epoch_len`` > None.
+
+    ``None`` means "leave the dataset's own default" (``_DEFAULT_FOLSOM_TRAIN_EPOCH_LEN``).
+    The dataset constructor does not accept this kwarg; the trainer applies the result
+    by writing ``train_dataset._train_epoch_len`` after construction.
+    """
+    if cli_value is not None:
+        return int(cli_value)
+    base_cfg_path = _resolve_named_config(_DATASETS_CONFIG_DIR, dataset_config_name, "dataset-config")
+    cfg_path = _folsom_pv_dataset_config_path(base_cfg_path)
+    cfg = _load_yaml(cfg_path)
+    yaml_value = (cfg.get("sampling", {}) or {}).get("train_epoch_len")
+    if yaml_value is None:
+        return None
+    return int(yaml_value)
+
+
 def main() -> None:
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--config", type=str, default=_DEFAULT_TRAIN_CONF_NAME)
@@ -588,6 +618,13 @@ def main() -> None:
     train_dataset = FolsomIrradianceDataset(**_dataset_kwargs(dataset_cfg, "train"))
     val_dataset = FolsomIrradianceDataset(**_dataset_kwargs(dataset_cfg, "val"))
     test_dataset = FolsomIrradianceDataset(**_dataset_kwargs(dataset_cfg, "test"))
+    _epoch_len_override = _resolve_train_epoch_len(dataset_cfg, args.train_epoch_len)
+    if _epoch_len_override is not None:
+        train_dataset._train_epoch_len = max(1, int(_epoch_len_override))
+    print(
+        f"train_epoch_len: {train_dataset._train_epoch_len:,} "
+        f"(valid train anchors: {len(train_dataset._train_anchor_valid_positions):,})"
+    )
 
     dev_dn_list = train_dataset.devDn_list
 
