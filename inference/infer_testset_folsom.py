@@ -3,8 +3,8 @@ Folsom rolling inference: one sweep over the test split, save full 192-step fore
 
 Modelled after ``inference/infer_testset.py`` (Luoyang) but specialised for
 :class:`dataloader.folsom.FolsomIrradianceDataset` — a single-site GHI dataset whose
-``target_pv`` is GHI / 1100 (W/m²); predictions and targets are denormalised back to
-W/m² before being written out.
+``target_pv`` is raw GHI in W/m² (post-alignment, commit 518dca9); predictions and
+targets are written out as-is in W/m² (no denormalization needed).
 
 Two horizons are reported in ``_summary.csv`` (output step ``k`` corresponds to
 ``t0 + (k + 1) * 15 min``):
@@ -36,7 +36,8 @@ are plain numpy and load without ``allow_pickle=True``):
   * zero_sky        : ()        bool      regime used at inference time
   * use_nwp         : ()        bool      regime used at inference time
   * checkpoint      : ()        '<U256'   basename of the checkpoint
-  * target_scale    : ()        float32   multiplied into preds/targets (=1100.0)
+  * target_scale    : ()        float32   multiplied into preds/targets (=1.0; values
+                                            are already in W/m^2 post-alignment)
 
 Example invocations (run on ``node12`` after activating the training env):
 
@@ -84,9 +85,10 @@ from training.train_vit_test_folsom import (  # noqa: E402
 )
 
 
-# FolsomIrradianceDataset stores ``target_pv`` as ``GHI / 1100`` (matches trainer evaluate()).
-# Multiply by this to express predictions/targets back in W/m².
-GHI_SCALE_WM2 = 1100.0
+# Post-alignment (commit 518dca9) FolsomIrradianceDataset stores ``target_pv`` as raw
+# GHI in W/m^2 (no /1100 normalization), so predictions/targets are already in W/m^2 and
+# need no rescale. Kept as a constant=1.0 for clarity / NPZ metadata.
+GHI_SCALE_WM2 = 1.0
 
 # ``forecast_timefeats`` schema: [sin_az, cos_az, sin_ze, cos_ze, sin_doy, cos_doy,
 # sin_hod, cos_hod, delta_t]. Confirmed in training/train_vit_test_folsom.py::evaluate()

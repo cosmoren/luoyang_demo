@@ -164,7 +164,7 @@ def forward_vit(model: nn.Module, d: dict) -> torch.Tensor:
     ``kt`` (clear-sky index / 4000.0) and the daytime ``kt_mask``; the caller scales the
     output back to ``kt`` and multiplies by ``target_p_cs * p_mean`` to recover ``pv``.
     Folsom's divisor is 4000 (vs Luoyang's 20) because Folsom kt is in W/m^2-ish units
-    (numerator is raw GHI ~1100 W/m^2, denominator is dimensionless ``p_cs``) so empirical
+    (numerator is raw GHI ~1000 W/m^2, denominator is dimensionless ``p_cs``) so empirical
     kt p99 ~= 1434 / max ~= 2630; ``/4000`` lands the ViT input at p99 ~= 0.36 and max ~=
     0.66, matching Luoyang's headroom (Luoyang p99/20 = 0.38, max/20 = 0.60)."""
     return model(
@@ -308,27 +308,16 @@ def evaluate(
             n_elem += m.sum().item()
 
     mean_loss = total_loss / max(n_batches, 1)
-    mae_norm = sum_abs / max(n_elem, 1.0)
-    rmse_norm = (sum_sq / max(n_elem, 1.0)) ** 0.5
-    # Dataset stores GHI / 1100; convert error to ~W/m² for readability.
-    ghi_scale = 1100.0
-    mae_wm2 = mae_norm * ghi_scale
-    rmse_wm2 = rmse_norm * ghi_scale
-    capacity = ghi_scale
+    # Post-alignment (commit 518dca9) target_pv is raw W/m^2, so per-element residual
+    # means are already in W/m^2 -- no denormalization needed.
+    mae_wm2 = sum_abs / max(n_elem, 1.0)
+    rmse_wm2 = (sum_sq / max(n_elem, 1.0)) ** 0.5
     print(
         f"First-{_LOSS_METRIC_HORIZON}-step metrics (masked GHI; pred zeroed at night): "
-        f"MAE(norm)={mae_norm:.6f}  RMSE(norm)={rmse_norm:.6f}  "
-        f"MAE≈{mae_wm2:.2f} W/m²  RMSE≈{rmse_wm2:.2f} W/m²"
+        f"MAE={mae_wm2:.4f} W/m²  RMSE={rmse_wm2:.4f} W/m²  "
+        f"(~4 h horizon at 15 min)"
     )
-    print(
-        f"RMSE/MAE on first {_LOSS_METRIC_HORIZON} forecast steps (~4 h at 15 min). "
-        f"Capacity: {capacity:.0f} (W/m² GHI scale)"
-    )
-    print(
-        f"MAE: {mae_wm2:.6f}, RMSE: {rmse_wm2:.6f}, "
-        f"ACC(MAE): {1.0 - mae_wm2 / capacity:.6f}, ACC(RMSE): {1.0 - rmse_wm2 / capacity:.6f}"
-    )
-    return mean_loss, rmse_norm, mae_norm
+    return mean_loss, rmse_wm2, mae_wm2
 
 
 def _build_lr_scheduler(
@@ -722,7 +711,7 @@ def main() -> None:
             )
         print(
             f"Epoch {epoch}/{args.epochs}  lr={cur_lr:.2e}  "
-            f"train_loss={avg_loss:.6f}  val_loss={val_loss:.6f}  val_RMSE(norm)={val_rmse:.6f}"
+            f"train_loss={avg_loss:.6f}  val_loss={val_loss:.6f}  val_RMSE={val_rmse:.4f} W/m²"
         )
         writer.add_scalar("loss/train", avg_loss, epoch)
         writer.add_scalar("loss/val", val_loss, epoch)
@@ -801,7 +790,7 @@ def main() -> None:
         )
         print(
             f"Test set with best val-RMSE checkpoint ({best_ckpt_path.name}, epoch={ckpt.get('epoch', '?')}): "
-            f"loss={test_loss_best:.6f}, RMSE(norm)={test_rmse_best:.6f}, MAE(norm)={test_mae_best:.6f}"
+            f"loss={test_loss_best:.6f}, RMSE={test_rmse_best:.4f} W/m², MAE={test_mae_best:.4f} W/m²"
         )
         writer.add_scalar("metric/test_rmse", test_rmse_best, args.epochs)
         writer.add_scalar("metric/test_mae", test_mae_best, args.epochs)
