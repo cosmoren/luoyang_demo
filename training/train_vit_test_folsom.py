@@ -254,7 +254,7 @@ def train_one_epoch(
         if ema is not None:
             ema.update(model)
         total_loss += loss.item()
-        n += B
+        n += 1
     print()
     return total_loss / max(n, 1)
 
