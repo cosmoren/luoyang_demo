@@ -1,3 +1,9 @@
+# SKIPP'd-specific overrides on top of the shared `config/train/conf_train.yaml`.
+# Only keys explicitly set here override the shared defaults; missing keys inherit.
+# Trainer flow: load conf_train.yaml -> apply this `training:` block -> CLI flags win.
+training:
+  epochs: 40
+
 # Stanford SKIPP'd (Huang Engineering rooftop) — PV CSV + sky Zarr (no NWP, no satellite).
 # -----------------------------------------------------------------------------
 # This file mirrors ``config/datasets/conf_folsom.yaml`` field-by-field so the

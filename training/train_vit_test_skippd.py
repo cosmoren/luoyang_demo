@@ -539,13 +539,23 @@ def _dataset_kwargs(dataset_config_name: str, split: str) -> dict:
 def main() -> None:
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--config", type=str, default=_DEFAULT_TRAIN_CONF_NAME)
+    pre_parser.add_argument("--dataset-config", type=str, default=_DEFAULT_SKIPPD_DATASET_CONFIG)
     pre_args, _ = pre_parser.parse_known_args()
 
     train_conf_path = _resolve_named_config(_TRAIN_CONFIG_DIR, pre_args.config, "config")
     train_conf = _load_yaml(train_conf_path)
-    h = train_conf.get("training") or {}
+    h = dict(train_conf.get("training") or {})
     if not h:
         raise KeyError(f"training config {train_conf_path} is missing a 'training:' section")
+
+    # Dataset YAML may carry a ``training:`` override block (mirrors the Folsom
+    # trainer); only keys explicitly set non-None override the shared base.
+    dataset_cfg_path = _resolve_named_config(_DATASETS_CONFIG_DIR, pre_args.dataset_config, "dataset-config")
+    dataset_cfg_raw = _load_yaml(_skippd_pv_dataset_config_path(dataset_cfg_path))
+    _ds_training_override = dataset_cfg_raw.get("training") or {}
+    for _k, _v in _ds_training_override.items():
+        if _v is not None:
+            h[_k] = _v
 
     parser = _build_parser(h, config_default=pre_args.config)
     args = parser.parse_args()
