@@ -499,6 +499,18 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
             "Use with --use-nwp for PV+NWP vs PV+NWP+sky comparisons."
         ),
     )
+    parser.add_argument(
+        "--tb-log-dir",
+        type=str,
+        default=None,
+        help=(
+            "Explicit TensorBoard log directory for this run. Precedence: "
+            "(1) this flag if set; (2) else derived from --checkpoint_dir as runs/<basename>; "
+            "(3) else legacy default runs/folsom_pv_gpu{N}. "
+            "Set this (or a distinct --checkpoint_dir) when launching parallel runs to avoid "
+            "SummaryWriter event-file collisions."
+        ),
+    )
     return parser
 
 
@@ -644,7 +656,14 @@ def main() -> None:
         _ckpt_suffix = "cpu"
     best_ckpt_path = checkpoint_dir / f"folsom_pv_forecast_vit_best_{_ckpt_suffix}.pt"
 
-    tb_log_dir = _PROJECT_ROOT / "runs" / f"folsom_pv_{_ckpt_suffix}"
+    if getattr(args, "tb_log_dir", None):
+        tb_log_dir = Path(args.tb_log_dir)
+        if not tb_log_dir.is_absolute():
+            tb_log_dir = _PROJECT_ROOT / tb_log_dir
+    elif args.checkpoint_dir:
+        tb_log_dir = _PROJECT_ROOT / "runs" / Path(args.checkpoint_dir).name
+    else:
+        tb_log_dir = _PROJECT_ROOT / "runs" / f"folsom_pv_{_ckpt_suffix}"
     writer = SummaryWriter(log_dir=str(tb_log_dir))
     print(f"TensorBoard log dir: {tb_log_dir}")
 
