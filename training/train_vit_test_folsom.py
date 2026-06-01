@@ -45,7 +45,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CONFIG_DIR = _PROJECT_ROOT / "config"
 _TRAIN_CONFIG_DIR = _CONFIG_DIR / "train"
 _DATASETS_CONFIG_DIR = _CONFIG_DIR / "datasets"
-_DEFAULT_TRAIN_CONF_NAME = "conf_train_folsom.yaml"
+_DEFAULT_TRAIN_CONF_NAME = "conf_train.yaml"
 _DEFAULT_FOLSOM_DATASET_CONFIG = "conf_folsom.yaml"
 # When the dataset YAML omits ``paths.sky_format``, ``dataloader.folsom`` would default to jpg;
 # this trainer injects ``zarr`` instead (JPEG users must set ``paths.sky_format: jpg``).
@@ -603,13 +603,25 @@ def _resolve_train_epoch_len(dataset_config_name: str, cli_value: int | None) ->
 def main() -> None:
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--config", type=str, default=_DEFAULT_TRAIN_CONF_NAME)
+    pre_parser.add_argument("--dataset-config", type=str, default=_DEFAULT_FOLSOM_DATASET_CONFIG)
     pre_args, _ = pre_parser.parse_known_args()
 
     train_conf_path = _resolve_named_config(_TRAIN_CONFIG_DIR, pre_args.config, "config")
     train_conf = _load_yaml(train_conf_path)
-    h = train_conf.get("training") or {}
+    h = dict(train_conf.get("training") or {})
     if not h:
         raise KeyError(f"training config {train_conf_path} is missing a 'training:' section")
+
+    # Dataset YAML may carry a ``training:`` override block (Folsom uses this for
+    # epochs=40 etc, so dataset-specific knobs live alongside dataset paths/sampling
+    # without forking the shared conf_train.yaml). Override only keys explicitly set
+    # to a non-None value; missing keys inherit from the shared base.
+    dataset_cfg_path = _resolve_named_config(_DATASETS_CONFIG_DIR, pre_args.dataset_config, "dataset-config")
+    dataset_cfg_raw = _load_yaml(_folsom_pv_dataset_config_path(dataset_cfg_path))
+    _ds_training_override = dataset_cfg_raw.get("training") or {}
+    for _k, _v in _ds_training_override.items():
+        if _v is not None:
+            h[_k] = _v
 
     parser = _build_parser(h, config_default=pre_args.config)
     args = parser.parse_args()

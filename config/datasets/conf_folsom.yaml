@@ -1,3 +1,9 @@
+# Folsom-specific overrides on top of the shared `config/train/conf_train.yaml`.
+# Only keys explicitly set here override the shared defaults; missing keys inherit.
+# Trainer flow: load conf_train.yaml -> apply this `training:` block -> CLI flags win.
+training:
+  epochs: 40
+
 # Folsom, CA — irradiance CSV + sky Zarr + (optional) merged NWP CSV.
 # -----------------------------------------------------------------------------
 # Same schema as Luoyang `pv_*` keys (no `irr_*`, no `dataset_profile: folsom`).
