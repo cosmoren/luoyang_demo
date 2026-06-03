@@ -116,3 +116,7 @@ logs/
 
 # Cursor IDE local settings / skills
 .cursor/
+
+# Daily progress reports (generated artifacts)
+progress_report_*.pptx
+report_*/
