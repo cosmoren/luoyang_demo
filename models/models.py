@@ -20,11 +20,47 @@ from modules.SkyEncoder import (
     patchify_spatiotemporal_sky_images,
 )
 from modules.SkyCompressor import SkyTwoStageCompressor
+from dataloader.folsom import _FOLSOM_NWP_FEATURE_COLS
 from .timesformer import TimeSformerFeatureExtractor, TimesformerConfig
 import logging
 import os
 import contextlib
 import io
+
+
+# Per-feature normalizers applied to columns of ``nwp_tensor`` in
+# ``pv_forecasting_model_vit_imgs``. Order-agnostic dispatch: the column index for
+# each feature comes from ``_FOLSOM_NWP_FEATURE_COLS`` (see ``dataloader/folsom.py``);
+# the trainer feeds the raw tensor (no channel remap), and the model loops over the
+# resolved ``self.nwp_features`` list applying these closures in feature order.
+#
+# Constants (data-fit, post-refactor; ``temperature`` differs from the pre-refactor
+# ``(t - 288.15) / 10`` to match the merged Folsom NWP distribution):
+#   * dwsw          (W/m^2): (x/1000 - 0.5) * 2 -> ~[-1, +1.5] at peak sun
+#   * cloud_cover   (%)    : (x - 50)/50         -> [-1, +1]
+#   * precipitation (mm/h) : log1p(x.clamp(>=0))/3 -> ~[0, 2] for typical events
+#   * pressure      (Pa)   : (x - 100500)/500    -> roughly [-3, +3]
+#   * wind-u/wind-v (m/s)  : x / 5
+#   * temperature   (K)    : (x - 295)/12        -> ~[-2, +2] across Folsom annual range
+#   * rel_humidity  (%)    : (x - 50)/50         -> [-1, +1]
+#
+# The trailing invalid-mask channel (``nwp_tensor[:, :, -1]``) is passed through as-is
+# when ``use_invalid_mask`` is set on the model.
+NWP_FEATURE_NORMALIZERS = {
+    "dwsw":          lambda x: (x / 1000.0 - 0.5) * 2.0,
+    "cloud_cover":   lambda x: (x - 50.0) / 50.0,
+    "precipitation": lambda x: torch.log1p(x.clamp(min=0)) / 3.0,
+    "pressure":      lambda x: (x - 100500.0) / 500.0,
+    "wind-u":        lambda x: x / 5.0,
+    "wind-v":        lambda x: x / 5.0,
+    "temperature":   lambda x: (x - 295.0) / 12.0,
+    "rel_humidity":  lambda x: (x - 50.0) / 50.0,
+}
+# Sanity: every canonical NWP feature must have a normalizer.
+assert set(NWP_FEATURE_NORMALIZERS) == set(_FOLSOM_NWP_FEATURE_COLS), (
+    "NWP_FEATURE_NORMALIZERS and _FOLSOM_NWP_FEATURE_COLS must cover the same features: "
+    f"normalizers={sorted(NWP_FEATURE_NORMALIZERS)} vs feature_cols={sorted(_FOLSOM_NWP_FEATURE_COLS)}"
+)
 
 class TemporalCNN1d(nn.Module):
     """
@@ -513,19 +549,60 @@ class pv_forecasting_model_vit_nwp_short(nn.Module):
 
 
 
+# Default per-feature NWP selection for ``pv_forecasting_model_vit_imgs``. Matches the
+# post-refactor "minimal" preset and the pre-refactor hardcoded behaviour (which fed
+# ssrd-like + temperature-like channels through ``query_mlp``); used as the legacy
+# default when an older checkpoint does not record ``nwp_features``.
+_DEFAULT_VIT_IMGS_NWP_FEATURES: tuple[str, ...] = ("dwsw", "temperature")
+_DEFAULT_VIT_IMGS_NWP_USE_INVALID_MASK: bool = False
+
+
 # Using PV history and NWP to forecast PV, solar features and NWP features are used as query
 class pv_forecasting_model_vit_imgs(nn.Module):
     """
     Like ``pv_forecasting_model_vit_nwp`` but satellite frames go through
     :func:`modules.SatEncoder.patchify_spatiotemporal_images` and
     :class:`modules.SatEncoder.AlternatingIntraInterFrameAttention`, then cross-attend into the forecast query.
+
+    NWP forecast-query channels are configurable: ``nwp_features`` selects which columns
+    of ``_FOLSOM_NWP_FEATURE_COLS`` to read from ``nwp_tensor`` (each normalised via
+    :data:`NWP_FEATURE_NORMALIZERS`), and ``use_invalid_mask`` toggles passing the trailing
+    per-step invalid mask channel (``nwp_tensor[:, :, -1]``) through as-is.
     """
 
-    def __init__(self, use_batchnorm: bool = True, dropout: float = 0.0, dev_dn_list: Optional[list] = None):
+    def __init__(
+        self,
+        use_batchnorm: bool = True,
+        dropout: float = 0.0,
+        dev_dn_list: Optional[list] = None,
+        nwp_features: Optional[list[str]] = None,
+        use_invalid_mask: bool = _DEFAULT_VIT_IMGS_NWP_USE_INVALID_MASK,
+    ):
         super().__init__()
 
         self.use_batchnorm = use_batchnorm
         self.dropout = dropout
+
+        if nwp_features is None:
+            nwp_features = list(_DEFAULT_VIT_IMGS_NWP_FEATURES)
+        nwp_features = list(nwp_features)
+        unknown = [n for n in nwp_features if n not in NWP_FEATURE_NORMALIZERS]
+        if unknown:
+            raise ValueError(
+                f"Unknown NWP feature(s) {unknown}; valid features are "
+                f"{sorted(NWP_FEATURE_NORMALIZERS)}"
+            )
+        dupes = [n for n in nwp_features if nwp_features.count(n) > 1]
+        if dupes:
+            raise ValueError(f"Duplicate NWP feature(s) in nwp_features: {sorted(set(dupes))}")
+        self.nwp_features: list[str] = nwp_features
+        self.use_invalid_mask: bool = bool(use_invalid_mask)
+        # Pre-resolve column indices in ``nwp_tensor`` (last dim = 8 features + 1 mask).
+        self._nwp_feature_indices: list[int] = [
+            _FOLSOM_NWP_FEATURE_COLS.index(name) for name in self.nwp_features
+        ]
+        # Forecast-query input dim = 3 time feats + N NWP features (+ 1 if mask passed through).
+        query_mlp_in_dim = 3 + len(self.nwp_features) + (1 if self.use_invalid_mask else 0)
 
         dim = 64
         self.pv_mod_embed = nn.Parameter(torch.randn(1, 1, dim) * 0.02)   # PV modality embedding
@@ -545,7 +622,7 @@ class pv_forecasting_model_vit_imgs(nn.Module):
                            529, 532, 535, 538, 541, 544, 547, 550, 553, 556, 559, 562, 565, 568, 571, 574]
         self.learnable_pv_queries = nn.Parameter(torch.randn(1, 48, 64))
         self.cross_attention_pv_compression = CrossAttention(query_dim=64, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)        
-        self.query_mlp = MLP(in_dim=5, hidden_dims=(64, 64), out_dim=64, dropout=0.0)
+        self.query_mlp = MLP(in_dim=query_mlp_in_dim, hidden_dims=(64, 64), out_dim=64, dropout=0.0)
 
         self.sat_embed_dim = 64
         self.sat_patch_embed = VideoPatchSpatiotemporalEmbed(
@@ -618,11 +695,18 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         KV_hist_mem_compressed = self.cross_attention_pv_compression(query=corase_queries, key=KV_hist_mem, value=KV_hist_mem) # [B,48,D=64] 48 pv tokens
         KV_hist_mem_compressed = KV_hist_mem_compressed + corase_queries + self.pv_mod_embed
 
-        # Forecast queries
-        ssrd_normalized = (nwp_tensor[:,:,0]/1000 - 0.5)*2
-        # msl_normalized = (nwp_tensor[:,:,1]-101325)/1000
-        t2m_normalized = (nwp_tensor[:,:,2]-288.15)/10
-        forecast_ssrd_timefeats = torch.cat([forecast_timefeats, ssrd_normalized.unsqueeze(2), t2m_normalized.unsqueeze(2)], dim=2)
+        # Forecast queries: per-feature NWP normalization via dispatch dict (see
+        # ``NWP_FEATURE_NORMALIZERS`` at module top). ``self.nwp_features`` chooses which
+        # columns of ``nwp_tensor`` (canonical order: ``_FOLSOM_NWP_FEATURE_COLS``) are
+        # read; channels are appended after ``forecast_timefeats`` in feature order. If
+        # ``self.use_invalid_mask`` is set, ``nwp_tensor[:, :, -1]`` (per-step invalid
+        # mask written by the dataloader) is also appended, as-is.
+        nwp_channels = [forecast_timefeats]
+        for name, idx in zip(self.nwp_features, self._nwp_feature_indices):
+            nwp_channels.append(NWP_FEATURE_NORMALIZERS[name](nwp_tensor[:, :, idx]).unsqueeze(2))
+        if self.use_invalid_mask:
+            nwp_channels.append(nwp_tensor[:, :, -1].unsqueeze(2))
+        forecast_ssrd_timefeats = torch.cat(nwp_channels, dim=2)
         forecast_query = self.query_mlp(forecast_ssrd_timefeats)
 
         # satellite images encoder
