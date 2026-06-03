@@ -61,8 +61,10 @@ from models.models import pv_forecasting_model_vit_imgs  # noqa: E402
 _FOLSOM_NWP_TEMPERATURE_INDEX = _FOLSOM_NWP_FEATURE_COLS.index("temperature")
 # ``pv_forecasting_model_vit_imgs`` reads ``nwp_tensor[:, :, 0]`` as shortwave-like and ``[:, :, 2]`` as Kelvin temp.
 _VIT_IMGS_NWP_TEMPERATURE_SLOT = 2
-# Match ``training/train_vit_test.py``: first 16 output steps (~4 h at 15 min; Folsom uses 15 min output).
-_LOSS_METRIC_HORIZON = 16
+# Full Folsom forecast horizon: all 192 output steps (~48 h at 15 min; Folsom uses 15 min output).
+# Previously capped at 16 (~4 h) to mirror Luoyang; extended to the dataset's native
+# ``pv_output_len`` so loss + masked RMSE/MAE cover the whole forecast window.
+_LOSS_METRIC_HORIZON = 192
 
 
 def remap_nwp_tensor_for_pv_vit_imgs(nwp_tensor: torch.Tensor) -> torch.Tensor:
@@ -315,7 +317,7 @@ def evaluate(
     print(
         f"First-{_LOSS_METRIC_HORIZON}-step metrics (masked GHI; pred zeroed at night): "
         f"MAE={mae_wm2:.4f} W/m²  RMSE={rmse_wm2:.4f} W/m²  "
-        f"(~4 h horizon at 15 min)"
+        f"(~48 h horizon at 15 min)"
     )
     return mean_loss, rmse_wm2, mae_wm2
 

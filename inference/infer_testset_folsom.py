@@ -319,6 +319,13 @@ def main() -> None:
             _prepare_sky_for_vit(d, zero_sky=zero_sky)
 
             with autocast_ctx:
+                # !!! BUG / NEEDS FIXING !!!
+                # Scale factor must match training (training/train_vit_test_folsom.py uses 4000.0
+                # because Folsom kt = GHI / p_cs is in ~W/m^2 units; the 20.0 here is a leftover
+                # from the Luoyang inference script and is INVALID for Folsom checkpoints.
+                # Until this is rescaled to 4000.0, every number this script writes
+                # (NPZ preds, _summary.csv RMSE/MAE/MBE) is off by ~200x and INVALID.
+                # TODO: change 20.0 -> 4000.0 and re-run inference on all Folsom checkpoints.
                 kt_pred = forward_vit(model, d) * 20.0
             pv_pred = (kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)).float()  # [B, T_out]
 
