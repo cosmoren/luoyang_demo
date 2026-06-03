@@ -48,9 +48,11 @@ from training.train_vit_test_folsom import (  # noqa: E402
     _LOSS_METRIC_HORIZON,
     _batch_to_device,
     _dataset_kwargs,
+    _format_nwp_features_for_log,
     _prepare_nwp_for_vit,
     _prepare_sky_for_vit,
     forward_vit,
+    resolve_nwp_features_from_ckpt,
 )
 
 # Folsom output cadence is 15 min/step (see ``config/datasets/conf_folsom.yaml``:
@@ -299,7 +301,16 @@ def main() -> int:
             "Pass a checkpoint saved by training/train_vit_test_folsom.py."
         )
 
-    model = pv_forecasting_model_vit_imgs(dev_dn_list=dev_dn_list).to(device)
+    nwp_features, nwp_use_invalid_mask = resolve_nwp_features_from_ckpt(ckpt)
+    print(
+        f"[eval] nwp_features={_format_nwp_features_for_log(nwp_features, nwp_use_invalid_mask)} "
+        f"(source: {'checkpoint' if 'nwp_features' in ckpt else 'legacy default'})"
+    )
+    model = pv_forecasting_model_vit_imgs(
+        dev_dn_list=dev_dn_list,
+        nwp_features=nwp_features,
+        use_invalid_mask=nwp_use_invalid_mask,
+    ).to(device)
     missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
     if missing or unexpected:
         # Helpful diagnostic if the saver format ever drifts.

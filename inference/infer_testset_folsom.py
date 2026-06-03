@@ -79,9 +79,11 @@ from models.models import pv_forecasting_model_vit_imgs  # noqa: E402
 from training.train_vit_test_folsom import (  # noqa: E402
     _batch_to_device,
     _dataset_kwargs as _folsom_dataset_kwargs,
+    _format_nwp_features_for_log,
     _prepare_nwp_for_vit,
     _prepare_sky_for_vit,
     forward_vit,
+    resolve_nwp_features_from_ckpt,
 )
 
 
@@ -272,8 +274,17 @@ def main() -> None:
         f"[infer_folsom] zero_sky={zero_sky} use_nwp={use_nwp} "
         f"(source: zero_sky={zs_src}, use_nwp={un_src})"
     )
+    nwp_features, nwp_use_invalid_mask = resolve_nwp_features_from_ckpt(ckpt)
+    print(
+        f"[infer_folsom] nwp_features={_format_nwp_features_for_log(nwp_features, nwp_use_invalid_mask)} "
+        f"(source: {'checkpoint' if 'nwp_features' in ckpt else 'legacy default'})"
+    )
 
-    model = pv_forecasting_model_vit_imgs(dev_dn_list=test_dataset.devDn_list).to(device)
+    model = pv_forecasting_model_vit_imgs(
+        dev_dn_list=test_dataset.devDn_list,
+        nwp_features=nwp_features,
+        use_invalid_mask=nwp_use_invalid_mask,
+    ).to(device)
     state = ckpt.get("model_state_dict", ckpt)
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing:

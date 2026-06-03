@@ -54,9 +54,11 @@ from training.train_vit_test_folsom import (  # noqa: E402
     _LOSS_METRIC_HORIZON,
     _batch_to_device,
     _dataset_kwargs,
+    _format_nwp_features_for_log,
     _prepare_nwp_for_vit,
     _prepare_sky_for_vit,
     forward_vit,
+    resolve_nwp_features_from_ckpt,
 )
 
 _OUTPUT_INTERVAL_MIN = 15
@@ -328,7 +330,16 @@ def main() -> int:
             f"Checkpoint {args.ckpt} does not contain 'dev_dn_list'; model factory needs it."
         )
 
-    model = pv_forecasting_model_vit_imgs(dev_dn_list=dev_dn_list).to(device)
+    nwp_features, nwp_use_invalid_mask = resolve_nwp_features_from_ckpt(ckpt)
+    print(
+        f"[eval-save] nwp_features={_format_nwp_features_for_log(nwp_features, nwp_use_invalid_mask)} "
+        f"(source: {'checkpoint' if 'nwp_features' in ckpt else 'legacy default'})"
+    )
+    model = pv_forecasting_model_vit_imgs(
+        dev_dn_list=dev_dn_list,
+        nwp_features=nwp_features,
+        use_invalid_mask=nwp_use_invalid_mask,
+    ).to(device)
     missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
     if missing or unexpected:
         print(f"[eval-save][warn] load_state_dict mismatch: "
