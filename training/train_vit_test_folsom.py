@@ -55,7 +55,10 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 from dataloader.folsom import FolsomIrradianceDataset, _FOLSOM_NWP_FEATURE_COLS  # noqa: E402
 from dataloader.luoyang_zarr import collate_batched  # noqa: E402
-from models.models import pv_forecasting_model_vit_imgs  # noqa: E402
+from models.models import (  # noqa: E402
+    NWP_FEATURE_NORMALIZERS,
+    pv_forecasting_model_vit_imgs,
+)
 
 # Column indices in ``nwp_tensor`` **before** remap: 8 features from ``_FOLSOM_NWP_FEATURE_COLS`` + 1 trailing mask.
 _FOLSOM_NWP_TEMPERATURE_INDEX = _FOLSOM_NWP_FEATURE_COLS.index("temperature")
@@ -66,15 +69,30 @@ _VIT_IMGS_NWP_TEMPERATURE_SLOT = 2
 # ``pv_output_len`` so loss + masked RMSE/MAE cover the whole forecast window.
 _LOSS_METRIC_HORIZON = 192
 
+# Special token in ``--nwp-features`` that toggles the per-step invalid-mask channel
+# (``nwp_tensor[:, :, -1]``); not a real NWP feature so kept out of the features list.
+_NWP_INVALID_MASK_TOKEN = "invalid_mask"
+# Presets resolved by ``_parse_nwp_features``.
+_NWP_FEATURE_PRESETS: dict[str, tuple[tuple[str, ...], bool]] = {
+    "minimal": (("dwsw", "temperature"), False),
+    "all": (tuple(_FOLSOM_NWP_FEATURE_COLS), True),
+}
+
 
 def remap_nwp_tensor_for_pv_vit_imgs(nwp_tensor: torch.Tensor) -> torch.Tensor:
     """
     Reorder Folsom merged-NWP features for ``pv_forecasting_model_vit_imgs``.
 
     Folsom ``_interpolate_nwp`` stacks columns in ``_FOLSOM_NWP_FEATURE_COLS`` order, then appends
-    an invalid mask. The PV ViT assumes channel 0 ≈ surface shortwave (W/m²) and channel 2 ≈ air
-    temperature (K), matching Luoyang's ``ssrd`` / ``t2m`` positions. Here ``dwsw`` is already at
-    index 0; ``temperature`` is at index 6 and must be copied into index 2.
+    an invalid mask. The PV ViT used to assume channel 0 ≈ surface shortwave (W/m²) and channel 2
+    ≈ air temperature (K), matching Luoyang's ``ssrd`` / ``t2m`` positions. Here ``dwsw`` is
+    already at index 0; ``temperature`` is at index 6 and used to be copied into index 2.
+
+    NOTE: this helper is no longer used by ``pv_forecasting_model_vit_imgs`` (which now reads
+    raw ``_FOLSOM_NWP_FEATURE_COLS`` indices directly via the per-feature dispatch dict; see
+    ``models.models.NWP_FEATURE_NORMALIZERS`` and the model's ``nwp_features`` constructor
+    argument). Kept here as a no-touch reference for any older variant that might still want the
+    Luoyang-style channel layout.
     """
     if nwp_tensor.ndim != 3:
         raise ValueError(f"nwp_tensor expected [B, T, C], got shape {tuple(nwp_tensor.shape)}")
@@ -87,6 +105,96 @@ def remap_nwp_tensor_for_pv_vit_imgs(nwp_tensor: torch.Tensor) -> torch.Tensor:
     out[:, :, _VIT_IMGS_NWP_TEMPERATURE_SLOT] = nwp_tensor[:, :, _FOLSOM_NWP_TEMPERATURE_INDEX]
     # Channel 0 is already ``dwsw`` (first column of ``_FOLSOM_NWP_FEATURE_COLS``).
     return out
+
+
+def _parse_nwp_features(spec: str) -> tuple[list[str], bool]:
+    """Resolve ``--nwp-features`` into ``(features, use_invalid_mask)``.
+
+    Accepts a preset name (see ``_NWP_FEATURE_PRESETS``) or a comma-separated list of
+    canonical feature names. The special token ``invalid_mask`` (or ``+invalid_mask``)
+    toggles the per-step invalid mask channel instead of adding a feature.
+
+    Raises ``ValueError`` with a clear message on unknown / duplicate names.
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        raise ValueError("--nwp-features may not be empty")
+    if spec in _NWP_FEATURE_PRESETS:
+        feats, use_mask = _NWP_FEATURE_PRESETS[spec]
+        return list(feats), bool(use_mask)
+
+    features: list[str] = []
+    use_invalid_mask = False
+    valid = set(NWP_FEATURE_NORMALIZERS)
+    seen: set[str] = set()
+    for raw in spec.split(","):
+        token = raw.strip()
+        if not token:
+            continue
+        if token in (_NWP_INVALID_MASK_TOKEN, "+" + _NWP_INVALID_MASK_TOKEN):
+            use_invalid_mask = True
+            continue
+        if token not in valid:
+            raise ValueError(
+                f"--nwp-features: unknown feature {token!r}. Valid features: "
+                f"{sorted(valid)} (presets: {sorted(_NWP_FEATURE_PRESETS)}; "
+                f"add {_NWP_INVALID_MASK_TOKEN!r} to include the per-step invalid mask)."
+            )
+        if token in seen:
+            raise ValueError(f"--nwp-features: duplicate feature {token!r}")
+        seen.add(token)
+        features.append(token)
+
+    if not features:
+        raise ValueError(
+            "--nwp-features must select at least one feature "
+            f"(got spec {spec!r}; valid features: {sorted(valid)})"
+        )
+    return features, use_invalid_mask
+
+
+def _format_nwp_features_for_log(features: list[str], use_invalid_mask: bool) -> str:
+    """Compact, deterministic string for logs / TensorBoard hparams."""
+    parts = list(features)
+    if use_invalid_mask:
+        parts.append(_NWP_INVALID_MASK_TOKEN)
+    return ",".join(parts) if parts else "<none>"
+
+
+# Default ``nwp_features`` / ``nwp_use_invalid_mask`` for checkpoints that pre-date the
+# per-feature selector (i.e. saved with the hardcoded ``(ssrd, t2m)`` query). Matches
+# ``models.models._DEFAULT_VIT_IMGS_NWP_FEATURES`` and the ``minimal`` preset.
+_LEGACY_CKPT_NWP_FEATURES: tuple[str, ...] = ("dwsw", "temperature")
+_LEGACY_CKPT_NWP_USE_INVALID_MASK: bool = False
+
+
+def resolve_nwp_features_from_ckpt(ckpt: dict) -> tuple[list[str], bool]:
+    """Read ``nwp_features`` / ``nwp_use_invalid_mask`` from a loaded checkpoint dict.
+
+    Falls back to the pre-refactor defaults (``["dwsw", "temperature"]`` / ``False``) when
+    the keys are absent so older checkpoints can be reloaded by the same code path.
+    Also validates that any feature name listed in the checkpoint is currently known to
+    the dispatch dict; otherwise the model factory would explode further downstream.
+    """
+    raw_feats = ckpt.get("nwp_features")
+    if raw_feats is None:
+        features = list(_LEGACY_CKPT_NWP_FEATURES)
+    else:
+        features = [str(n) for n in raw_feats]
+        unknown = [n for n in features if n not in NWP_FEATURE_NORMALIZERS]
+        if unknown:
+            raise ValueError(
+                f"checkpoint nwp_features contains unknown name(s) {unknown}; "
+                f"valid features are {sorted(NWP_FEATURE_NORMALIZERS)}"
+            )
+
+    raw_mask = ckpt.get("nwp_use_invalid_mask")
+    if raw_mask is None:
+        use_invalid_mask = _LEGACY_CKPT_NWP_USE_INVALID_MASK
+    else:
+        use_invalid_mask = bool(raw_mask)
+
+    return features, use_invalid_mask
 
 
 def _gpu_id_for_checkpoint() -> int:
@@ -130,18 +238,18 @@ def _prepare_nwp_for_vit(d: dict, *, use_nwp: bool) -> dict:
     Prepare ``d['nwp_tensor']`` for the ViT, in place.
 
     Two parallel paths share the same downstream call signature so the model code is unchanged:
-      * ``use_nwp=True``  -> remap channels (real NWP path; see ``remap_nwp_tensor_for_pv_vit_imgs``).
+      * ``use_nwp=True``  -> pass the raw merged-NWP tensor through unchanged (post-refactor:
+        ``pv_forecasting_model_vit_imgs`` reads ``_FOLSOM_NWP_FEATURE_COLS`` indices itself via
+        the per-feature dispatch dict; channel remap is no longer needed).
       * ``use_nwp=False`` -> overwrite with ``zeros_like`` (blacked-out / NWP-ablation baseline).
 
-    The model indexes ``nwp_tensor[:, :, 0|1|2|-1]`` unconditionally, so we keep the original
+    The model always indexes ``nwp_tensor`` columns, so we keep the original
     shape/dtype/device and only swap the values; ``None`` would crash the forward pass.
     """
     nwp = d.get("nwp_tensor")
     if nwp is None:
         return d
-    if use_nwp:
-        d["nwp_tensor"] = remap_nwp_tensor_for_pv_vit_imgs(nwp)
-    else:
+    if not use_nwp:
         d["nwp_tensor"] = torch.zeros_like(nwp)
     return d
 
@@ -500,8 +608,28 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
         "--use-nwp",
         action="store_true",
         help=(
-            "Feed the real Folsom merged-NWP tensor to the ViT (channels remapped). "
-            "Default is OFF: the NWP tensor is replaced with zeros (blacked-out baseline)."
+            "Feed the real Folsom merged-NWP tensor to the ViT. Default is OFF: the NWP "
+            "tensor is replaced with zeros (blacked-out baseline). The per-feature selection "
+            "is controlled by --nwp-features below; --use-nwp toggles whether the data is real "
+            "or zeroed-out at input."
+        ),
+    )
+    parser.add_argument(
+        "--nwp-features",
+        type=str,
+        default="minimal",
+        help=(
+            "Which NWP feature channels to feed into the forecast-query MLP of "
+            "pv_forecasting_model_vit_imgs (also fixes the model's query_mlp input dim). "
+            "Comma-separated list from "
+            f"{sorted(NWP_FEATURE_NORMALIZERS)} (canonical order: "
+            f"{list(_FOLSOM_NWP_FEATURE_COLS)}); add the special token "
+            f"'{_NWP_INVALID_MASK_TOKEN}' (or '+{_NWP_INVALID_MASK_TOKEN}') to also append the "
+            "per-step invalid mask channel. Presets: "
+            f"{sorted(_NWP_FEATURE_PRESETS)}. Default 'minimal' = "
+            f"{list(_NWP_FEATURE_PRESETS['minimal'][0])} (mask off). When --use-nwp is off, this "
+            "flag still picks the architecture but the input data is zeroed (existing "
+            "_prepare_nwp_for_vit behaviour)."
         ),
     )
     parser.add_argument(
@@ -642,8 +770,19 @@ def main() -> None:
 
     dev_dn_list = train_dataset.devDn_list
 
+    nwp_features, nwp_use_invalid_mask = _parse_nwp_features(args.nwp_features)
+    nwp_features_str = _format_nwp_features_for_log(nwp_features, nwp_use_invalid_mask)
+    print(
+        f"NWP features (resolved from --nwp-features={args.nwp_features!r}): "
+        f"{nwp_features_str}  (use_invalid_mask={nwp_use_invalid_mask})"
+    )
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = pv_forecasting_model_vit_imgs(dev_dn_list=dev_dn_list).to(device)
+    model = pv_forecasting_model_vit_imgs(
+        dev_dn_list=dev_dn_list,
+        nwp_features=nwp_features,
+        use_invalid_mask=nwp_use_invalid_mask,
+    ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -717,6 +856,12 @@ def main() -> None:
         tb_log_dir = _PROJECT_ROOT / "runs" / f"folsom_pv_{_ckpt_suffix}"
     writer = SummaryWriter(log_dir=str(tb_log_dir))
     print(f"TensorBoard log dir: {tb_log_dir}")
+    # Persist the resolved feature selection in TB so the run is self-describing in the UI.
+    writer.add_text(
+        "nwp/features",
+        f"--nwp-features={args.nwp_features!r} -> resolved={nwp_features_str} "
+        f"(use_invalid_mask={nwp_use_invalid_mask})",
+    )
 
     max_batches = args.train_max_batches_per_epoch
     if max_batches is not None and max_batches < 0:
@@ -725,7 +870,8 @@ def main() -> None:
     eval_cap = args.eval_max_batches
     use_nwp = bool(args.use_nwp)
     zero_sky = bool(args.zero_sky)
-    print(f"NWP input: {'REAL (remapped)' if use_nwp else 'ZEROED-OUT (baseline)'}")
+    print(f"NWP input: {'REAL (raw _FOLSOM_NWP_FEATURE_COLS)' if use_nwp else 'ZEROED-OUT (baseline)'}")
+    print(f"NWP features (model arch): {nwp_features_str}  use_invalid_mask={nwp_use_invalid_mask}")
     print(f"Sky images: {'ZEROED (--zero-sky; PV+NWP-style ablation)' if zero_sky else 'REAL from dataset'}")
     initial_test_loss, _, _ = evaluate(
         model,
@@ -804,6 +950,8 @@ def main() -> None:
                     "ema": ema_active,
                     "zero_sky": zero_sky,
                     "use_nwp": use_nwp,
+                    "nwp_features": list(nwp_features),
+                    "nwp_use_invalid_mask": bool(nwp_use_invalid_mask),
                 },
                 path,
             )
@@ -824,6 +972,8 @@ def main() -> None:
                     "ema": ema_active,
                     "zero_sky": zero_sky,
                     "use_nwp": use_nwp,
+                    "nwp_features": list(nwp_features),
+                    "nwp_use_invalid_mask": bool(nwp_use_invalid_mask),
                 },
                 best_ckpt_path,
             )
@@ -841,6 +991,8 @@ def main() -> None:
             "ema": ema is not None,
             "zero_sky": zero_sky,
             "use_nwp": use_nwp,
+            "nwp_features": list(nwp_features),
+            "nwp_use_invalid_mask": bool(nwp_use_invalid_mask),
         },
         final_path,
     )
@@ -873,6 +1025,8 @@ def main() -> None:
                 "weight_decay": args.weight_decay,
                 "use_nwp": int(use_nwp),
                 "zero_sky": int(zero_sky),
+                "nwp_features": nwp_features_str,
+                "nwp_use_invalid_mask": int(nwp_use_invalid_mask),
                 "dataset_config": dataset_cfg,
                 "eval_max_batches": -1 if eval_cap is None else int(eval_cap),
                 "use_ema": int(args.use_ema),
