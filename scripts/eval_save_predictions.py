@@ -47,7 +47,12 @@ from torch.utils.data import DataLoader
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from dataloader.folsom import FolsomIrradianceDataset, _FOLSOM_GHI_SCALE  # noqa: E402
+from dataloader.folsom import (  # noqa: E402
+    _FOLSOM_GHI_SCALE,
+    _FOLSOM_HUBER_DELTA,
+    _FOLSOM_KT_INPUT_SCALE,
+    FolsomIrradianceDataset,
+)
 from dataloader.luoyang_zarr import collate_batched  # noqa: E402
 from models.models import pv_forecasting_model_vit_imgs  # noqa: E402
 from training.train_vit_test_folsom import (  # noqa: E402
@@ -197,7 +202,7 @@ def _run_inference(
     input_ts_chunks: list[list[list[str]]] = []
     forecast_ts_chunks: list[list[list[str]]] = []
 
-    huber_per_elem = nn.HuberLoss(delta=30.0, reduction="none")
+    huber_per_elem = nn.HuberLoss(delta=_FOLSOM_HUBER_DELTA, reduction="none")
     sum_abs = 0.0
     sum_sq = 0.0
     n_elem = 0.0
@@ -216,7 +221,7 @@ def _run_inference(
             _prepare_nwp_for_vit(d, use_nwp=use_nwp)
             _prepare_sky_for_vit(d, zero_sky=zero_sky)
 
-            kt_pred = forward_vit(model, d) * 4000.0
+            kt_pred = forward_vit(model, d) * _FOLSOM_KT_INPUT_SCALE
             pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
             t_out = int(pv_pred.shape[1])
             h = min(h_steps, t_out)

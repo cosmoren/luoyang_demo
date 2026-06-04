@@ -73,7 +73,10 @@ _CONFIG_DIR = _PROJECT_ROOT / "config"
 _DATASETS_CONFIG_DIR = _CONFIG_DIR / "datasets"
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from dataloader.folsom import FolsomIrradianceDataset  # noqa: E402
+from dataloader.folsom import (  # noqa: E402
+    _FOLSOM_KT_INPUT_SCALE,
+    FolsomIrradianceDataset,
+)
 from dataloader.luoyang_zarr import collate_batched  # noqa: E402
 from models.models import pv_forecasting_model_vit_imgs  # noqa: E402
 from training.train_vit_test_folsom import (  # noqa: E402
@@ -332,8 +335,9 @@ def main() -> None:
             _prepare_sky_for_vit(d, zero_sky=zero_sky)
 
             with autocast_ctx:
-                # Rescale matches trainer: ViT input was kt/4000, so output * 4000 recovers kt.
-                kt_pred = forward_vit(model, d) * 4000.0
+                # Rescale matches trainer: ViT input was kt/_FOLSOM_KT_INPUT_SCALE, so multiplying
+                # the output by the same scale recovers kt.
+                kt_pred = forward_vit(model, d) * _FOLSOM_KT_INPUT_SCALE
             pv_pred = (kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)).float()  # [B, T_out]
 
             pred_np = pv_pred.detach().cpu().numpy()

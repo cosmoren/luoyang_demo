@@ -134,6 +134,12 @@ _FOLSOM_GHI_SCALE = 1000.0
 # where ``p_cs <= 0.1`` (nighttime / very low sun) get ``kt = 0`` via the mask product.
 _FOLSOM_KT_DAYTIME_THRESHOLD = 0.1
 _FOLSOM_KT_EPS = 1e-6
+# ViT input/output scaling for ``kt`` (W/m^2-ish; see ``forward_vit`` docstring in the
+# trainer). Single source of truth so trainer / eval / inference stay in lockstep.
+_FOLSOM_KT_INPUT_SCALE = 4000.0
+# Huber loss delta in W/m^2, sized for the PV-target residual scale (~3% of 1000 W/m^2
+# peak, rounded to 30). Shared by trainer + eval Huber sites.
+_FOLSOM_HUBER_DELTA = 30.0
 
 
 def _compute_folsom_p_cs(

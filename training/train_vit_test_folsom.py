@@ -55,7 +55,12 @@ _DEFAULT_SKY_FORMAT_FOR_PV_TRAINER = "zarr"
 _FOLSOM_PV_TEMP_CFG_DIRS: list[Path] = []
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from dataloader.folsom import FolsomIrradianceDataset, _FOLSOM_NWP_FEATURE_COLS  # noqa: E402
+from dataloader.folsom import (  # noqa: E402
+    _FOLSOM_HUBER_DELTA,
+    _FOLSOM_KT_INPUT_SCALE,
+    _FOLSOM_NWP_FEATURE_COLS,
+    FolsomIrradianceDataset,
+)
 from dataloader.luoyang_zarr import collate_batched  # noqa: E402
 from models.models import (  # noqa: E402
     NWP_FEATURE_NORMALIZERS,
@@ -292,7 +297,7 @@ def forward_vit(model: nn.Module, d: dict) -> torch.Tensor:
     0.66, matching Luoyang's headroom (Luoyang p99/20 = 0.38, max/20 = 0.60)."""
     return model(
         d["device_id"],
-        d["kt"] / 4000.0,
+        d["kt"] / _FOLSOM_KT_INPUT_SCALE,
         pv_mask=d["kt_mask"],
         pv_timefeats=d["pv_timefeats"],
         forecast_timefeats=d["forecast_timefeats"],
@@ -362,7 +367,7 @@ def train_one_epoch(
         _prepare_sky_for_vit(d, zero_sky=zero_sky)
         B = d["device_id"].size(0)
         optimizer.zero_grad()
-        kt_pred = forward_vit(model, d) * 4000.0
+        kt_pred = forward_vit(model, d) * _FOLSOM_KT_INPUT_SCALE
         pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
         t_out = int(pv_pred.shape[1])
         assert d["target_pv"].shape[1] == t_out, (pv_pred.shape, d["target_pv"].shape)
@@ -412,7 +417,7 @@ def evaluate(
             d = _batch_to_device(batch, device)
             _prepare_nwp_for_vit(d, use_nwp=use_nwp)
             _prepare_sky_for_vit(d, zero_sky=zero_sky)
-            kt_pred = forward_vit(model, d) * 4000.0
+            kt_pred = forward_vit(model, d) * _FOLSOM_KT_INPUT_SCALE
             pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
             t_out = int(pv_pred.shape[1])
             h = min(_LOSS_METRIC_HORIZON, t_out)
@@ -830,7 +835,7 @@ def main() -> None:
     # ~= 3% of 33 kW peak; Folsom analog is 3% of 1000 W/m^2 peak ~= 33 W/m^2,
     # rounded to 30). Keeps the Huber MSE region active for "good" predictions
     # and the MAE region for outliers, matching Luoyang's effective behavior.
-    criterion = nn.HuberLoss(delta=30.0)
+    criterion = nn.HuberLoss(delta=_FOLSOM_HUBER_DELTA)
     ema: ModelEMA | None = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
     print(
         f"EMA: {'enabled' if args.use_ema else 'disabled'}"

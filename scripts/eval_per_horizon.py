@@ -41,7 +41,11 @@ from torch.utils.data import DataLoader
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from dataloader.folsom import FolsomIrradianceDataset  # noqa: E402
+from dataloader.folsom import (  # noqa: E402
+    _FOLSOM_HUBER_DELTA,
+    _FOLSOM_KT_INPUT_SCALE,
+    FolsomIrradianceDataset,
+)
 from dataloader.luoyang_zarr import collate_batched  # noqa: E402
 from models.models import pv_forecasting_model_vit_imgs  # noqa: E402
 from training.train_vit_test_folsom import (  # noqa: E402
@@ -202,7 +206,7 @@ def _per_step_eval(
     total_loss_sum = 0.0
     n_batches = 0
 
-    huber_per_elem = nn.HuberLoss(delta=30.0, reduction="none")
+    huber_per_elem = nn.HuberLoss(delta=_FOLSOM_HUBER_DELTA, reduction="none")
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
@@ -212,7 +216,7 @@ def _per_step_eval(
             _prepare_nwp_for_vit(d, use_nwp=use_nwp)
             _prepare_sky_for_vit(d, zero_sky=zero_sky)
 
-            kt_pred = forward_vit(model, d) * 4000.0
+            kt_pred = forward_vit(model, d) * _FOLSOM_KT_INPUT_SCALE
             pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
             t_out = int(pv_pred.shape[1])
             h = min(h_steps, t_out)
@@ -333,7 +337,7 @@ def main() -> int:
         print(f"[eval][warn] --use-nwp={args.use_nwp} but checkpoint was trained with "
               f"use_nwp={ckpt_use_nwp}.")
 
-    criterion = nn.HuberLoss(delta=30.0)  # Match trainer (line 662 of train_vit_test_folsom.py).
+    criterion = nn.HuberLoss(delta=_FOLSOM_HUBER_DELTA)
 
     loader = _build_test_loader(args.dataset_config, args.batch_size, args.num_workers)
     print(f"[eval] test batches: {len(loader)} (batch_size={args.batch_size})")
