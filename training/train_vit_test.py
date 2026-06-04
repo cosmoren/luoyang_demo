@@ -9,6 +9,7 @@ import argparse
 import contextlib
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from torch.utils.tensorboard import SummaryWriter
@@ -74,6 +75,45 @@ def _batch_to_device(batch: dict, device: torch.device) -> dict:
         v = batch.get(key)
         out[key] = None if v is None else v.to(device)
     return out
+
+
+@dataclass
+class EvalMetrics:
+    """Validation/test metrics for combined loss and per-horizon windows."""
+
+    loss: float
+    loss_15m: float
+    loss_4h: float
+    loss_48h: float
+    rmse_15m: float
+    mae_15m: float
+    rmse_4h: float
+    mae_4h: float
+    rmse_48h: float
+    mae_48h: float
+
+    @property
+    def rmse(self) -> float:
+        return self.rmse_48h
+
+    @property
+    def mae(self) -> float:
+        return self.mae_48h
+
+    @staticmethod
+    def log_header() -> str:
+        return (
+            "loss_15m\trmse_15m\tmae_15m\t"
+            "loss_4h\trmse_4h\tmae_4h\t"
+            "loss_48h\trmse_48h\tmae_48h\n"
+        )
+
+    def to_log_line(self) -> str:
+        return (
+            f"{self.loss_15m:.8f}\t{self.rmse_15m:.8f}\t{self.mae_15m:.8f}\t"
+            f"{self.loss_4h:.8f}\t{self.rmse_4h:.8f}\t{self.mae_4h:.8f}\t"
+            f"{self.loss_48h:.8f}\t{self.rmse_48h:.8f}\t{self.mae_48h:.8f}\n"
+        )
 
 
 def forward_vit(model: nn.Module, d: dict) -> torch.Tensor:
@@ -154,7 +194,14 @@ def train_one_epoch(
         kt_pred = forward_vit(model, d) * 20.0
         pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
 
-        loss = criterion( pv_pred, d["target_pv"] )
+        loss_15m = criterion( pv_pred[:,0], d["target_pv"][:,0] )
+        loss_4h = criterion( pv_pred[:,15], d["target_pv"][:,15] )
+        loss_48h = criterion( pv_pred, d["target_pv"] )
+
+        lambda_15m = 2.0
+        lambda_4h = 2.0
+        lambda_48h = 1.0
+        loss = lambda_15m*loss_15m + lambda_4h*loss_4h + lambda_48h*loss_48h
         # loss = criterion(pv_pred, d["target_pv"])
         loss.backward()
         optimizer.step()
@@ -168,9 +215,12 @@ def train_one_epoch(
 
 def evaluate(
     model: nn.Module, device: torch.device, loader: DataLoader, criterion: nn.Module
-) -> tuple[float, float, float]:
+) -> EvalMetrics:
     model.eval()
     total_loss = 0.0
+    total_loss_15m = 0.0
+    total_loss_4h = 0.0
+    total_loss_48h = 0.0
     n = 0
     pred_dict = {}
     target_dict = {}
@@ -180,48 +230,82 @@ def evaluate(
             B = d["device_id"].size(0)
             kt_pred = forward_vit(model, d) * 20.0
             pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
-            loss = criterion( pv_pred, d["target_pv"] )
+            loss_15m = criterion( pv_pred[:,0], d["target_pv"][:,0] )
+            loss_4h = criterion( pv_pred[:,15], d["target_pv"][:,15] )
+            loss_48h = criterion( pv_pred, d["target_pv"] )
+
+            lambda_15m = 2.0
+            lambda_4h = 2.0
+            lambda_48h = 1.0
+            loss = lambda_15m * loss_15m + lambda_4h * loss_4h + lambda_48h * loss_48h
             # loss = criterion(pv_pred, d["target_pv"])
             total_loss += loss.item()
+            total_loss_15m += loss_15m.item()
+            total_loss_4h += loss_4h.item()
+            total_loss_48h += loss_48h.item()
             n += B
             # save these values and used them to compute the MAE and RMSE of the total station
             for i in range(pv_pred.shape[0]):
-                kk = int(d["device_id"][i].item()) # the inverter ID
-                # forecast_timefeats[:, 3] == cos_zenith (see solar_features_encoder column order)
-                # RMSE/MAE aggregation: first 16 horizons only (match training loss window)
+                kk = int(d["device_id"][i].item())  # the inverter ID
                 pred_np = pv_pred[i, :].detach().cpu().float().numpy().copy()
                 tgt_np = d["target_pv"][i, :].detach().cpu().float().numpy().copy()
-                discrete_pred = pred_np.tolist()
-                discrete_target = tgt_np.tolist()
-                
+
                 if kk not in pred_dict:
                     pred_dict[kk] = []
                     target_dict[kk] = []
-                pred_dict[kk].append(discrete_pred)
-                target_dict[kk].append(discrete_target)
-        
-        total_pred = None
-        total_target = None
+                pred_dict[kk].append(pred_np)
+                target_dict[kk].append(tgt_np)
+
+        # Sum inverter outputs per sample -> station-level [N, T] arrays.
+        station_pred = None
+        station_target = None
         for kk in pred_dict.keys():
-            if total_pred is None:
-                total_pred = np.asarray(pred_dict[kk]).reshape(-1)
+            pred_k = np.asarray(pred_dict[kk])
+            tgt_k = np.asarray(target_dict[kk])
+            if station_pred is None:
+                station_pred = pred_k
+                station_target = tgt_k
             else:
-                total_pred = total_pred + np.asarray(pred_dict[kk]).reshape(-1)
-            
-            if total_target is None:
-                total_target = np.asarray(target_dict[kk]).reshape(-1)
-            else:
-                total_target = total_target + np.asarray(target_dict[kk]).reshape(-1)
-        
-        scale = 1.0
-        mae = np.mean(np.abs(total_pred*scale - total_target*scale))
-        rmse = np.sqrt(np.mean((total_pred*scale - total_target*scale) ** 2))
+                station_pred = station_pred + pred_k
+                station_target = station_target + tgt_k
+
+        def _mae_rmse(pred: np.ndarray, tgt: np.ndarray) -> tuple[float, float]:
+            diff = pred - tgt
+            return float(np.mean(np.abs(diff))), float(np.sqrt(np.mean(diff ** 2)))
+
+        # Horizons aligned with training loss: idx 0 = t0+15m, idx 15 = t0+4h, all = 48h window.
+        idx_15m, idx_4h = 0, 15
+        mae_15m, rmse_15m = _mae_rmse(station_pred[:, idx_15m], station_target[:, idx_15m])
+        mae_4h, rmse_4h = _mae_rmse(station_pred[:, idx_4h], station_target[:, idx_4h])
+        mae_48h, rmse_48h = _mae_rmse(station_pred.reshape(-1), station_target.reshape(-1))
 
         capacity = 54600
-        print(f"RMSE/MAE on first 16 steps (15min), ~4h. Capacity: {capacity}(KW)")
-        print(f"MAE: {mae:.6f}, RMSE: {rmse:.6f}, ACC(MAE): {1.0 - mae/capacity:.6f}, ACC(RMSE): {1.0 - rmse/capacity:.6f}")
-    
-    return total_loss / max(n, 1), rmse, mae
+        for label, mae, rmse in (
+            ("t0+15m", mae_15m, rmse_15m),
+            ("t0+4h", mae_4h, rmse_4h),
+            ("t0+48h", mae_48h, rmse_48h),
+        ):
+            print(f"RMSE/MAE [{label}]. Capacity: {capacity}(KW)")
+            print(
+                f"  MAE: {mae:.6f}, RMSE: {rmse:.6f}, "
+                f"ACC(MAE): {1.0 - mae / capacity:.6f}, ACC(RMSE): {1.0 - rmse / capacity:.6f}"
+            )
+
+        mae, rmse = mae_48h, rmse_48h
+
+    denom = max(n, 1)
+    return EvalMetrics(
+        loss=total_loss / denom,
+        loss_15m=total_loss_15m / denom,
+        loss_4h=total_loss_4h / denom,
+        loss_48h=total_loss_48h / denom,
+        rmse_15m=rmse_15m,
+        mae_15m=mae_15m,
+        rmse_4h=rmse_4h,
+        mae_4h=mae_4h,
+        rmse_48h=rmse_48h,
+        mae_48h=mae_48h,
+    )
 
 
 def _build_lr_scheduler(
@@ -521,7 +605,7 @@ def main() -> None:
     # initial_test_loss, _, _ = evaluate(model, device, test_loader, criterion)
     # print(f"Initial test loss: {initial_test_loss:.6f}")
 
-    rmse_min = 1e8
+    best_val_loss = float("inf")
     for epoch in range(1, args.epochs + 1):
         cur_lr = optimizer.param_groups[0]["lr"]
         ema_active = ema is not None and epoch > args.ema_warmup_epochs
@@ -540,17 +624,18 @@ def main() -> None:
         )
         if ema_active:
             with ema.apply(model):
-                val_loss, val_rmse, val_mae = evaluate(model, device, val_loader, criterion)
+                val_metrics = evaluate(model, device, val_loader, criterion)
         else:
-            val_loss, val_rmse, val_mae = evaluate(model, device, val_loader, criterion)
+            val_metrics = evaluate(model, device, val_loader, criterion)
+        val_loss = val_metrics.loss
         print(
             f"Epoch {epoch}/{args.epochs}  lr={cur_lr:.2e}  "
             f"train_loss={avg_loss:.6f}  val_loss={val_loss:.6f}"
         )
         writer.add_scalar("loss/train", avg_loss, epoch)
         writer.add_scalar("loss/val", val_loss, epoch)
-        writer.add_scalar("metric/val_rmse", val_rmse, epoch)
-        writer.add_scalar("metric/val_mae", val_mae, epoch)
+        writer.add_scalar("metric/val_rmse", val_metrics.rmse, epoch)
+        writer.add_scalar("metric/val_mae", val_metrics.mae, epoch)
         writer.add_scalar("lr", cur_lr, epoch)
         scheduler.step()
 
@@ -569,8 +654,8 @@ def main() -> None:
             )
             print(f"  saved {path}")
         
-        if val_rmse < rmse_min:
-            rmse_min = val_rmse
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
             best_state = ema.state_dict() if ema_active else model.state_dict()
             torch.save(
                 {
@@ -579,6 +664,7 @@ def main() -> None:
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
                     "loss": avg_loss,
+                    "val_loss": val_loss,
                     "dev_dn_list": dev_dn_list,
                     "ema": ema_active,
                 },
@@ -603,13 +689,13 @@ def main() -> None:
     if best_ckpt_path.is_file():
         ckpt = torch.load(best_ckpt_path, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"])
-        test_loss_best, test_rmse_best, test_mae_best = evaluate(model, device, test_loader, criterion)
+        test_metrics = evaluate(model, device, test_loader, criterion)
         print(
-            f"Test set with best val-RMSE checkpoint ({best_ckpt_path.name}, epoch={ckpt.get('epoch', '?')}): "
-            f"loss={test_loss_best:.6f}, RMSE={test_rmse_best:.6f}, MAE={test_mae_best:.6f}"
+            f"Test set with best val-loss checkpoint ({best_ckpt_path.name}, epoch={ckpt.get('epoch', '?')}): "
+            f"loss={test_metrics.loss:.6f}, RMSE={test_metrics.rmse:.6f}, MAE={test_metrics.mae:.6f}"
         )
-        writer.add_scalar("metric/test_rmse", test_rmse_best, args.epochs)
-        writer.add_scalar("metric/test_mae", test_mae_best, args.epochs)
+        writer.add_scalar("metric/test_rmse", test_metrics.rmse, args.epochs)
+        writer.add_scalar("metric/test_mae", test_metrics.mae, args.epochs)
         writer.add_hparams(
             {
                 "lr": args.lr,
@@ -619,15 +705,16 @@ def main() -> None:
                 "weight_decay": args.weight_decay,
             },
             {
-                "hparam/test_rmse": test_rmse_best,
-                "hparam/test_mae": test_mae_best,
+                "hparam/test_rmse": test_metrics.rmse,
+                "hparam/test_mae": test_metrics.mae,
             },
         )
-        metrics_log = checkpoint_dir / f"pv_forecast_4h_pv_sat_{_ckpt_suffix}.txt"
+        metrics_log = checkpoint_dir / f"pv_forecast_pv_sat_{_ckpt_suffix}.txt"
+        write_header = not metrics_log.exists() or metrics_log.stat().st_size == 0
         with open(metrics_log, "a", encoding="utf-8") as mf:
-            mf.write(
-                f"{test_loss_best:.8f}\t{test_rmse_best:.8f}\t{test_mae_best:.8f}\n"
-            )
+            if write_header:
+                mf.write(EvalMetrics.log_header())
+            mf.write(test_metrics.to_log_line())
         print(f"Appended best-test metrics to {metrics_log}")
     else:
         print(f"No {best_ckpt_path.name} on disk; skip test evaluation with best checkpoint.")

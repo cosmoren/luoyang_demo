@@ -605,6 +605,7 @@ class pv_forecasting_model_vit_imgs(nn.Module):
 
         pv_timefeats = pv_timefeats[:, :, [2,3,8]]
         forecast_timefeats = forecast_timefeats[:, :, [2,3,8]]
+        sat_timefeats = sat_timefeats[:, :, [2,3,8]]
         
         pv_history = torch.cat([pv_masked, pv_mask, pv_timefeats.permute(0, 2, 1)], dim=1)  # [B, C=11, T]
         pv_hist_mem = self.TCN(pv_history, pv_mask)     # [B, C_out, T]()
@@ -619,9 +620,18 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         KV_hist_mem_compressed = KV_hist_mem_compressed + corase_queries + self.pv_mod_embed
 
         # Forecast queries
-        ssrd_normalized = (nwp_tensor[:,:,0]/1000 - 0.5)*2
-        # msl_normalized = (nwp_tensor[:,:,1]-101325)/1000
-        t2m_normalized = (nwp_tensor[:,:,2]-288.15)/10
+        if nwp_tensor is not None:
+            ssrd_normalized = (nwp_tensor[:,:,0]/1000 - 0.5)*2
+            # msl_normalized = (nwp_tensor[:,:,1]-101325)/1000
+            t2m_normalized = (nwp_tensor[:,:,2]-288.15)/10
+        else:
+            zero_nwp_feat = torch.zeros(
+                forecast_timefeats.shape[:2],
+                device=forecast_timefeats.device,
+                dtype=forecast_timefeats.dtype,
+            )
+            ssrd_normalized = zero_nwp_feat
+            t2m_normalized = zero_nwp_feat
         forecast_ssrd_timefeats = torch.cat([forecast_timefeats, ssrd_normalized.unsqueeze(2), t2m_normalized.unsqueeze(2)], dim=2)
         forecast_query = self.query_mlp(forecast_ssrd_timefeats)
 
