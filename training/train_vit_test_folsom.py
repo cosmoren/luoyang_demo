@@ -797,7 +797,7 @@ def main() -> None:
         lr_min=args.lr_min,
     )
     # delta is sized to Folsom's W/m^2 residual scale (Luoyang uses delta=1 kW
-    # ~= 3% of 33 kW peak; Folsom analog is 3% of 1100 W/m^2 peak ~= 33 W/m^2,
+    # ~= 3% of 33 kW peak; Folsom analog is 3% of 1000 W/m^2 peak ~= 33 W/m^2,
     # rounded to 30). Keeps the Huber MSE region active for "good" predictions
     # and the MAE region for outliers, matching Luoyang's effective behavior.
     criterion = nn.HuberLoss(delta=30.0)

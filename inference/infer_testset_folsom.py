@@ -77,6 +77,7 @@ from dataloader.folsom import FolsomIrradianceDataset  # noqa: E402
 from dataloader.luoyang_zarr import collate_batched  # noqa: E402
 from models.models import pv_forecasting_model_vit_imgs  # noqa: E402
 from training.train_vit_test_folsom import (  # noqa: E402
+    _LOSS_METRIC_HORIZON,
     _batch_to_device,
     _dataset_kwargs as _folsom_dataset_kwargs,
     _format_nwp_features_for_log,
@@ -88,8 +89,9 @@ from training.train_vit_test_folsom import (  # noqa: E402
 
 
 # Post-alignment (commit 518dca9) FolsomIrradianceDataset stores ``target_pv`` as raw
-# GHI in W/m^2 (no /1100 normalization), so predictions/targets are already in W/m^2 and
-# need no rescale. Kept as a constant=1.0 for clarity / NPZ metadata.
+# GHI in W/m^2 (no rescale; ``_FOLSOM_GHI_SCALE = 1000.0`` in the dataloader only
+# controls ``p_cs`` normalisation and is consumed via ``target_p_cs`` / ``p_mean``).
+# Predictions/targets are already in W/m^2 here. Constant kept as 1.0 for NPZ metadata.
 GHI_SCALE_WM2 = 1.0
 
 # ``forecast_timefeats`` schema: [sin_az, cos_az, sin_ze, cos_ze, sin_doy, cos_doy,
@@ -330,14 +332,8 @@ def main() -> None:
             _prepare_sky_for_vit(d, zero_sky=zero_sky)
 
             with autocast_ctx:
-                # !!! BUG / NEEDS FIXING !!!
-                # Scale factor must match training (training/train_vit_test_folsom.py uses 4000.0
-                # because Folsom kt = GHI / p_cs is in ~W/m^2 units; the 20.0 here is a leftover
-                # from the Luoyang inference script and is INVALID for Folsom checkpoints.
-                # Until this is rescaled to 4000.0, every number this script writes
-                # (NPZ preds, _summary.csv RMSE/MAE/MBE) is off by ~200x and INVALID.
-                # TODO: change 20.0 -> 4000.0 and re-run inference on all Folsom checkpoints.
-                kt_pred = forward_vit(model, d) * 20.0
+                # Rescale matches trainer: ViT input was kt/4000, so output * 4000 recovers kt.
+                kt_pred = forward_vit(model, d) * 4000.0
             pv_pred = (kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)).float()  # [B, T_out]
 
             pred_np = pv_pred.detach().cpu().numpy()
@@ -424,6 +420,33 @@ def main() -> None:
             "use_nwp": bool(use_nwp),
             "checkpoint": ckpt_basename,
         })
+
+    # 48h-pooled aggregate (trainer-style): all 192 (or T_out, whichever is smaller)
+    # output steps, masked by ``target_mask``. Predictions at night were already zeroed
+    # above when --mask_night is on (default), mirroring the trainer's evaluate(). We
+    # do NOT re-mask here -- just respect the existing ``preds`` array.
+    h_pooled = min(_LOSS_METRIC_HORIZON, T_out)
+    m_pool = target_mask[:, :h_pooled].astype(np.float64)
+    n_valid_pool = int(m_pool.sum())
+    if n_valid_pool > 0:
+        diff_pool = preds[:, :h_pooled].astype(np.float64) - targets[:, :h_pooled].astype(np.float64)
+        rmse_pool = float(np.sqrt(((diff_pool ** 2) * m_pool).sum() / n_valid_pool))
+        mae_pool = float((np.abs(diff_pool) * m_pool).sum() / n_valid_pool)
+        mbe_pool = float((diff_pool * m_pool).sum() / n_valid_pool)
+    else:
+        rmse_pool = float("nan")
+        mae_pool = float("nan")
+        mbe_pool = float("nan")
+    summary_rows.append({
+        "horizon": "48h_pooled",
+        "n_valid": n_valid_pool,
+        "rmse": rmse_pool,
+        "mae": mae_pool,
+        "mbe": mbe_pool,
+        "zero_sky": bool(zero_sky),
+        "use_nwp": bool(use_nwp),
+        "checkpoint": ckpt_basename,
+    })
 
     summary_df = pd.DataFrame(summary_rows)
     summary_path = out_dir / "_summary.csv"
