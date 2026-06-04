@@ -28,11 +28,13 @@ import atexit
 import contextlib
 import copy
 import os
+import random
 import shutil
 import sys
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim.lr_scheduler as lr_scheduler
@@ -267,6 +269,17 @@ def _prepare_sky_for_vit(d: dict, *, zero_sky: bool) -> dict:
         if t is not None:
             d[key] = torch.zeros_like(t)
     return d
+
+
+def _seed_worker(worker_id: int) -> None:
+    """DataLoader ``worker_init_fn``: distinct-but-deterministic per-worker RNGs.
+
+    ``dataloader.folsom`` calls ``np.random.choice`` per ``__getitem__``, so without this each
+    worker would share whatever numpy/random state it forked with.
+    """
+    worker_seed = (torch.initial_seed() + worker_id) % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def forward_vit(model: nn.Module, d: dict) -> torch.Tensor:
@@ -575,6 +588,12 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
         help="Skip EMA updates for the first N epochs (default 5).",
     )
     parser.add_argument("--batch_size", type=int, default=int(h["batch_size"]))
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="RNG seed for python/numpy/torch + dataloader workers (default 0).",
+    )
     parser.add_argument("--checkpoint_dir", type=str, default=None)
     parser.add_argument("--save_every", type=int, default=int(h["save_every"]))
     parser.add_argument("--num_workers", type=int, default=int(h["num_workers"]))
@@ -756,6 +775,17 @@ def main() -> None:
     parser = _build_parser(h, config_default=pre_args.config)
     args = parser.parse_args()
 
+    seed = int(args.seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # Soft seeding: keep cudnn autotuner on (benchmark=True) and skip the deterministic
+    # algo selection so we don't pay the perf hit. Multi-seed A/Bs still see real variance
+    # since the python/numpy/torch RNGs above pin sample order, init, and worker draws.
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+
     dataset_cfg = args.dataset_config
     train_dataset = FolsomIrradianceDataset(**_dataset_kwargs(dataset_cfg, "train"))
     val_dataset = FolsomIrradianceDataset(**_dataset_kwargs(dataset_cfg, "val"))
@@ -806,6 +836,7 @@ def main() -> None:
         f"EMA: {'enabled' if args.use_ema else 'disabled'}"
         + (f" (decay={args.ema_decay}, warmup={args.ema_warmup_epochs} epoch)" if args.use_ema else "")
     )
+    print(f"Seed: {seed} (soft cudnn: benchmark=True, deterministic=False)")
 
     nw = int(args.num_workers)
     pin = torch.cuda.is_available()
@@ -817,6 +848,7 @@ def main() -> None:
         num_workers=nw,
         pin_memory=pin,
         persistent_workers=nw > 0,
+        worker_init_fn=_seed_worker,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -826,6 +858,7 @@ def main() -> None:
         num_workers=nw,
         pin_memory=pin,
         persistent_workers=nw > 0,
+        worker_init_fn=_seed_worker,
     )
     test_loader = DataLoader(
         test_dataset,
@@ -835,6 +868,7 @@ def main() -> None:
         num_workers=nw,
         pin_memory=pin,
         persistent_workers=nw > 0,
+        worker_init_fn=_seed_worker,
     )
 
     checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else _PROJECT_ROOT / "checkpoints_folsom_pv"
@@ -1023,6 +1057,7 @@ def main() -> None:
                 "epochs": args.epochs,
                 "warmup_epochs": args.warmup_epochs,
                 "weight_decay": args.weight_decay,
+                "seed": int(args.seed),
                 "use_nwp": int(use_nwp),
                 "zero_sky": int(zero_sky),
                 "nwp_features": nwp_features_str,
