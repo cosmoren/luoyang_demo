@@ -48,7 +48,7 @@ sampling:
   pv_input_interval_min: 5      # multiple of csv_interval_min
   pv_input_len: 576             # 576 * 5min = 48 h history
   pv_output_interval_min: 15    # multiple of csv_interval_min
-  pv_output_len: 192            # 192 * 15min = 48 h forecast
+  pv_output_len: 16             # 16 * 15min = 4 h forecast
   # Time-based split: 60% train / 10% val / 30% test (fixed in the dataset class; this fraction
   # is required by the schema but only `pv_train_time_fraction` is read for legacy parity).
   pv_train_time_fraction: 0.7
