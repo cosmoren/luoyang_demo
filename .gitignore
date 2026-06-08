@@ -121,3 +121,6 @@ inference_results/
 # Daily progress reports (generated artifacts)
 progress_report_*.pptx
 report_*/
+
+# Animated forecast outputs (generated artifacts; regenerate via inference/animate_forecast.py)
+inference/animations/
