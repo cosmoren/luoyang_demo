@@ -123,4 +123,6 @@ progress_report_*.pptx
 report_*/
 
 # Animated forecast outputs (generated artifacts; regenerate via inference/animate_forecast.py)
-inference/animations/
+# Ignore everything inside inference/animations/ except the RUNS.md manifest.
+inference/animations/*
+!inference/animations/RUNS.md

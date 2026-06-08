@@ -63,6 +63,10 @@ _DEFAULT_CHECKPOINT = (
 )
 _DEFAULT_ARCHIVE_NAME = "lr2e5_4h_2seeds_sky_nwp_2026-06-05"
 _DEFAULT_RUN_NAME = "ghi_sky_nwp_s0"
+# Variant tag used as a subfolder under --out-dir. Change the label whenever you
+# change model / horizon / anchor stride / rendering choices so old artifacts
+# survive. RUNS.md alongside --out-dir documents what each label means.
+_DEFAULT_RUN_LABEL = "v1_vit_sky_nwp_s0"
 
 # Folsom is California; January is PST = UTC-8, summer is PDT = UTC-7. zoneinfo
 # does the right thing automatically for any date in [1970, 2037].
@@ -495,7 +499,18 @@ def _parse_args() -> argparse.Namespace:
         "--out-dir",
         type=str,
         default=str(_PROJECT_ROOT / "inference" / "animations"),
-        help="Output directory (default: inference/animations).",
+        help="Output base directory (default: inference/animations).",
+    )
+    p.add_argument(
+        "--run-label",
+        type=str,
+        default=_DEFAULT_RUN_LABEL,
+        help=(
+            "Variant tag used as a subfolder under --out-dir (default: "
+            f"{_DEFAULT_RUN_LABEL!r}). Use a different label whenever you change "
+            "the model, anchor stride, horizon, or other rendering choices so "
+            "outputs do not overwrite each other."
+        ),
     )
     p.add_argument(
         "--force",
@@ -529,7 +544,8 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
-    out_dir = Path(args.out_dir).expanduser().resolve()
+    out_root = Path(args.out_dir).expanduser().resolve()
+    out_dir = out_root / args.run_label
     out_dir.mkdir(parents=True, exist_ok=True)
 
     npz_path = out_dir / f"{args.date}_predictions.npz"
@@ -619,6 +635,7 @@ def main() -> int:
         )
         meta = dict(
             date_local=args.date,
+            run_label=args.run_label,
             archive_name=args.archive_name,
             run_name=args.run_name,
             checkpoint=run_meta["checkpoint"],
@@ -692,6 +709,7 @@ def main() -> int:
     # (CSV row at display time T should equal gt_kw[i].)
     print("\n[animate] === SUMMARY ===")
     print(f"  date_local      : {args.date}")
+    print(f"  run_label       : {args.run_label}")
     print(f"  archive_name    : {meta.get('archive_name')}")
     print(f"  run_name        : {meta.get('run_name')}")
     print(f"  checkpoint      : {meta.get('checkpoint')}")
