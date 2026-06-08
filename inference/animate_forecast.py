@@ -4,7 +4,8 @@ Animate a rolling 15-min next-step nowcast for one local day at Folsom, CA.
 Produces a two-panel GIF:
 
     LEFT  : fisheye sky-camera image at the current display time T
-    RIGHT : ground truth (black) + point prediction (red) vs hour-of-day (local)
+    RIGHT : ground truth (black) + one-or-two point predictions vs
+            hour-of-day (local)
 
 For each display time T on a 15-min local grid:
 
@@ -17,18 +18,33 @@ the project brief. Inference and rendering are kept separate so visual tweaks
 do not require re-running the model: predictions are cached in a NPZ next to
 the GIF (see ``--force`` to recompute).
 
+Two-model overlay (v2 mode):
+
+    Pass ``--checkpoint-extra <path>`` to overlay a second model's prediction
+    on the same panel as a third (blue) line. This is used to visually compare
+    a sky-arm against a no-sky arm. The two checkpoints can carry different
+    ``zero_sky`` flags; each forward uses its own checkpoint's flag. The
+    dataset is constructed once and reused for both forwards.
+
 Usage::
 
+    # v1 (single model, same as before):
     micromamba run -n luoyang python inference/animate_forecast.py \
         --date 2014-01-15
 
+    # v2 (sky vs no-sky 3-line overlay):
     micromamba run -n luoyang python inference/animate_forecast.py \
-        --date 2014-06-15 --keep-frames
+        --run-label v2_sky_vs_nosky \
+        --date 2014-01-15 \
+        --checkpoint /path/to/sky_best.pt \
+        --checkpoint-extra /path/to/nosky_best.pt
 
-Outputs (under ``inference/animations/``):
+Outputs (under ``inference/animations/<run_label>/``):
 
     <date>.gif                  the animation itself
-    <date>_predictions.npz      per-frame (t, gt, pred) arrays
+    <date>_predictions.npz      per-frame (t, gt, pred[, pred_extra]) arrays
+                                v1 schema: gt_kw, pred_kw
+                                v2 schema: gt_kw, pred_sky_kw, pred_nosky_kw
     <date>_meta.json            checkpoint / run / config metadata
     <date>_frames/              per-frame PNGs (only with --keep-frames)
 """
@@ -214,12 +230,29 @@ def _run_model_on_anchors(
     checkpoint_path: Path,
     device,
     batch_size: int = 8,
+    legacy_pre_518dca9: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     """Forward the model once per anchor; return (pred_kw, gt_kw, cos_zenith, meta).
 
     Predictions/targets are *raw GHI* in W/m^2 (the Folsom training target post-
     commit 518dca9; see :mod:`inference.infer_testset_folsom`). The output arrays
     line up with ``anchors`` (one entry per anchor; we only ever take step 0).
+
+    ``legacy_pre_518dca9`` switch: pre-518dca9 (May-26 era) checkpoints were
+    trained with a different normalization recipe -- ``_FOLSOM_GHI_SCALE = 1100``
+    in the dataloader, ``target_pv = ghi/1100`` (normalized), ``p_mean = 1``,
+    ``kt = (ghi/1100) / (ghi_cs/1100) = ghi/ghi_cs ~ [0, 1.5]``, and trainer-side
+    ``kt_input_scale = 20.0``. HEAD's dataloader instead emits raw-W/m^2 ``kt =
+    1000 * ghi/ghi_cs`` and ``target_pv = ghi`` (W/m^2), with trainer scale
+    ``_FOLSOM_KT_INPUT_SCALE = 4000.0``. To run a pre-518dca9 checkpoint
+    correctly with HEAD's dataloader, we (a) pre-scale ``d["kt"]`` so the
+    in-function ``/ _FOLSOM_KT_INPUT_SCALE`` yields ``kt_legacy/20``, (b)
+    multiply the output by ``20`` to recover ``kt_legacy``, and (c) multiply
+    the reconstructed ``pv_pred`` by an extra ``1000`` to land in W/m^2
+    (HEAD's ``target_p_cs = ghi_cs/1000`` so ``kt_legacy * target_p_cs * 1000
+    = (ghi/ghi_cs) * (ghi_cs/1000) * 1000 = ghi``). Without this switch the
+    May-26 model sees inputs ~5x larger than training distribution and outputs
+    saturate at ~30% of the correct magnitude.
     """
     import torch
     from torch.utils.data import DataLoader
@@ -235,6 +268,21 @@ def _run_model_on_anchors(
         resolve_nwp_features_from_ckpt,
     )
 
+    # Legacy (pre-518dca9) constants: the May-26 trainer fed the model
+    # ``kt_legacy / 20.0`` where ``kt_legacy = ghi/ghi_cs ~ [0, 1.5]``. Today's
+    # dataloader emits ``kt = 1000 * ghi/ghi_cs``. Pre-scaling factor below
+    # arranges that ``forward_vit``'s in-function ``/ _FOLSOM_KT_INPUT_SCALE``
+    # yields ``kt_legacy / 20`` exactly. Reconstruction multiplier is the
+    # extra 1000x needed to land in W/m^2 (since HEAD's ``target_p_cs`` lives
+    # at the 1000-scale, not the 1100-scale).
+    _LEGACY_KT_INPUT_SCALE = 20.0
+    _LEGACY_KT_DATALOADER_SCALE_RATIO = 1000.0  # HEAD kt = 1000 * legacy kt
+    _LEGACY_KT_PRESCALE = (
+        _FOLSOM_KT_INPUT_SCALE / (_LEGACY_KT_DATALOADER_SCALE_RATIO * _LEGACY_KT_INPUT_SCALE)
+    )  # = 4000 / (1000 * 20) = 0.2
+    _LEGACY_PV_RECON_EXTRA_SCALE = _LEGACY_KT_DATALOADER_SCALE_RATIO  # 1000.0
+    _LEGACY_KT_RECOVERY_MUL = _LEGACY_KT_INPUT_SCALE  # 20.0
+
     ckpt = torch.load(checkpoint_path, map_location=device)
     ckpt_zero_sky = bool(ckpt.get("zero_sky", False))
     ckpt_use_nwp = bool(ckpt.get("use_nwp", True))
@@ -247,10 +295,18 @@ def _run_model_on_anchors(
     ).to(device)
     state = ckpt.get("model_state_dict", ckpt)
     missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing:
-        print(f"[animate] WARNING missing keys: {len(missing)} (first 5: {missing[:5]})")
-    if unexpected:
-        print(f"[animate] WARNING unexpected keys: {len(unexpected)} (first 5: {unexpected[:5]})")
+    missing_list = list(missing)
+    unexpected_list = list(unexpected)
+    if missing_list:
+        print(
+            f"[animate] WARNING missing keys: {len(missing_list)} "
+            f"(first 5: {missing_list[:5]}) for {checkpoint_path}"
+        )
+    if unexpected_list:
+        print(
+            f"[animate] WARNING unexpected keys: {len(unexpected_list)} "
+            f"(first 5: {unexpected_list[:5]}) for {checkpoint_path}"
+        )
     model.eval()
 
     class _AnchorView(torch.utils.data.Dataset):
@@ -287,9 +343,23 @@ def _run_model_on_anchors(
             d = _batch_to_device(batch, device)
             _prepare_nwp_for_vit(d, use_nwp=ckpt_use_nwp)
             _prepare_sky_for_vit(d, zero_sky=ckpt_zero_sky)
+            if legacy_pre_518dca9:
+                # Pre-scale d["kt"] so forward_vit's in-function division by
+                # _FOLSOM_KT_INPUT_SCALE (= 4000) yields kt_legacy/20.
+                d["kt"] = d["kt"] * _LEGACY_KT_PRESCALE
             with autocast_ctx:
-                kt_pred = forward_vit(model, d) * _FOLSOM_KT_INPUT_SCALE
-            pv_pred = (kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)).float()
+                output = forward_vit(model, d)
+            if legacy_pre_518dca9:
+                kt_pred = output * _LEGACY_KT_RECOVERY_MUL
+                pv_pred = (
+                    kt_pred
+                    * d["target_p_cs"]
+                    * d["p_mean"].unsqueeze(1)
+                    * _LEGACY_PV_RECON_EXTRA_SCALE
+                ).float()
+            else:
+                kt_pred = output * _FOLSOM_KT_INPUT_SCALE
+                pv_pred = (kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)).float()
             B = pv_pred.shape[0]
             cz = d["forecast_timefeats"][:, 0, 3].detach().cpu().numpy()
             night = cz < 0
@@ -308,6 +378,11 @@ def _run_model_on_anchors(
         use_nwp=ckpt_use_nwp,
         nwp_features=list(nwp_features),
         nwp_use_invalid_mask=bool(nwp_use_invalid_mask),
+        missing_keys_count=len(missing_list),
+        unexpected_keys_count=len(unexpected_list),
+        missing_keys_first5=missing_list[:5],
+        unexpected_keys_first5=unexpected_list[:5],
+        legacy_pre_518dca9=bool(legacy_pre_518dca9),
     )
     return preds_step0, gts_step0, cz_step0, meta
 
@@ -352,7 +427,7 @@ def _render_one_frame(
     t_utc: pd.Timestamp,
     hours_local: np.ndarray,
     gt_kw: np.ndarray,
-    pred_kw: np.ndarray,
+    preds: list[tuple[np.ndarray, str, str]],
     cursor_idx: int,
     sky_img: np.ndarray | None,
     date_local_str: str,
@@ -360,8 +435,14 @@ def _render_one_frame(
     ymax: float,
     xlim: tuple[float, float],
     title_right: str,
+    gt_label: str = "Ground truth",
 ) -> np.ndarray:
-    """Render one (left=sky, right=plot) frame and return as ``[H, W, 3]`` uint8."""
+    """Render one (left=sky, right=plot) frame and return as ``[H, W, 3]`` uint8.
+
+    ``preds`` is a list of ``(values, hex_color, legend_label)`` tuples; one
+    line is plotted per entry. v1 mode passes a single tuple (red); v2 mode
+    passes two (red sky, blue no-sky).
+    """
     import matplotlib
 
     matplotlib.use("Agg")
@@ -403,22 +484,24 @@ def _render_one_frame(
             gt_kw[sl],
             color="black",
             linewidth=1.6,
-            label="Ground truth",
+            label=gt_label,
         )
-        ax_r.plot(
-            hours_local[sl],
-            pred_kw[sl],
-            color="#cc1f1f",
-            linewidth=1.6,
-            label="Point pred.",
-        )
-        ax_r.scatter(
-            [hours_local[cursor_idx]],
-            [pred_kw[cursor_idx]],
-            color="#cc1f1f",
-            s=22,
-            zorder=5,
-        )
+        for values, color, label in preds:
+            ax_r.plot(
+                hours_local[sl],
+                values[sl],
+                color=color,
+                linewidth=1.6,
+                label=label,
+            )
+        for values, color, _label in preds:
+            ax_r.scatter(
+                [hours_local[cursor_idx]],
+                [values[cursor_idx]],
+                color=color,
+                s=22,
+                zorder=5,
+            )
         ax_r.scatter(
             [hours_local[cursor_idx]],
             [gt_kw[cursor_idx]],
@@ -496,6 +579,60 @@ def _parse_args() -> argparse.Namespace:
         help="Run name inside the archive (metadata only).",
     )
     p.add_argument(
+        "--checkpoint-extra",
+        type=str,
+        default=None,
+        help=(
+            "Optional second checkpoint. When set, a third (blue) line is "
+            "overlaid on the right panel using this model's prediction. The "
+            "second model's own ``zero_sky`` flag is used for its sky-input "
+            "preparation (so a sky-arm and a no-sky-arm can be compared "
+            "head-to-head)."
+        ),
+    )
+    p.add_argument(
+        "--archive-name-extra",
+        type=str,
+        default=None,
+        help="Archive folder name for the second checkpoint (metadata only).",
+    )
+    p.add_argument(
+        "--run-name-extra",
+        type=str,
+        default=None,
+        help="Run name for the second checkpoint (metadata only).",
+    )
+    p.add_argument(
+        "--label-main",
+        type=str,
+        default=None,
+        help=(
+            "Legend label for the main prediction line. Defaults to "
+            "'GHI + NWP + sky' when --checkpoint-extra is set, else 'Point pred.'."
+        ),
+    )
+    p.add_argument(
+        "--label-extra",
+        type=str,
+        default="GHI + NWP (no sky)",
+        help=(
+            "Legend label for the second (extra) prediction line "
+            "(default: 'GHI + NWP (no sky)')."
+        ),
+    )
+    p.add_argument(
+        "--legacy-pre-518dca9",
+        action="store_true",
+        help=(
+            "Use legacy (pre-518dca9, May-26 era) Folsom kt/p_cs/p_mean "
+            "normalization for inference. Required for checkpoints trained "
+            "before commit 518dca9 (e.g. archive "
+            "folsom_kt_sky_vs_nosky_40ep_4runs_2026-05-26 @ commit 24b9772). "
+            "Without this flag the May-26 model sees inputs ~5x larger than "
+            "training distribution and underpredicts by ~3x."
+        ),
+    )
+    p.add_argument(
         "--out-dir",
         type=str,
         default=str(_PROJECT_ROOT / "inference" / "animations"),
@@ -542,11 +679,19 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+_MAIN_COLOR = "#cc1f1f"
+_EXTRA_COLOR = "#1f4ec8"
+
+
 def main() -> int:
     args = _parse_args()
     out_root = Path(args.out_dir).expanduser().resolve()
     out_dir = out_root / args.run_label
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    has_extra = bool(args.checkpoint_extra)
+    label_main = args.label_main or ("GHI + NWP + sky" if has_extra else "Point pred.")
+    label_extra = args.label_extra
 
     npz_path = out_dir / f"{args.date}_predictions.npz"
     meta_path = out_dir / f"{args.date}_meta.json"
@@ -569,16 +714,28 @@ def main() -> int:
         f"frames={len(grid_utc)} (15-min stride)"
     )
 
+    pred_extra_kw: np.ndarray | None = None
+
     if npz_path.is_file() and not args.force:
         print(f"[animate] using cached predictions: {npz_path}")
         cached = np.load(npz_path, allow_pickle=False)
+        keys = set(cached.files)
         t_utc_arr = cached["t_utc"]
-        pred_kw = cached["pred_kw"]
         gt_kw = cached["gt_kw"]
+        if "pred_sky_kw" in keys and "pred_nosky_kw" in keys:
+            pred_kw = cached["pred_sky_kw"]
+            pred_extra_kw = cached["pred_nosky_kw"]
+        else:
+            pred_kw = cached["pred_kw"]
         with meta_path.open() as f:
             meta = json.load(f)
         # Rebuild display grid from cache so a stale --date doesn't lie.
         grid_utc = pd.DatetimeIndex(pd.to_datetime(t_utc_arr))
+        if has_extra and pred_extra_kw is None:
+            raise RuntimeError(
+                f"--checkpoint-extra was passed but cached NPZ {npz_path} only "
+                f"holds a single prediction. Re-run with --force to recompute."
+            )
     else:
         import torch
 
@@ -609,13 +766,42 @@ def main() -> int:
             f"last row {anchors_rows[-1]})"
         )
 
+        print(
+            f"[animate] forwarding main checkpoint: {args.checkpoint} "
+            f"(legacy_pre_518dca9={bool(args.legacy_pre_518dca9)})"
+        )
         pred_kw, gt_kw, cz, run_meta = _run_model_on_anchors(
             ds,
             anchors_rows,
             checkpoint_path=Path(args.checkpoint).expanduser().resolve(),
             device=device,
             batch_size=int(args.batch_size),
+            legacy_pre_518dca9=bool(args.legacy_pre_518dca9),
         )
+
+        run_meta_extra: dict | None = None
+        if has_extra:
+            print(
+                f"[animate] forwarding extra checkpoint: {args.checkpoint_extra} "
+                f"(legacy_pre_518dca9={bool(args.legacy_pre_518dca9)})"
+            )
+            pred_extra_kw, gt_kw_extra, cz_extra, run_meta_extra = _run_model_on_anchors(
+                ds,
+                anchors_rows,
+                checkpoint_path=Path(args.checkpoint_extra).expanduser().resolve(),
+                device=device,
+                batch_size=int(args.batch_size),
+                legacy_pre_518dca9=bool(args.legacy_pre_518dca9),
+            )
+            # Sanity: GT and cos_zenith are model-independent so they must match.
+            if not np.allclose(gt_kw, gt_kw_extra, equal_nan=True):
+                raise RuntimeError(
+                    "GT mismatch between main and extra forwards (should be identical)."
+                )
+            if not np.allclose(cz, cz_extra, equal_nan=True):
+                raise RuntimeError(
+                    "cos_zenith mismatch between main and extra forwards (should be identical)."
+                )
 
         t_utc_arr = np.asarray([pd.Timestamp(t).to_datetime64() for t in grid_utc], dtype="datetime64[s]")
         t_local_arr = np.asarray(
@@ -625,24 +811,29 @@ def main() -> int:
             ],
             dtype="datetime64[s]",
         )
-        np.savez_compressed(
-            npz_path,
-            t_utc=t_utc_arr,
-            t_local=t_local_arr,
-            gt_kw=gt_kw,
-            pred_kw=pred_kw,
-            cos_zenith=cz,
-        )
+        if has_extra:
+            np.savez_compressed(
+                npz_path,
+                t_utc=t_utc_arr,
+                t_local=t_local_arr,
+                gt_kw=gt_kw,
+                pred_sky_kw=pred_kw,
+                pred_nosky_kw=pred_extra_kw,
+                cos_zenith=cz,
+            )
+        else:
+            np.savez_compressed(
+                npz_path,
+                t_utc=t_utc_arr,
+                t_local=t_local_arr,
+                gt_kw=gt_kw,
+                pred_kw=pred_kw,
+                cos_zenith=cz,
+            )
+
         meta = dict(
             date_local=args.date,
             run_label=args.run_label,
-            archive_name=args.archive_name,
-            run_name=args.run_name,
-            checkpoint=run_meta["checkpoint"],
-            zero_sky=bool(run_meta["zero_sky"]),
-            use_nwp=bool(run_meta["use_nwp"]),
-            nwp_features=run_meta["nwp_features"],
-            nwp_use_invalid_mask=bool(run_meta["nwp_use_invalid_mask"]),
             horizon_step_used=0,
             pv_output_len_at_inference=int(_FORCE_PV_OUTPUT_LEN),
             n_frames=int(len(grid_utc)),
@@ -650,7 +841,55 @@ def main() -> int:
             sky_zarr="/work/folsom_dataset/sky_zarr",
             sky_time_tolerance_s=int(_SKY_TIME_MATCH_TOLERANCE_S),
             local_tz="America/Los_Angeles",
+            two_model_overlay=bool(has_extra),
+            legacy_pre_518dca9=bool(args.legacy_pre_518dca9),
         )
+        if has_extra:
+            meta["main"] = dict(
+                label=label_main,
+                color=_MAIN_COLOR,
+                archive_name=args.archive_name,
+                run_name=args.run_name,
+                checkpoint=run_meta["checkpoint"],
+                zero_sky=bool(run_meta["zero_sky"]),
+                use_nwp=bool(run_meta["use_nwp"]),
+                nwp_features=run_meta["nwp_features"],
+                nwp_use_invalid_mask=bool(run_meta["nwp_use_invalid_mask"]),
+                missing_keys_count=int(run_meta["missing_keys_count"]),
+                unexpected_keys_count=int(run_meta["unexpected_keys_count"]),
+                missing_keys_first5=list(run_meta["missing_keys_first5"]),
+                unexpected_keys_first5=list(run_meta["unexpected_keys_first5"]),
+            )
+            assert run_meta_extra is not None
+            meta["extra"] = dict(
+                label=label_extra,
+                color=_EXTRA_COLOR,
+                archive_name=args.archive_name_extra,
+                run_name=args.run_name_extra,
+                checkpoint=run_meta_extra["checkpoint"],
+                zero_sky=bool(run_meta_extra["zero_sky"]),
+                use_nwp=bool(run_meta_extra["use_nwp"]),
+                nwp_features=run_meta_extra["nwp_features"],
+                nwp_use_invalid_mask=bool(run_meta_extra["nwp_use_invalid_mask"]),
+                missing_keys_count=int(run_meta_extra["missing_keys_count"]),
+                unexpected_keys_count=int(run_meta_extra["unexpected_keys_count"]),
+                missing_keys_first5=list(run_meta_extra["missing_keys_first5"]),
+                unexpected_keys_first5=list(run_meta_extra["unexpected_keys_first5"]),
+            )
+        else:
+            meta.update(
+                archive_name=args.archive_name,
+                run_name=args.run_name,
+                checkpoint=run_meta["checkpoint"],
+                zero_sky=bool(run_meta["zero_sky"]),
+                use_nwp=bool(run_meta["use_nwp"]),
+                nwp_features=run_meta["nwp_features"],
+                nwp_use_invalid_mask=bool(run_meta["nwp_use_invalid_mask"]),
+                missing_keys_count=int(run_meta["missing_keys_count"]),
+                unexpected_keys_count=int(run_meta["unexpected_keys_count"]),
+                missing_keys_first5=list(run_meta["missing_keys_first5"]),
+                unexpected_keys_first5=list(run_meta["unexpected_keys_first5"]),
+            )
         with meta_path.open("w") as f:
             json.dump(meta, f, indent=2, sort_keys=True)
         print(f"[animate] cached predictions -> {npz_path}")
@@ -661,7 +900,10 @@ def main() -> int:
         dtype=np.float64,
     )
 
-    finite_vals = np.concatenate([gt_kw, pred_kw])
+    if pred_extra_kw is not None:
+        finite_vals = np.concatenate([gt_kw, pred_kw, pred_extra_kw])
+    else:
+        finite_vals = np.concatenate([gt_kw, pred_kw])
     ymax_data = float(np.nanmax(finite_vals)) if finite_vals.size else 1.0
     if not np.isfinite(ymax_data) or ymax_data <= 0:
         ymax_data = 1.0
@@ -675,6 +917,14 @@ def main() -> int:
 
     title_right = f"Our approach (1-step ViT nowcast) — {args.date}"
 
+    if pred_extra_kw is not None:
+        preds_for_render: list[tuple[np.ndarray, str, str]] = [
+            (pred_kw, _MAIN_COLOR, label_main),
+            (pred_extra_kw, _EXTRA_COLOR, label_extra),
+        ]
+    else:
+        preds_for_render = [(pred_kw, _MAIN_COLOR, label_main)]
+
     if args.keep_frames:
         frames_dir.mkdir(parents=True, exist_ok=True)
 
@@ -685,7 +935,7 @@ def main() -> int:
             t_utc=pd.Timestamp(t),
             hours_local=hours_local,
             gt_kw=gt_kw,
-            pred_kw=pred_kw,
+            preds=preds_for_render,
             cursor_idx=i,
             sky_img=img,
             date_local_str=args.date,
@@ -705,23 +955,41 @@ def main() -> int:
     _save_gif(frames, gif_path, fps=_FPS)
     gif_size_mb = gif_path.stat().st_size / (1024 * 1024)
 
-    # Sanity-spot-check: assert cached step-0 GT roughly matches the raw CSV row.
-    # (CSV row at display time T should equal gt_kw[i].)
     print("\n[animate] === SUMMARY ===")
     print(f"  date_local      : {args.date}")
     print(f"  run_label       : {args.run_label}")
-    print(f"  archive_name    : {meta.get('archive_name')}")
-    print(f"  run_name        : {meta.get('run_name')}")
-    print(f"  checkpoint      : {meta.get('checkpoint')}")
+    print(f"  two_model       : {has_extra}")
+    if has_extra:
+        m = meta.get("main", {})
+        e = meta.get("extra", {})
+        print(f"  main.archive    : {m.get('archive_name')}")
+        print(f"  main.run        : {m.get('run_name')}")
+        print(f"  main.checkpoint : {m.get('checkpoint')}")
+        print(
+            f"  main.zero_sky   : {m.get('zero_sky')}  "
+            f"missing={m.get('missing_keys_count')}  unexpected={m.get('unexpected_keys_count')}"
+        )
+        print(f"  extra.archive   : {e.get('archive_name')}")
+        print(f"  extra.run       : {e.get('run_name')}")
+        print(f"  extra.checkpoint: {e.get('checkpoint')}")
+        print(
+            f"  extra.zero_sky  : {e.get('zero_sky')}  "
+            f"missing={e.get('missing_keys_count')}  unexpected={e.get('unexpected_keys_count')}"
+        )
+    else:
+        print(f"  archive_name    : {meta.get('archive_name')}")
+        print(f"  run_name        : {meta.get('run_name')}")
+        print(f"  checkpoint      : {meta.get('checkpoint')}")
+        print(f"  zero_sky        : {meta.get('zero_sky')}")
     print(f"  horizon step    : {meta.get('horizon_step_used')} (= +15 min from anchor)")
     print(f"  pv_output_len   : {meta.get('pv_output_len_at_inference')}")
-    print(f"  use_nwp         : {meta.get('use_nwp')}  nwp_features={meta.get('nwp_features')}")
-    print(f"  zero_sky        : {meta.get('zero_sky')}")
     print(f"  frames          : {len(frames)} @ {_FPS} fps")
     print(f"  gif             : {gif_path}  ({gif_size_mb:.2f} MB)")
     print(f"  npz             : {npz_path}")
     print(f"  peak_gt_kw      : {float(np.nanmax(gt_kw)):.2f}")
-    print(f"  peak_pred_kw    : {float(np.nanmax(pred_kw)):.2f}")
+    print(f"  peak_pred_main  : {float(np.nanmax(pred_kw)):.2f}")
+    if pred_extra_kw is not None:
+        print(f"  peak_pred_extra : {float(np.nanmax(pred_extra_kw)):.2f}")
     if args.keep_frames:
         print(f"  frames_dir      : {frames_dir}")
 
