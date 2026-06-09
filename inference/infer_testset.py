@@ -6,36 +6,34 @@ the full 192-step (15-min cadence, covers t0+15min ... t0+48h) forecast plus
 targets / mask / cos(zenith) into ``<output_dir>/<inverter_devDn>.npz``
 (one NPZ per inverter).
 
+Model I/O matches ``training/train_vit_test.py``:
+  kt_pred = model(device_id, kt/20, pv_mask=kt_mask, ...)
+  pv_pred = kt_pred * 20 * target_p_cs * p_mean
+
 Step k (0-indexed) corresponds to ``t0 + (k+1) * 15 min``:
   * step 0  = t0 + 15 min
   * step 15 = t0 + 4 h
   * step 191 = t0 + 48 h
 
-NPZ contents per inverter (all arrays aligned along the window axis, length nw).
-All entries are plain numpy arrays — no pickle needed; ``np.load(path)`` works
-without ``allow_pickle=True``:
+NPZ contents per inverter (all arrays aligned along the window axis, length nw):
   * t0_utc            : (nw,)     '<U32'  ISO UTC string for each rolling anchor
   * pred_kW           : (nw, 192) float32  forecast PV power in kW
   * target_kW         : (nw, 192) float32  ground-truth PV power in kW
   * target_mask       : (nw, 192) uint8    1 = valid, 0 = inverter_state != 512
+  * weather_score     : (nw, 192) float32  station weather score at each horizon (from CSV)
   * cos_zenith        : (nw, 192) float32  cos(solar zenith) at each horizon
   * forecast_dt_min   : ()        int32    forecast step in minutes (=15)
   * pv_output_len     : ()        int32    number of horizons (=192)
   * device_id         : ()        int32    PVDataset.devDn_list index
-  * devDn             : ()        '<U64'   inverter devDn (e.g. ``X.YY=A1``)
+  * devDn             : ()        '<U64'   inverter devDn (e.g. ``NE=333620909``)
   * stride_min        : ()        int32    test-anchor stride used
-  * pv_scale_kW       : ()        float32  multiplied into preds/targets (=50.0)
-
-The test anchor stride can be tightened from the default of
-``pv_output_interval_min`` (15 min) all the way down to ``csv_interval_min``
-(5 min) via ``--stride_min`` (default 5).
 
 Example:
 
   python inference/infer_testset.py \
-      --checkpoint /mnt/nfs/slurm/home/yuan/workspace/checkpoints_4h/pv_forecast_vit_best_gpu0.pt \
+      --checkpoint checkpoints/pv_forecast_vit_best_gpu4.pt \
       --output_dir inference_results/test_rolling \
-      --dataset_config conf_luoyang.yaml \
+      --dataset_config conf_luoyang_shm.yaml \
       --stride_min 5
 """
 
@@ -44,12 +42,12 @@ from __future__ import annotations
 import argparse
 import contextlib
 import sys
-from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 import yaml
 from torch.utils.data import DataLoader
 
@@ -61,13 +59,10 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 from dataloader.luoyang_zarr import PVDataset, collate_batched
 from models.models import pv_forecasting_model_vit_imgs
 
-
-# Re-scale factor: dataset divides active_power by 50 when normalising,
-# so we multiply back here to express predictions in kW.
-PV_SCALE_KW = 50.0
-
 # forecast_timefeats columns: [sin_az, cos_az, sin_ze, cos_ze, sin_doy, cos_doy, sin_hod, cos_hod, delta_t]
 COS_ZENITH_COL = 3
+
+KT_SCALE = 20.0
 
 
 def _load_yaml(path: Path) -> dict:
@@ -164,14 +159,20 @@ def _dataset_kwargs(
 
 
 def _batch_to_device(batch: dict, device: torch.device) -> dict:
+    """Match ``training/train_vit_test.py::_batch_to_device``."""
     out = {
         "device_id": batch["dev_idx"].to(device, non_blocking=True),
         "pv": batch["pv"].to(device, non_blocking=True),
         "pv_mask": batch["pv_mask"].to(device, non_blocking=True),
         "pv_timefeats": batch["pv_timefeats"].to(device, non_blocking=True),
         "forecast_timefeats": batch["forecast_timefeats"].to(device, non_blocking=True),
+        "kt": batch["kt"].to(device, non_blocking=True),
+        "kt_mask": batch["kt_mask"].to(device, non_blocking=True),
+        "p_mean": batch["p_mean"].to(device, non_blocking=True),
         "target_pv": batch["target_pv"].to(device, non_blocking=True),
         "target_mask": batch["target_mask"].to(device, non_blocking=True),
+        "target_p_cs": batch["target_p_cs"].to(device, non_blocking=True),
+        "target_weather_score": batch["target_weather_score"].to(device, non_blocking=True),
     }
     for key in ("sat_tensor", "sat_timefeats", "skimg_tensor", "skimg_timefeats", "nwp_tensor"):
         v = batch.get(key)
@@ -179,11 +180,12 @@ def _batch_to_device(batch: dict, device: torch.device) -> dict:
     return out
 
 
-def _forward(model: torch.nn.Module, d: dict) -> torch.Tensor:
+def forward_vit(model: nn.Module, d: dict) -> torch.Tensor:
+    """Same as ``training/train_vit_test.py::forward_vit`` → kt in model units."""
     return model(
         d["device_id"],
-        d["pv"],
-        pv_mask=d["pv_mask"],
+        d["kt"] / KT_SCALE,
+        pv_mask=d["kt_mask"],
         pv_timefeats=d["pv_timefeats"],
         forecast_timefeats=d["forecast_timefeats"],
         sat_tensor=d["sat_tensor"],
@@ -192,6 +194,12 @@ def _forward(model: torch.nn.Module, d: dict) -> torch.Tensor:
         skimg_timefeats=d["skimg_timefeats"],
         nwp_tensor=d["nwp_tensor"],
     )
+
+
+def predict_pv_kW(model: nn.Module, d: dict) -> torch.Tensor:
+    """Return PV power forecast in kW, shape [B, T_out]."""
+    kt_pred = forward_vit(model, d) * KT_SCALE
+    return kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -214,8 +222,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset_config",
         type=str,
-        default="conf_luoyang.yaml",
-        help="Bare YAML filename under config/datasets/ (default: conf_luoyang.yaml).",
+        default="conf_luoyang_shm.yaml",
+        help="Bare YAML filename under config/datasets/ (default: conf_luoyang_shm.yaml).",
     )
     parser.add_argument(
         "--stride_min",
@@ -236,8 +244,7 @@ def _parse_args() -> argparse.Namespace:
                         help="Optional: stop after N batches (debug only).")
     parser.add_argument("--max_inverters", type=int, default=None,
                         help="Optional: process only the first N inverters (sorted by "
-                             "filename, same order PVDataset uses). Useful for quickly "
-                             "checking output format before running on all 626 inverters.")
+                             "filename, same order PVDataset uses).")
     return parser.parse_args()
 
 
@@ -296,16 +303,27 @@ def main() -> None:
         p.stem.replace("_", "=") for p in test_dataset.sample_files
     ]
 
-    model = pv_forecasting_model_vit_imgs(dev_dn_list=test_dataset.devDn_list).to(device)
-    ckpt = torch.load(ckpt_path, map_location=device)
+    try:
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    except TypeError:
+        ckpt = torch.load(ckpt_path, map_location=device)
+    dev_dn_list = ckpt.get("dev_dn_list", test_dataset.devDn_list)
+    if ckpt.get("ema"):
+        print("[infer_testset] checkpoint was saved with EMA weights")
+
+    model = pv_forecasting_model_vit_imgs(dev_dn_list=dev_dn_list).to(device)
     state = ckpt.get("model_state_dict", ckpt)
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing:
-        print(f"[infer_testset] WARNING: missing keys in state_dict: {len(missing)} "
-              f"(first 5: {missing[:5]})")
+        print(
+            f"[infer_testset] WARNING: missing keys in state_dict: {len(missing)} "
+            f"(first 5: {missing[:5]})"
+        )
     if unexpected:
-        print(f"[infer_testset] WARNING: unexpected keys in state_dict: {len(unexpected)} "
-              f"(first 5: {unexpected[:5]})")
+        print(
+            f"[infer_testset] WARNING: unexpected keys in state_dict: {len(unexpected)} "
+            f"(first 5: {unexpected[:5]})"
+        )
     model.eval()
 
     test_loader = DataLoader(
@@ -318,7 +336,6 @@ def main() -> None:
         persistent_workers=(args.num_workers > 0),
     )
 
-    # Pre-allocate per-inverter arrays so we never carry the whole dataset in RAM as Python objects.
     preds_buf: dict[int, np.ndarray] = {
         i: np.zeros((nw, T_out), dtype=np.float32) for i in range(n_files)
     }
@@ -327,6 +344,9 @@ def main() -> None:
     }
     mask_buf: dict[int, np.ndarray] = {
         i: np.zeros((nw, T_out), dtype=np.uint8) for i in range(n_files)
+    }
+    ws_buf: dict[int, np.ndarray] = {
+        i: np.zeros((nw, T_out), dtype=np.float32) for i in range(n_files)
     }
     cz_buf: dict[int, np.ndarray] = {
         i: np.zeros((nw, T_out), dtype=np.float32) for i in range(n_files)
@@ -348,14 +368,15 @@ def main() -> None:
                 break
             d = _batch_to_device(batch, device)
             with autocast_ctx:
-                pv_pred = _forward(model, d)
-            pv_pred = pv_pred.float()  # [B, T_out]
+                pv_pred = predict_pv_kW(model, d)
+            pv_pred = pv_pred.float()
 
-            pred_np = pv_pred.detach().cpu().numpy()              # [B, T_out]
-            tgt_np = d["target_pv"].detach().cpu().numpy()        # [B, T_out]
-            mask_np = d["target_mask"].detach().cpu().numpy()     # [B, T_out]
-            cz_np = d["forecast_timefeats"][:, :, COS_ZENITH_COL].detach().cpu().numpy()  # [B, T_out]
-            dev_ids_np = d["device_id"].detach().cpu().numpy()    # [B]
+            pred_np = pv_pred.detach().cpu().numpy()
+            tgt_np = d["target_pv"].detach().cpu().numpy()
+            mask_np = d["target_mask"].detach().cpu().numpy()
+            ws_np = d["target_weather_score"].detach().cpu().numpy()
+            cz_np = d["forecast_timefeats"][:, :, COS_ZENITH_COL].detach().cpu().numpy()
+            dev_ids_np = d["device_id"].detach().cpu().numpy()
 
             if args.mask_night:
                 night = cz_np < 0
@@ -368,9 +389,10 @@ def main() -> None:
                 win_idx = idx % nw
                 if file_idx >= n_files:
                     raise RuntimeError(f"file_idx {file_idx} out of range {n_files}")
-                preds_buf[file_idx][win_idx] = pred_np[i] * PV_SCALE_KW
-                targets_buf[file_idx][win_idx] = tgt_np[i] * PV_SCALE_KW
+                preds_buf[file_idx][win_idx] = pred_np[i]
+                targets_buf[file_idx][win_idx] = tgt_np[i]
                 mask_buf[file_idx][win_idx] = mask_np[i].astype(np.uint8)
+                ws_buf[file_idx][win_idx] = ws_np[i]
                 cz_buf[file_idx][win_idx] = cz_np[i]
                 filled[file_idx][win_idx] = True
                 device_id_seen.setdefault(file_idx, int(dev_ids_np[i]))
@@ -401,6 +423,7 @@ def main() -> None:
         preds = preds_buf[file_idx][kept]
         targets = targets_buf[file_idx][kept]
         target_mask = mask_buf[file_idx][kept]
+        weather_score = ws_buf[file_idx][kept]
         cos_zenith = cz_buf[file_idx][kept]
         t0_strs = t0_strs_per_window[kept]
 
@@ -413,18 +436,17 @@ def main() -> None:
             pred_kW=preds,
             target_kW=targets,
             target_mask=target_mask,
+            weather_score=weather_score,
             cos_zenith=cos_zenith,
             forecast_dt_min=np.int32(dt_min),
             pv_output_len=np.int32(T_out),
             device_id=np.int32(device_id_seen.get(file_idx, -1)),
             devDn=np.asarray(inverter_name, dtype="<U64"),
             stride_min=np.int32(args.stride_min),
-            pv_scale_kW=np.float32(PV_SCALE_KW),
         )
         n_written += 1
 
-        # Quick metrics on the two horizons the user originally cared about.
-        for label, k in (("15min", 0), ("4h", 15)):
+        for label, k in (("15min", 0), ("4h", 15), ("48h", 191)):
             m = target_mask[:, k].astype(bool)
             if m.any():
                 err = preds[m, k] - targets[m, k]
@@ -448,7 +470,7 @@ def main() -> None:
     print(f"[infer_testset] wrote {n_written} per-inverter NPZs to {out_dir}")
     print(f"[infer_testset] summary saved to {summary_path}")
     if not summary_df.empty:
-        for h in ["15min", "4h"]:
+        for h in ["15min", "4h", "48h"]:
             sub = summary_df[summary_df["horizon"] == h]
             if not sub.empty:
                 print(

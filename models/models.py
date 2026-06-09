@@ -605,7 +605,6 @@ class pv_forecasting_model_vit_imgs(nn.Module):
 
         pv_timefeats = pv_timefeats[:, :, [2,3,8]]
         forecast_timefeats = forecast_timefeats[:, :, [2,3,8]]
-        sat_timefeats = sat_timefeats[:, :, [2,3,8]]
         
         pv_history = torch.cat([pv_masked, pv_mask, pv_timefeats.permute(0, 2, 1)], dim=1)  # [B, C=11, T]
         pv_hist_mem = self.TCN(pv_history, pv_mask)     # [B, C_out, T]()
@@ -646,7 +645,6 @@ class pv_forecasting_model_vit_imgs(nn.Module):
             B_sat, T_sat, C_sat, H_sat, W_sat = sat_tensor.shape
             if C_sat != 3:
                 raise ValueError(f"sat_tensor expected 3 channels, got {C_sat}")
-            sat_timefeats = sat_timefeats[:, :, [2, 3, 8]]
             sat_hr = nn.functional.interpolate(
                 sat_tensor.reshape(B_sat * T_sat, C_sat, H_sat, W_sat),
                 size=(112, 112),
@@ -654,6 +652,7 @@ class pv_forecasting_model_vit_imgs(nn.Module):
                 align_corners=False,
             ).view(B_sat, T_sat, 3, 112, 112)
 
+            sat_timefeats = sat_timefeats[:, :, [2,3,8]]
             sat_patch_tokens = patchify_spatiotemporal_images(sat_hr, self.sat_patch_embed, timefeats=sat_timefeats[:,:,-1].unsqueeze(2))
             sat_patch_tokens = self.sat_alt_attn(sat_patch_tokens)  # [B,T=24,P=49,D=64]
             sat_start = sat_timefeats[:, 0, -1]   # [B]
