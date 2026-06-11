@@ -39,7 +39,7 @@ Usage::
         --checkpoint /path/to/sky_best.pt \
         --checkpoint-extra /path/to/nosky_best.pt
 
-Outputs (under ``inference/animations/<run_label>/``):
+Outputs (under ``playground/animations/<run_label>/``):
 
     <date>.gif                  the animation itself
     <date>_predictions.npz      per-frame (t, gt, pred[, pred_extra]) arrays
@@ -651,8 +651,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--out-dir",
         type=str,
-        default=str(_PROJECT_ROOT / "inference" / "animations"),
-        help="Output base directory (default: inference/animations).",
+        default=str(_PROJECT_ROOT / "playground" / "animations"),
+        help="Output base directory (default: playground/animations).",
     )
     p.add_argument(
         "--run-label",
