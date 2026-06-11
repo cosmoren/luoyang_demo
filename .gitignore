@@ -108,6 +108,8 @@ venv.bak/
 checkpoints/
 checkpoints_*/
 runs/
+logs/
+inference_results/
 
 # Training / experiment logs
 logs/
@@ -130,3 +132,8 @@ handoff_*/
 
 # preprocessing smoke-report figures
 SPMF_preprocessing/folsom/*_figs/
+
+# Animated forecast outputs (generated artifacts; regenerate via inference/animate_forecast.py)
+# Ignore everything inside inference/animations/ except the RUNS.md manifest.
+inference/animations/*
+!inference/animations/RUNS.md

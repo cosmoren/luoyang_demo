@@ -1,3 +1,9 @@
+# Folsom-specific overrides on top of the shared `config/train/conf_train.yaml`.
+# Only keys explicitly set here override the shared defaults; missing keys inherit.
+# Trainer flow: load conf_train.yaml -> apply this `training:` block -> CLI flags win.
+training:
+  epochs: 40
+
 # Folsom, CA — irradiance CSV + sky Zarr + (optional) merged NWP CSV.
 # -----------------------------------------------------------------------------
 # Same schema as Luoyang `pv_*` keys (no `irr_*`, no `dataset_profile: folsom`).
@@ -29,13 +35,20 @@ paths:
 
 # Sampling / window keys for ``dataloader.folsom`` and ``training/train_vit_test_folsom.py``
 sampling:
+  # Random anchor draws per training epoch from the valid-train pool.
+  # Folsom has ~925k valid train anchors; 100k/epoch over 40 epochs is 4M total
+  # draws -> ~99% unique-anchor coverage, ~4.3x average per-anchor revisits.
+  # Going past 4M total draws is mostly diminishing returns. CLI flag
+  # --train_epoch_len overrides this; fallback if absent is the dataloader
+  # constant _DEFAULT_FOLSOM_TRAIN_EPOCH_LEN.
+  train_epoch_len: 100000
   # CSV row spacing (Folsom is 1-min; Luoyang was 5-min).
   csv_interval_min: 1
   # PVDataset / FolsomIrradianceDataset input window (X) and forecast window (Y).
   pv_input_interval_min: 5      # multiple of csv_interval_min
   pv_input_len: 576             # 576 * 5min = 48 h history
   pv_output_interval_min: 15    # multiple of csv_interval_min
-  pv_output_len: 192            # 192 * 15min = 48 h forecast
+  pv_output_len: 16             # 16 * 15min = 4 h forecast
   # Time-based split: 60% train / 10% val / 30% test (fixed in the dataset class; this fraction
   # is required by the schema but only `pv_train_time_fraction` is read for legacy parity).
   pv_train_time_fraction: 0.7
