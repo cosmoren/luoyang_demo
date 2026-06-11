@@ -1,14 +1,19 @@
 """
 Training script for pv_forecasting_model_vit (sat + sky TimeSformer + PV TCN).
-Uses the same Luoyang CSV / sky / sat DataLoader as train.py.
+
+Unified round-robin training: alternates one batch from PVDataset (Luoyang) and
+one batch from FolsomIrradianceDataset per optimizer step; validation and test
+are run separately per dataset so per-domain metrics stay disentangled.
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import itertools
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,10 +22,14 @@ from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim.lr_scheduler as lr_scheduler
 import yaml
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader
+
+EPS = 1e-6
+KT_CLIP_MAX = 1.5
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CONFIG_DIR = _PROJECT_ROOT / "config"
@@ -30,6 +39,7 @@ _DEFAULT_TRAIN_CONF_NAME = "conf_train.yaml"
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from dataloader.luoyang_zarr import PVDataset, collate_batched
+from dataloader.folsom import FolsomIrradianceDataset
 from models.models import pv_forecasting_model_vit_imgs
 
 
@@ -58,8 +68,9 @@ def _gpu_id_for_checkpoint() -> int:
 
 def _batch_to_device(batch: dict, device: torch.device) -> dict:
     """Move luoyang collate fields to device; optional tensors may be None."""
+    dev_id = batch["device_id"] if "device_id" in batch else batch["dev_idx"]
     out = {
-        "device_id": batch["dev_idx"].to(device),
+        "device_id": dev_id.to(device),
         "pv": batch["pv"].to(device),
         "pv_mask": batch["pv_mask"].to(device),
         "pv_timefeats": batch["pv_timefeats"].to(device),
@@ -79,7 +90,13 @@ def _batch_to_device(batch: dict, device: torch.device) -> dict:
 
 @dataclass
 class EvalMetrics:
-    """Validation/test metrics for combined loss and per-horizon windows."""
+    """Validation/test metrics for combined loss and per-horizon windows.
+
+    ``loss`` and ``loss_*`` are kt-space (unitless) masked-mean losses, computed
+    against ``kt_target = target_pv / (target_p_cs * p_mean)`` so Luoyang (kW) and
+    Folsom (W/m^2) share the same dynamic range during training. ``rmse_*`` and
+    ``mae_*`` stay in physical units (per-dataset: kW for Luoyang, W/m^2 for Folsom).
+    """
 
     loss: float
     loss_15m: float
@@ -172,6 +189,33 @@ class ModelEMA:
         return self.shadow
 
 
+def _loss_none(criterion: nn.Module, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Element-wise loss mirroring ``criterion``'s loss type (Huber/MSE/L1), reduction='none'."""
+    if isinstance(criterion, nn.HuberLoss):
+        return F.huber_loss(pred, target, reduction="none", delta=criterion.delta)
+    if isinstance(criterion, nn.MSELoss):
+        return F.mse_loss(pred, target, reduction="none")
+    if isinstance(criterion, nn.L1Loss):
+        return F.l1_loss(pred, target, reduction="none")
+    raise TypeError(
+        f"Unsupported criterion type for kt-space masked loss: {type(criterion).__name__}"
+    )
+
+
+def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Mean of ``values`` over positions where ``mask`` is non-zero; safe when all-zero."""
+    if mask.shape != values.shape:
+        mask = mask.broadcast_to(values.shape)
+    mask = mask.to(values.dtype)
+    return (values * mask).sum() / mask.sum().clamp(min=1.0)
+
+
+def _kt_target(d: dict) -> torch.Tensor:
+    """Reconstruct kt-space target from physical pv-space tensors in batch dict ``d``."""
+    denom = (d["target_p_cs"] * d["p_mean"].unsqueeze(1)).clamp(min=EPS)
+    return (d["target_pv"] / denom).clamp(0.0, KT_CLIP_MAX)
+
+
 def train_one_epoch(
     model: nn.Module,
     device: torch.device,
@@ -184,7 +228,13 @@ def train_one_epoch(
     model.train()
     total_loss = 0.0
     n = 0
-    print("number of batches: ", len(loader))
+    n_batches = len(loader)
+    print(f"number of batches: {n_batches}", flush=True)
+    # Heartbeat so a silent training epoch is distinguishable from a dead process.
+    # With 1564 batches * ~3s/batch the epoch takes ~78 min; without this the stdout log
+    # appears frozen for the entire epoch and the run looks dead from `tail -f`.
+    _hb_every = max(1, n_batches // 200) if n_batches > 0 else 1
+    _hb_start = time.time()
     for batch_idx, batch in enumerate(loader):
         if max_batches is not None and batch_idx >= max_batches:
             break
@@ -193,22 +243,34 @@ def train_one_epoch(
         optimizer.zero_grad()
         kt_pred = forward_vit(model, d) * 20.0
         pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
+        kt_target = _kt_target(d)
+        mask = d["target_mask"]
 
-        loss_15m = criterion( pv_pred[:,0], d["target_pv"][:,0] )
-        loss_4h = criterion( pv_pred[:,15], d["target_pv"][:,15] )
-        loss_48h = criterion( pv_pred, d["target_pv"] )
+        loss_15m = _masked_mean(_loss_none(criterion, kt_pred[:, 0], kt_target[:, 0]), mask[:, 0])
+        loss_4h = _masked_mean(_loss_none(criterion, kt_pred[:, 15], kt_target[:, 15]), mask[:, 15])
+        loss_48h = _masked_mean(_loss_none(criterion, kt_pred, kt_target), mask)
 
         lambda_15m = 2.0
         lambda_4h = 2.0
         lambda_48h = 1.0
         loss = lambda_15m*loss_15m + lambda_4h*loss_4h + lambda_48h*loss_48h
-        # loss = criterion(pv_pred, d["target_pv"])
         loss.backward()
         optimizer.step()
         if ema is not None:
             ema.update(model)
         total_loss += loss.item()
         n += B
+        if (batch_idx + 1) % _hb_every == 0 or (batch_idx + 1) == n_batches:
+            elapsed = time.time() - _hb_start
+            sec_per_batch = elapsed / max(batch_idx + 1, 1)
+            eta_sec = sec_per_batch * max(n_batches - (batch_idx + 1), 0)
+            running_avg_loss = total_loss / max(n, 1)
+            print(
+                f"  [train] batch {batch_idx + 1}/{n_batches}  "
+                f"loss={loss.item():.6f}  avg={running_avg_loss:.6f}  "
+                f"{sec_per_batch:.2f}s/batch  ETA={eta_sec / 60:.1f}min",
+                flush=True,
+            )
     print()
     return total_loss / max(n, 1)
 
@@ -230,15 +292,17 @@ def evaluate(
             B = d["device_id"].size(0)
             kt_pred = forward_vit(model, d) * 20.0
             pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
-            loss_15m = criterion( pv_pred[:,0], d["target_pv"][:,0] )
-            loss_4h = criterion( pv_pred[:,15], d["target_pv"][:,15] )
-            loss_48h = criterion( pv_pred, d["target_pv"] )
+            kt_target = _kt_target(d)
+            mask = d["target_mask"]
+
+            loss_15m = _masked_mean(_loss_none(criterion, kt_pred[:, 0], kt_target[:, 0]), mask[:, 0])
+            loss_4h = _masked_mean(_loss_none(criterion, kt_pred[:, 15], kt_target[:, 15]), mask[:, 15])
+            loss_48h = _masked_mean(_loss_none(criterion, kt_pred, kt_target), mask)
 
             lambda_15m = 2.0
             lambda_4h = 2.0
             lambda_48h = 1.0
             loss = lambda_15m * loss_15m + lambda_4h * loss_4h + lambda_48h * loss_48h
-            # loss = criterion(pv_pred, d["target_pv"])
             total_loss += loss.item()
             total_loss_15m += loss_15m.item()
             total_loss_4h += loss_4h.item()
@@ -508,6 +572,39 @@ def _dataset_kwargs(dataset_config_name: str, split: str) -> dict:
     )
 
 
+def _folsom_dataset_kwargs(dataset_config_name: str, split: str) -> dict:
+    """``_dataset_kwargs`` minus ``train_samples_per_csv`` (not in Folsom's __init__)."""
+    kwargs = _dataset_kwargs(dataset_config_name, split)
+    kwargs.pop("train_samples_per_csv", None)
+    return kwargs
+
+
+class _RoundRobinLoader:
+    """Fixed-length round-robin over multiple DataLoaders.
+
+    Each ``__iter__`` rebuilds child iterators wrapped in ``itertools.cycle`` so
+    whichever loader exhausts first restarts transparently. Exactly ``n_steps``
+    batches are yielded per pass, alternating children one-for-one.
+    """
+
+    def __init__(self, loaders: list, n_steps: int) -> None:
+        if not loaders:
+            raise ValueError("_RoundRobinLoader requires at least one child loader")
+        if int(n_steps) < 1:
+            raise ValueError("_RoundRobinLoader n_steps must be >= 1")
+        self._loaders = list(loaders)
+        self._n_steps = int(n_steps)
+
+    def __iter__(self):
+        iters = [itertools.cycle(iter(dl)) for dl in self._loaders]
+        k = len(iters)
+        for i in range(self._n_steps):
+            yield next(iters[i % k])
+
+    def __len__(self) -> int:
+        return self._n_steps
+
+
 def main() -> None:
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--config", type=str, default=_DEFAULT_TRAIN_CONF_NAME)
@@ -523,23 +620,26 @@ def main() -> None:
     args = parser.parse_args()
 
     # =========================================================================
-    # Dataset selection: change DATASET_CLS to a different Dataset class and
-    # DATASET_CONFIG to a YAML filename under config/datasets/ to train on a
-    # different dataset (e.g. ``conf_folsom.yaml``). The chosen YAML supplies
-    # ``paths.*`` and the ``sampling:`` section consumed by ``_dataset_kwargs``.
+    # Unified Luoyang + Folsom training. Each domain gets its own train/val/test
+    # dataset+loader; training is wrapped in a round-robin iterator that emits
+    # one batch per domain per optimizer step. Validation and test are run
+    # separately on each domain so per-domain metrics stay distinct.
     # =========================================================================
-    DATASET_CLS = PVDataset
-    DATASET_CONFIG = "conf_luoyang_shm.yaml"  # sat/sky read from /dev/shm (RAM); see scripts/vit_test.sh
+    luo_train_dataset = PVDataset(**_dataset_kwargs("conf_luoyang_shm.yaml", "train"))
+    luo_val_dataset = PVDataset(**_dataset_kwargs("conf_luoyang_shm.yaml", "val"))
+    luo_test_dataset = PVDataset(**_dataset_kwargs("conf_luoyang_shm.yaml", "test"))
 
-    train_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "train"))
-    val_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "val"))
-    test_dataset = DATASET_CLS(**_dataset_kwargs(DATASET_CONFIG, "test"))
+    fol_train_dataset = FolsomIrradianceDataset(
+        **_folsom_dataset_kwargs("conf_folsom.yaml", "train")
+    )
+    fol_val_dataset = FolsomIrradianceDataset(
+        **_folsom_dataset_kwargs("conf_folsom.yaml", "val")
+    )
+    fol_test_dataset = FolsomIrradianceDataset(
+        **_folsom_dataset_kwargs("conf_folsom.yaml", "test")
+    )
 
-    # Folsom: use training/train_vit_test_folsom.py with config/datasets/conf_folsom.yaml
-
-    # =========================================================================
-
-    dev_dn_list = train_dataset.devDn_list
+    dev_dn_list = luo_train_dataset.devDn_list
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = pv_forecasting_model_vit_imgs(dev_dn_list=dev_dn_list).to(device)
@@ -561,32 +661,32 @@ def main() -> None:
     print(f"EMA: {'enabled' if args.use_ema else 'disabled'}"
           + (f" (decay={args.ema_decay}, warmup={args.ema_warmup_epochs} epoch)" if args.use_ema else ""))
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collate_batched,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_batched,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_batched,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        persistent_workers=True,
+    def _make_loader(ds, shuffle: bool) -> DataLoader:
+        return DataLoader(
+            ds,
+            batch_size=args.batch_size,
+            shuffle=shuffle,
+            collate_fn=collate_batched,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            persistent_workers=(args.num_workers > 0),
+        )
+
+    luo_train_loader = _make_loader(luo_train_dataset, True)
+    luo_val_loader = _make_loader(luo_val_dataset, False)
+    luo_test_loader = _make_loader(luo_test_dataset, False)
+    fol_train_loader = _make_loader(fol_train_dataset, True)
+    fol_val_loader = _make_loader(fol_val_dataset, False)
+    fol_test_loader = _make_loader(fol_test_dataset, False)
+
+    if args.train_max_batches_per_epoch is not None:
+        n_train_steps = int(args.train_max_batches_per_epoch)
+    else:
+        n_train_steps = 2 * min(len(luo_train_loader), len(fol_train_loader))
+    train_loader = _RoundRobinLoader([luo_train_loader, fol_train_loader], n_train_steps)
+    print(
+        f"Round-robin train: n_steps={n_train_steps} "
+        f"(luo_loader_len={len(luo_train_loader)}, fol_loader_len={len(fol_train_loader)})"
     )
 
     checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else _PROJECT_ROOT / "checkpoints"
@@ -619,23 +719,29 @@ def main() -> None:
             train_loader,
             criterion,
             optimizer,
-            max_batches=args.train_max_batches_per_epoch,
+            max_batches=None,
             ema=ema if ema_active else None,
         )
         if ema_active:
             with ema.apply(model):
-                val_metrics = evaluate(model, device, val_loader, criterion)
+                val_luo = evaluate(model, device, luo_val_loader, criterion)
+                val_fol = evaluate(model, device, fol_val_loader, criterion)
         else:
-            val_metrics = evaluate(model, device, val_loader, criterion)
-        val_loss = val_metrics.loss
+            val_luo = evaluate(model, device, luo_val_loader, criterion)
+            val_fol = evaluate(model, device, fol_val_loader, criterion)
+        val_loss = val_luo.loss + val_fol.loss
         print(
             f"Epoch {epoch}/{args.epochs}  lr={cur_lr:.2e}  "
-            f"train_loss={avg_loss:.6f}  val_loss={val_loss:.6f}"
+            f"train_loss={avg_loss:.6f}  val_loss={val_loss:.6f}  "
+            f"(luo={val_luo.loss:.6f}, fol={val_fol.loss:.6f})"
         )
         writer.add_scalar("loss/train", avg_loss, epoch)
-        writer.add_scalar("loss/val", val_loss, epoch)
-        writer.add_scalar("metric/val_rmse", val_metrics.rmse, epoch)
-        writer.add_scalar("metric/val_mae", val_metrics.mae, epoch)
+        writer.add_scalar("loss/val_luoyang", val_luo.loss, epoch)
+        writer.add_scalar("loss/val_folsom", val_fol.loss, epoch)
+        writer.add_scalar("metric/val_rmse_luoyang", val_luo.rmse, epoch)
+        writer.add_scalar("metric/val_mae_luoyang", val_luo.mae, epoch)
+        writer.add_scalar("metric/val_rmse_folsom", val_fol.rmse, epoch)
+        writer.add_scalar("metric/val_mae_folsom", val_fol.mae, epoch)
         writer.add_scalar("lr", cur_lr, epoch)
         scheduler.step()
 
@@ -665,6 +771,8 @@ def main() -> None:
                     "scheduler_state_dict": scheduler.state_dict(),
                     "loss": avg_loss,
                     "val_loss": val_loss,
+                    "val_loss_luoyang": val_luo.loss,
+                    "val_loss_folsom": val_fol.loss,
                     "dev_dn_list": dev_dn_list,
                     "ema": ema_active,
                 },
@@ -689,13 +797,17 @@ def main() -> None:
     if best_ckpt_path.is_file():
         ckpt = torch.load(best_ckpt_path, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"])
-        test_metrics = evaluate(model, device, test_loader, criterion)
+        test_luo = evaluate(model, device, luo_test_loader, criterion)
+        test_fol = evaluate(model, device, fol_test_loader, criterion)
         print(
-            f"Test set with best val-loss checkpoint ({best_ckpt_path.name}, epoch={ckpt.get('epoch', '?')}): "
-            f"loss={test_metrics.loss:.6f}, RMSE={test_metrics.rmse:.6f}, MAE={test_metrics.mae:.6f}"
+            f"Test (best ckpt {best_ckpt_path.name}, epoch={ckpt.get('epoch', '?')}): "
+            f"luoyang loss={test_luo.loss:.6f} RMSE={test_luo.rmse:.6f} MAE={test_luo.mae:.6f}  |  "
+            f"folsom loss={test_fol.loss:.6f} RMSE={test_fol.rmse:.6f} MAE={test_fol.mae:.6f}"
         )
-        writer.add_scalar("metric/test_rmse", test_metrics.rmse, args.epochs)
-        writer.add_scalar("metric/test_mae", test_metrics.mae, args.epochs)
+        writer.add_scalar("metric/test_rmse_luoyang", test_luo.rmse, args.epochs)
+        writer.add_scalar("metric/test_mae_luoyang", test_luo.mae, args.epochs)
+        writer.add_scalar("metric/test_rmse_folsom", test_fol.rmse, args.epochs)
+        writer.add_scalar("metric/test_mae_folsom", test_fol.mae, args.epochs)
         writer.add_hparams(
             {
                 "lr": args.lr,
@@ -705,16 +817,19 @@ def main() -> None:
                 "weight_decay": args.weight_decay,
             },
             {
-                "hparam/test_rmse": test_metrics.rmse,
-                "hparam/test_mae": test_metrics.mae,
+                "hparam/test_rmse_luoyang": test_luo.rmse,
+                "hparam/test_mae_luoyang": test_luo.mae,
+                "hparam/test_rmse_folsom": test_fol.rmse,
+                "hparam/test_mae_folsom": test_fol.mae,
             },
         )
         metrics_log = checkpoint_dir / f"pv_forecast_pv_sat_{_ckpt_suffix}.txt"
         write_header = not metrics_log.exists() or metrics_log.stat().st_size == 0
         with open(metrics_log, "a", encoding="utf-8") as mf:
             if write_header:
-                mf.write(EvalMetrics.log_header())
-            mf.write(test_metrics.to_log_line())
+                mf.write("dataset\t" + EvalMetrics.log_header())
+            mf.write("luoyang\t" + test_luo.to_log_line())
+            mf.write("folsom\t" + test_fol.to_log_line())
         print(f"Appended best-test metrics to {metrics_log}")
     else:
         print(f"No {best_ckpt_path.name} on disk; skip test evaluation with best checkpoint.")
