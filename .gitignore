@@ -141,3 +141,7 @@ inference/animations/*
 # personal scratch space for throwaway agent/human experiments
 # (never committed; see AGENTS.md for the playground/ convention)
 playground/
+
+# local cache databases (e.g. requests-cache)
+*.sqlite
+*.sqlite3
