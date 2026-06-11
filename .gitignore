@@ -145,3 +145,6 @@ playground/
 # local cache databases (e.g. requests-cache)
 *.sqlite
 *.sqlite3
+
+# personal info-share folder (weekly bundles shared off-server; NO codebase coupling)
+info_share/
