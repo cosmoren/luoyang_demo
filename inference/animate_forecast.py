@@ -142,8 +142,17 @@ def _utc_naive_to_local_hour(t_utc: pd.Timestamp, tz: ZoneInfo) -> float:
 def _find_display_grid_utc(
     window: DayWindow,
     sky_times_utc: np.ndarray,
+    stride_min: int = 15,
 ) -> tuple[pd.DatetimeIndex, pd.Timestamp, pd.Timestamp]:
-    """Build the 15-min UTC display grid spanned by available sky imagery for ``window``."""
+    """Build the ``stride_min``-spaced UTC display grid spanned by available sky imagery.
+
+    ``stride_min`` controls the cadence of display times T (one model forward per
+    T). Native CSV cadence is 1 min, so any integer-minute stride >= 1 is
+    supported. The anchor lag (``t0 = T - 15 min``) is independent of stride and
+    is set by the model's output_interval (step 0 = +15 min from anchor).
+    """
+    if int(stride_min) < 1:
+        raise ValueError(f"stride_min must be >= 1 minute, got {stride_min}")
     if sky_times_utc.size == 0:
         raise RuntimeError(
             f"No sky imagery found in Zarr for {window.date_local:%Y-%m-%d} (local) "
@@ -160,30 +169,18 @@ def _find_display_grid_utc(
     first_sky = sky_in[0]
     last_sky = sky_in[-1]
 
-    # Round to a clean 15-min grid: first display T = ceil(first_sky to 15 min);
-    # last display T = floor(last_sky to 15 min).
-    def _ceil_15min(t: pd.Timestamp) -> pd.Timestamp:
-        rem = (t.minute * 60 + t.second) % (15 * 60)
-        if rem == 0:
-            return t.replace(second=0, microsecond=0, nanosecond=0)
-        return (t + pd.Timedelta(seconds=(15 * 60 - rem))).replace(
-            second=0, microsecond=0, nanosecond=0
-        )
-
-    def _floor_15min(t: pd.Timestamp) -> pd.Timestamp:
-        rem = (t.minute * 60 + t.second) % (15 * 60)
-        return (t - pd.Timedelta(seconds=rem)).replace(
-            second=0, microsecond=0, nanosecond=0
-        )
-
-    t_first = _ceil_15min(pd.Timestamp(first_sky))
-    t_last = _floor_15min(pd.Timestamp(last_sky))
+    # Round to a clean ``stride_min``-min grid: first display T = ceil(first_sky);
+    # last display T = floor(last_sky). pandas ``.ceil``/``.floor`` already
+    # epoch-align to the requested resolution.
+    freq = f"{int(stride_min)}min"
+    t_first = pd.Timestamp(first_sky).ceil(freq)
+    t_last = pd.Timestamp(last_sky).floor(freq)
     if t_last < t_first:
         raise RuntimeError(
             f"Sky imagery for {window.date_local:%Y-%m-%d} spans less than one "
-            f"15-min boundary (first_sky={first_sky}, last_sky={last_sky})"
+            f"{int(stride_min)}-min boundary (first_sky={first_sky}, last_sky={last_sky})"
         )
-    grid = pd.date_range(t_first, t_last, freq="15min")
+    grid = pd.date_range(t_first, t_last, freq=freq)
     return grid, pd.Timestamp(first_sky), pd.Timestamp(last_sky)
 
 
@@ -528,7 +525,7 @@ def _render_one_frame(
     return arr
 
 
-def _save_gif(frames: list[np.ndarray], out_path: Path, *, fps: int = _FPS) -> None:
+def _save_gif(frames: list[np.ndarray], out_path: Path, *, fps: float = _FPS) -> None:
     """Save a list of ``[H, W, 3]`` uint8 frames as an animated GIF (loop forever)."""
     from PIL import Image
 
@@ -608,16 +605,35 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Legend label for the main prediction line. Defaults to "
-            "'GHI + NWP + sky' when --checkpoint-extra is set, else 'Point pred.'."
+            "'GHI + NWP + Sky' when --checkpoint-extra is set, else 'Point pred.'."
         ),
     )
     p.add_argument(
         "--label-extra",
         type=str,
-        default="GHI + NWP (no sky)",
+        default="GHI + NWP",
         help=(
             "Legend label for the second (extra) prediction line "
-            "(default: 'GHI + NWP (no sky)')."
+            "(default: 'GHI + NWP')."
+        ),
+    )
+    p.add_argument(
+        "--label-gt",
+        type=str,
+        default="GT",
+        help="Legend label for the ground-truth line (default: 'GT').",
+    )
+    p.add_argument(
+        "--stride-min",
+        type=int,
+        default=15,
+        help=(
+            "Display-grid cadence in minutes (default: 15). One model forward "
+            "per display step; the anchor lag is fixed at 15 min by the model "
+            "output_interval and is independent of this stride. Native CSV "
+            "cadence is 1 min, so any integer >= 1 works. When != 15, output "
+            "filenames carry a `_stride{N}` suffix to avoid colliding with "
+            "existing 15-min outputs."
         ),
     )
     p.add_argument(
@@ -676,6 +692,16 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Force CPU inference (slow; for debugging only).",
     )
+    p.add_argument(
+        "--fps",
+        type=float,
+        default=float(_FPS),
+        help=(
+            f"GIF playback frames-per-second (default: {_FPS}). Lower = "
+            "slower / easier to follow. Float allowed (e.g. 3.33 for 50%% "
+            "slower than the default of 5)."
+        ),
+    )
     return p.parse_args()
 
 
@@ -690,13 +716,19 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     has_extra = bool(args.checkpoint_extra)
-    label_main = args.label_main or ("GHI + NWP + sky" if has_extra else "Point pred.")
+    label_main = args.label_main or ("GHI + NWP + Sky" if has_extra else "Point pred.")
     label_extra = args.label_extra
+    label_gt = args.label_gt
 
-    npz_path = out_dir / f"{args.date}_predictions.npz"
-    meta_path = out_dir / f"{args.date}_meta.json"
-    gif_path = out_dir / f"{args.date}.gif"
-    frames_dir = out_dir / f"{args.date}_frames"
+    stride_min = int(args.stride_min)
+    # Suffix is empty when stride==15 to preserve historical filenames; non-15
+    # strides append "_stride{N}" between the date stem and the extension/tag.
+    stride_suffix = "" if stride_min == 15 else f"_stride{stride_min}"
+    stem = f"{args.date}{stride_suffix}"
+    npz_path = out_dir / f"{stem}_predictions.npz"
+    meta_path = out_dir / f"{stem}_meta.json"
+    gif_path = out_dir / f"{stem}.gif"
+    frames_dir = out_dir / f"{stem}_frames"
 
     window = _local_day_window(args.date)
     print(
@@ -708,10 +740,12 @@ def main() -> int:
     sky_ds = xr.open_zarr("/work/folsom_dataset/sky_zarr")
     sky_times_raw = sky_ds["time_utc"].values
 
-    grid_utc, first_sky, last_sky = _find_display_grid_utc(window, np.asarray(sky_times_raw))
+    grid_utc, first_sky, last_sky = _find_display_grid_utc(
+        window, np.asarray(sky_times_raw), stride_min=stride_min
+    )
     print(
         f"[animate] sky availability in window: first={first_sky}  last={last_sky}  "
-        f"frames={len(grid_utc)} (15-min stride)"
+        f"frames={len(grid_utc)} ({stride_min}-min stride)"
     )
 
     pred_extra_kw: np.ndarray | None = None
@@ -837,7 +871,8 @@ def main() -> int:
             horizon_step_used=0,
             pv_output_len_at_inference=int(_FORCE_PV_OUTPUT_LEN),
             n_frames=int(len(grid_utc)),
-            fps=int(_FPS),
+            fps=float(args.fps),
+            stride_min=int(stride_min),
             sky_zarr="/work/folsom_dataset/sky_zarr",
             sky_time_tolerance_s=int(_SKY_TIME_MATCH_TOLERANCE_S),
             local_tz="America/Los_Angeles",
@@ -943,6 +978,7 @@ def main() -> int:
             ymax=ymax,
             xlim=xlim,
             title_right=title_right,
+            gt_label=label_gt,
         )
         frames.append(frame)
         if args.keep_frames:
@@ -952,7 +988,7 @@ def main() -> int:
         if (i + 1) % 10 == 0 or i == 0 or i == len(grid_utc) - 1:
             print(f"[animate] rendered frame {i + 1}/{len(grid_utc)}")
 
-    _save_gif(frames, gif_path, fps=_FPS)
+    _save_gif(frames, gif_path, fps=float(args.fps))
     gif_size_mb = gif_path.stat().st_size / (1024 * 1024)
 
     print("\n[animate] === SUMMARY ===")
@@ -983,7 +1019,7 @@ def main() -> int:
         print(f"  zero_sky        : {meta.get('zero_sky')}")
     print(f"  horizon step    : {meta.get('horizon_step_used')} (= +15 min from anchor)")
     print(f"  pv_output_len   : {meta.get('pv_output_len_at_inference')}")
-    print(f"  frames          : {len(frames)} @ {_FPS} fps")
+    print(f"  frames          : {len(frames)} @ {args.fps:g} fps")
     print(f"  gif             : {gif_path}  ({gif_size_mb:.2f} MB)")
     print(f"  npz             : {npz_path}")
     print(f"  peak_gt_kw      : {float(np.nanmax(gt_kw)):.2f}")
