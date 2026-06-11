@@ -148,3 +148,6 @@ playground/
 
 # personal info-share folder (weekly bundles shared off-server; NO codebase coupling)
 info_share/
+
+# personal AGENTS.md (kept local; not for team merges)
+AGENTS.md
