@@ -137,3 +137,7 @@ SPMF_preprocessing/folsom/*_figs/
 # Ignore everything inside inference/animations/ except the RUNS.md manifest.
 inference/animations/*
 !inference/animations/RUNS.md
+
+# personal scratch space for throwaway agent/human experiments
+# (never committed; see AGENTS.md for the playground/ convention)
+playground/
