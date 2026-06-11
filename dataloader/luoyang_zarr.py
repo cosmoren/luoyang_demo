@@ -95,6 +95,7 @@ class _DatasetProfiler:
 # --- PV per-station CSV helpers (5-minute rows, ``collectTime`` sorted) ---
 
 INVERTER_STATE_COL = "inverter_state"
+WEATHER_SCORE_COL = "weather_score"
 VALID_STATE = 512
 
 def load_csv(csv_path: Path | str) -> pd.DataFrame:
@@ -898,6 +899,15 @@ class PVDataset(Dataset):
         target_pv = torch.from_numpy((pow_y).astype(np.float32))
         target_mask = torch.from_numpy((inv_y == VALID_STATE).astype(np.float32))
         target_p_cs = torch.from_numpy(sub_y["p_cs"].values.astype(np.float32))
+        if WEATHER_SCORE_COL in sub_y.columns:
+            ws_y = (
+                pd.to_numeric(sub_y[WEATHER_SCORE_COL], errors="coerce")
+                .fillna(0.0)
+                .values.astype(np.float32)
+            )
+        else:
+            ws_y = np.zeros(len(sub_y), dtype=np.float32)
+        target_weather_score = torch.from_numpy(ws_y)
         prof.mark("build.targets")
 
         
@@ -994,14 +1004,15 @@ class PVDataset(Dataset):
             "p_cs": p_cs,
             "p_mean": p_mean,
             "forecast_timefeats": forecast_timefeats,
-            "sat_tensor": sat_tensor,
-            "sat_timefeats": sat_timefeats,
+            "sat_tensor": None, # sat_tensor,
+            "sat_timefeats": None, #sat_timefeats,
             "skimg_tensor": None,
             "skimg_timefeats": None,
             "nwp_tensor": nwp_tensor,
             "target_pv": target_pv,
             "target_mask": target_mask,
             "target_p_cs": target_p_cs,
+            "target_weather_score": target_weather_score,
         }
 
 
@@ -1098,6 +1109,7 @@ def collate_batched(batch):
         "target_pv": _stack("target_pv"),
         "target_mask": _stack("target_mask"),
         "target_p_cs": _stack("target_p_cs"),
+        "target_weather_score": _stack("target_weather_score"),
     }
     for key in ("nwp_tensor", "sat_tensor", "sat_timefeats", "skimg_tensor", "skimg_timefeats"):
         vals = [s[key] for s in batch]

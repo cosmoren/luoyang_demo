@@ -27,6 +27,7 @@ _CONFIG_DIR = _PROJECT_ROOT / "config"
 _TRAIN_CONFIG_DIR = _CONFIG_DIR / "train"
 _DATASETS_CONFIG_DIR = _CONFIG_DIR / "datasets"
 _DEFAULT_TRAIN_CONF_NAME = "conf_train.yaml"
+WEATHER_SCORE_THRESHOLD = 0.5
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from dataloader.luoyang_zarr import PVDataset, collate_batched
@@ -70,6 +71,7 @@ def _batch_to_device(batch: dict, device: torch.device) -> dict:
         "target_pv": batch["target_pv"].to(device),
         "target_mask": batch["target_mask"].to(device),
         "target_p_cs": batch["target_p_cs"].to(device),
+        "target_weather_score": batch["target_weather_score"].to(device),
     }
     for key in ("sat_tensor", "sat_timefeats", "skimg_tensor", "skimg_timefeats", "nwp_tensor"):
         v = batch.get(key)
@@ -91,6 +93,15 @@ class EvalMetrics:
     mae_4h: float
     rmse_48h: float
     mae_48h: float
+    rmse_15m_ws: float = float("nan")
+    mae_15m_ws: float = float("nan")
+    n_valid_15m_ws: int = 0
+    rmse_4h_ws: float = float("nan")
+    mae_4h_ws: float = float("nan")
+    n_valid_4h_ws: int = 0
+    rmse_48h_ws: float = float("nan")
+    mae_48h_ws: float = float("nan")
+    n_valid_48h_ws: int = 0
 
     @property
     def rmse(self) -> float:
@@ -101,18 +112,28 @@ class EvalMetrics:
         return self.mae_48h
 
     @staticmethod
+    def _fmt_metric(v: float) -> str:
+        return f"{v:.8f}" if np.isfinite(v) else "nan"
+
+    @staticmethod
     def log_header() -> str:
         return (
             "loss_15m\trmse_15m\tmae_15m\t"
             "loss_4h\trmse_4h\tmae_4h\t"
-            "loss_48h\trmse_48h\tmae_48h\n"
+            "loss_48h\trmse_48h\tmae_48h\t"
+            "rmse_15m_ws\tmae_15m_ws\tn_valid_15m_ws\t"
+            "rmse_4h_ws\tmae_4h_ws\tn_valid_4h_ws\t"
+            "rmse_48h_ws\tmae_48h_ws\tn_valid_48h_ws\n"
         )
 
     def to_log_line(self) -> str:
         return (
             f"{self.loss_15m:.8f}\t{self.rmse_15m:.8f}\t{self.mae_15m:.8f}\t"
             f"{self.loss_4h:.8f}\t{self.rmse_4h:.8f}\t{self.mae_4h:.8f}\t"
-            f"{self.loss_48h:.8f}\t{self.rmse_48h:.8f}\t{self.mae_48h:.8f}\n"
+            f"{self.loss_48h:.8f}\t{self.rmse_48h:.8f}\t{self.mae_48h:.8f}\t"
+            f"{self._fmt_metric(self.rmse_15m_ws)}\t{self._fmt_metric(self.mae_15m_ws)}\t{self.n_valid_15m_ws}\t"
+            f"{self._fmt_metric(self.rmse_4h_ws)}\t{self._fmt_metric(self.mae_4h_ws)}\t{self.n_valid_4h_ws}\t"
+            f"{self._fmt_metric(self.rmse_48h_ws)}\t{self._fmt_metric(self.mae_48h_ws)}\t{self.n_valid_48h_ws}\n"
         )
 
 
@@ -214,7 +235,12 @@ def train_one_epoch(
 
 
 def evaluate(
-    model: nn.Module, device: torch.device, loader: DataLoader, criterion: nn.Module
+    model: nn.Module,
+    device: torch.device,
+    loader: DataLoader,
+    criterion: nn.Module,
+    *,
+    weather_score_threshold: float | None = None,
 ) -> EvalMetrics:
     model.eval()
     total_loss = 0.0
@@ -222,8 +248,11 @@ def evaluate(
     total_loss_4h = 0.0
     total_loss_48h = 0.0
     n = 0
-    pred_dict = {}
-    target_dict = {}
+    pred_dict: dict[int, list[np.ndarray]] = {}
+    target_dict: dict[int, list[np.ndarray]] = {}
+    ws_dict: dict[int, list[np.ndarray]] = {}
+    mask_dict: dict[int, list[np.ndarray]] = {}
+    collect_weather = weather_score_threshold is not None
     with torch.no_grad():
         for batch in loader:
             d = _batch_to_device(batch, device)
@@ -253,31 +282,71 @@ def evaluate(
                 if kk not in pred_dict:
                     pred_dict[kk] = []
                     target_dict[kk] = []
+                    if collect_weather:
+                        ws_dict[kk] = []
+                        mask_dict[kk] = []
                 pred_dict[kk].append(pred_np)
                 target_dict[kk].append(tgt_np)
+                if collect_weather:
+                    ws_dict[kk].append(
+                        d["target_weather_score"][i, :].detach().cpu().float().numpy().copy()
+                    )
+                    mask_dict[kk].append(
+                        d["target_mask"][i, :].detach().cpu().float().numpy().copy()
+                    )
 
         # Sum inverter outputs per sample -> station-level [N, T] arrays.
         station_pred = None
         station_target = None
+        station_ws = None
+        station_mask = None
         for kk in pred_dict.keys():
             pred_k = np.asarray(pred_dict[kk])
             tgt_k = np.asarray(target_dict[kk])
             if station_pred is None:
                 station_pred = pred_k
                 station_target = tgt_k
+                if collect_weather:
+                    station_ws = np.asarray(ws_dict[kk])
+                    station_mask = np.asarray(mask_dict[kk])
             else:
                 station_pred = station_pred + pred_k
                 station_target = station_target + tgt_k
+                if collect_weather:
+                    station_mask = np.clip(station_mask + np.asarray(mask_dict[kk]), 0.0, 1.0)
+
+        if collect_weather and station_ws is None:
+            print(
+                "[evaluate] WARNING: weather_score metrics requested but no weather_score "
+                "collected (empty loader?)"
+            )
 
         def _mae_rmse(pred: np.ndarray, tgt: np.ndarray) -> tuple[float, float]:
             diff = pred - tgt
             return float(np.mean(np.abs(diff))), float(np.sqrt(np.mean(diff ** 2)))
+
+        def _mae_rmse_masked(
+            pred: np.ndarray, tgt: np.ndarray, valid: np.ndarray
+        ) -> tuple[float, float, int]:
+            valid = valid.astype(bool)
+            n_valid = int(valid.sum())
+            if n_valid == 0:
+                return float("nan"), float("nan"), 0
+            p = pred[valid]
+            t = tgt[valid]
+            diff = p - t
+            return float(np.mean(np.abs(diff))), float(np.sqrt(np.mean(diff ** 2))), n_valid
 
         # Horizons aligned with training loss: idx 0 = t0+15m, idx 15 = t0+4h, all = 48h window.
         idx_15m, idx_4h = 0, 15
         mae_15m, rmse_15m = _mae_rmse(station_pred[:, idx_15m], station_target[:, idx_15m])
         mae_4h, rmse_4h = _mae_rmse(station_pred[:, idx_4h], station_target[:, idx_4h])
         mae_48h, rmse_48h = _mae_rmse(station_pred.reshape(-1), station_target.reshape(-1))
+
+        rmse_15m_ws = mae_15m_ws = float("nan")
+        rmse_4h_ws = mae_4h_ws = float("nan")
+        rmse_48h_ws = mae_48h_ws = float("nan")
+        n_valid_15m_ws = n_valid_4h_ws = n_valid_48h_ws = 0
 
         capacity = 54600
         for label, mae, rmse in (
@@ -290,6 +359,38 @@ def evaluate(
                 f"  MAE: {mae:.6f}, RMSE: {rmse:.6f}, "
                 f"ACC(MAE): {1.0 - mae / capacity:.6f}, ACC(RMSE): {1.0 - rmse / capacity:.6f}"
             )
+
+        if collect_weather and station_ws is not None:
+            ws_thr = float(weather_score_threshold)
+            valid_15m = (station_ws[:, idx_15m] > ws_thr) & (station_mask[:, idx_15m] > 0.5)
+            valid_4h = (station_ws[:, idx_4h] > ws_thr) & (station_mask[:, idx_4h] > 0.5)
+            valid_48h = (
+                (station_ws.reshape(-1) > ws_thr) & (station_mask.reshape(-1) > 0.5)
+            )
+            ws_label_suffix = f"weather_score>{ws_thr:g} & valid"
+            mae_15m_ws, rmse_15m_ws, n_valid_15m_ws = _mae_rmse_masked(
+                station_pred[:, idx_15m], station_target[:, idx_15m], valid_15m
+            )
+            mae_4h_ws, rmse_4h_ws, n_valid_4h_ws = _mae_rmse_masked(
+                station_pred[:, idx_4h], station_target[:, idx_4h], valid_4h
+            )
+            mae_48h_ws, rmse_48h_ws, n_valid_48h_ws = _mae_rmse_masked(
+                station_pred.reshape(-1), station_target.reshape(-1), valid_48h
+            )
+            for label, mae, rmse, n_valid in (
+                ("t0+15m", mae_15m_ws, rmse_15m_ws, n_valid_15m_ws),
+                ("t0+4h", mae_4h_ws, rmse_4h_ws, n_valid_4h_ws),
+                ("t0+48h", mae_48h_ws, rmse_48h_ws, n_valid_48h_ws),
+            ):
+                print(f"RMSE/MAE [{label}, {ws_label_suffix}]. Capacity: {capacity}(KW)")
+                if n_valid == 0:
+                    print("  MAE: nan, RMSE: nan, n_valid=0")
+                else:
+                    print(
+                        f"  MAE: {mae:.6f}, RMSE: {rmse:.6f}, "
+                        f"ACC(MAE): {1.0 - mae / capacity:.6f}, "
+                        f"ACC(RMSE): {1.0 - rmse / capacity:.6f}, n_valid={n_valid}"
+                    )
 
         mae, rmse = mae_48h, rmse_48h
 
@@ -305,6 +406,15 @@ def evaluate(
         mae_4h=mae_4h,
         rmse_48h=rmse_48h,
         mae_48h=mae_48h,
+        rmse_15m_ws=rmse_15m_ws,
+        mae_15m_ws=mae_15m_ws,
+        n_valid_15m_ws=n_valid_15m_ws,
+        rmse_4h_ws=rmse_4h_ws,
+        mae_4h_ws=mae_4h_ws,
+        n_valid_4h_ws=n_valid_4h_ws,
+        rmse_48h_ws=rmse_48h_ws,
+        mae_48h_ws=mae_48h_ws,
+        n_valid_48h_ws=n_valid_48h_ws,
     )
 
 
@@ -689,7 +799,13 @@ def main() -> None:
     if best_ckpt_path.is_file():
         ckpt = torch.load(best_ckpt_path, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"])
-        test_metrics = evaluate(model, device, test_loader, criterion)
+        test_metrics = evaluate(
+            model,
+            device,
+            test_loader,
+            criterion,
+            weather_score_threshold=WEATHER_SCORE_THRESHOLD,
+        )
         print(
             f"Test set with best val-loss checkpoint ({best_ckpt_path.name}, epoch={ckpt.get('epoch', '?')}): "
             f"loss={test_metrics.loss:.6f}, RMSE={test_metrics.rmse:.6f}, MAE={test_metrics.mae:.6f}"
@@ -710,10 +826,14 @@ def main() -> None:
             },
         )
         metrics_log = checkpoint_dir / f"pv_forecast_pv_sat_{_ckpt_suffix}.txt"
-        write_header = not metrics_log.exists() or metrics_log.stat().st_size == 0
+        header = EvalMetrics.log_header()
         with open(metrics_log, "a", encoding="utf-8") as mf:
-            if write_header:
-                mf.write(EvalMetrics.log_header())
+            if not metrics_log.exists() or metrics_log.stat().st_size == 0:
+                mf.write(header)
+            else:
+                first_line = metrics_log.read_text(encoding="utf-8").splitlines()[0]
+                if first_line.strip() != header.strip():
+                    mf.write("\n" + header)
             mf.write(test_metrics.to_log_line())
         print(f"Appended best-test metrics to {metrics_log}")
     else:

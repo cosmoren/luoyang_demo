@@ -10,6 +10,10 @@ Aggregate 365 daily CSV files by devDn:
   from collectTime (UTC) + device lat/lon via pvlib:
   solar_zenith, solar_azimuth, local_solar_time, day_of_year, hour_of_day.
   day_of_year and hour_of_day are taken from local solar time.
+- ``weather_score``: station-level PV slope-jitter in [0, 1] (~1 = slopes jump violently /
+  cloudy-unstable, ~0 = slopes change smoothly / sunny); identical across all devDn at
+  the same ``collectTime``. In a ±1h window, consecutive 5-min slopes are compared;
+  smooth slope evolution scores low, erratic slope changes score high. Night: 0.
 
 Each daily file is read once; staging CSVs on disk then one devDn at a time in RAM
 for the final grid. Staging is deleted when done.
@@ -66,8 +70,19 @@ NUMERIC_COL_NAMES = [
 SOLAR_EXTRA_COLS = [
     "solar_zenith", "solar_azimuth", "local_solar_time",
     "day_of_year", "hour_of_day", "p_cs", "kt", "kt_mask", "p_mean",
+    "weather_score",
 ]
 OUTPUT_HEADER = HEADER + SOLAR_EXTRA_COLS
+
+# Minimum normalized clear-sky POA (``p_cs``) to treat a timestep as daytime.
+# Shared by per-inverter ``kt_mask`` and station-level ``weather_score``.
+P_CS_DAYTIME_THRESHOLD = 0.1
+
+# ``weather_score``: ±1h window on the 5-min grid (12 steps each side → 25 points).
+WEATHER_WINDOW_HALF_STEPS = 12
+WEATHER_WINDOW_SIZE = 2 * WEATHER_WINDOW_HALF_STEPS + 1
+WEATHER_WINDOW_MIN_PERIODS = 13
+WEATHER_NORM_PERCENTILE = 95.0
 
 
 def format_ts(dt):
@@ -350,6 +365,90 @@ def zero_like_row():
     return {k: "0" if k in NUMERIC_COL_NAMES else "" for k in HEADER}
 
 
+def load_active_power_series(staging_path: Path, utc_keys: list) -> np.ndarray:
+    """Read one staging CSV into an ``active_power`` array aligned with ``utc_keys``."""
+    time_to_row, _ = load_staging_to_time_to_row(staging_path)
+    return np.array(
+        [
+            parse_float(time_to_row.get(ts, {}).get("active_power", "0"))
+            for ts in utc_keys
+        ],
+        dtype=np.float64,
+    )
+
+
+def _slope_jump_std(segment: np.ndarray) -> float:
+    """Std of consecutive slope changes within a power segment (>=3 points)."""
+    if segment.size < 3:
+        return np.nan
+    slopes = np.diff(segment)
+    if slopes.size < 2:
+        return np.nan
+    return float(np.std(np.diff(slopes)))
+
+
+def compute_station_weather_score(
+    unique_devdns: list,
+    staging_dir: Path,
+    p_cs_arr: np.ndarray,
+    utc_keys: list,
+) -> np.ndarray:
+    """
+    Station-level PV slope-jitter in [0, 1], shared across all devDn.
+
+    For each timestep ``t`` on the 5-min grid, take station power in [t-1h, t+1h],
+    compute slopes between adjacent samples, then measure how much those slopes jump
+    from one interval to the next (std of slope differences). Smooth clear-sky ramps
+    change slope gradually → low score; cloud-driven up/down swings → high score.
+
+        station_power[t] = sum_i active_power_i(t)
+        slopes[k] = P[k+1] - P[k]   (within window)
+        jumps[k] = slopes[k+1] - slopes[k]
+        raw[t] = std(jumps) / (p_cs[t] * sum_i p_mean_i + eps)
+        weather_score[t] = clip(raw[t] / p95_daytime, 0, 1) * kt_mask[t]
+
+    Night timesteps (``p_cs <= P_CS_DAYTIME_THRESHOLD``) are set to 0.
+    """
+    n = len(utc_keys)
+    station_power = np.zeros(n, dtype=np.float64)
+    station_scale = 0.0  # sum_i p_mean_i
+
+    for devdn in unique_devdns:
+        active_power_arr = load_active_power_series(
+            staging_dir / safe_devdn_filename(devdn), utc_keys
+        )
+        station_power += active_power_arr
+        station_scale += float(active_power_arr.mean())
+
+    expected = p_cs_arr * station_scale
+    scale = np.maximum(expected, 1e-6)
+    hw = WEATHER_WINDOW_HALF_STEPS
+    raw = np.full(n, np.nan, dtype=np.float64)
+
+    for i in range(n):
+        lo = max(0, i - hw)
+        hi = min(n, i + hw + 1)
+        seg = station_power[lo:hi]
+        jump_std = _slope_jump_std(seg)
+        if np.isnan(jump_std):
+            continue
+        raw[i] = jump_std / scale[i]
+
+    kt_mask = (p_cs_arr > P_CS_DAYTIME_THRESHOLD).astype(np.float64)
+    daytime = kt_mask > 0
+    if not np.any(daytime):
+        return np.zeros(n, dtype=np.float64)
+
+    valid_day = daytime & np.isfinite(raw)
+    if not np.any(valid_day):
+        return np.zeros(n, dtype=np.float64)
+
+    p95 = float(np.percentile(raw[valid_day], WEATHER_NORM_PERCENTILE))
+    weather_score = np.clip(raw / (p95 + 1e-6), 0.0, 1.0)
+    weather_score = np.nan_to_num(weather_score, nan=0.0) * kt_mask
+    return weather_score
+
+
 def main(input_dir: Path, output_dir: Path, lat: float, lon: float):
     input_dir = input_dir.resolve()
     output_dir = output_dir.resolve()
@@ -357,10 +456,29 @@ def main(input_dir: Path, output_dir: Path, lat: float, lon: float):
 
     csv_paths = get_sorted_csv_paths(input_dir)
     print(f"Found {len(csv_paths)} daily CSV files")
+    if not input_dir.is_dir():
+        raise FileNotFoundError(
+            f"Input directory does not exist: {input_dir}\n"
+            f"Expected daily files matching 组串式逆变器-YYYY-MM-DD.csv "
+            f"(e.g. ~/datasets/2025_all_station)."
+        )
+    if not csv_paths:
+        hint = ""
+        alt = Path.home() / "datasets" / "2025_all_station"
+        if alt.is_dir() and alt != input_dir:
+            hint = f"\nHint: found data at {alt} ({len(get_sorted_csv_paths(alt))} daily files)."
+        raise FileNotFoundError(
+            f"No 组串式逆变器-YYYY-MM-DD.csv files under {input_dir}.{hint}"
+        )
 
     staging_dir = output_dir / STAGING_DIRNAME
     if staging_dir.is_dir():
-        shutil.rmtree(staging_dir)
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        if staging_dir.is_dir():
+            raise OSError(
+                f"Could not remove existing staging directory: {staging_dir}. "
+                "Stop other aggregate runs and delete it manually."
+            )
 
     print("Pass 1/2: single read of each daily file, fan-out to staging (per devDn)...")
     unique_devdns_set = fanout_daily_rows_to_staging(csv_paths, staging_dir)
@@ -375,7 +493,16 @@ def main(input_dir: Path, output_dir: Path, lat: float, lon: float):
     utc_idx = utc_index_for_grid()  # built once; shared across all per-devDn outputs
 
     try:
-        print("Pass 2/2: fill 5-min grid from staging (one devDn at a time)...")
+        sun = compute_solar_arrays(utc_idx, lat, lon)
+        p_cs_arr = np.asarray(sun["p_cs"], dtype=np.float64)
+        utc_keys = ordered_utc_collect_time_keys()
+
+        print("Pass 2a/2: computing station-level weather_score (shared across all devDn)...")
+        weather_score_arr = compute_station_weather_score(
+            unique_devdns, staging_dir, p_cs_arr, utc_keys
+        )
+
+        print("Pass 2b/2: fill 5-min grid from staging (one devDn at a time)...")
         for idx, devdn in enumerate(unique_devdns):
             print(f"Processing devDn {idx + 1}/{len(unique_devdns)}: {devdn}")
 
@@ -383,16 +510,8 @@ def main(input_dir: Path, output_dir: Path, lat: float, lon: float):
                 staging_dir / safe_devdn_filename(devdn)
             )
 
-            sun = compute_solar_arrays(utc_idx, lat, lon)
-
-            p_cs_arr = np.asarray(sun["p_cs"], dtype=np.float64)
-            utc_keys = ordered_utc_collect_time_keys()
-            active_power_arr = np.array(
-                [
-                    parse_float(time_to_row.get(ts, {}).get("active_power", "0"))
-                    for ts in utc_keys
-                ],
-                dtype=np.float64,
+            active_power_arr = load_active_power_series(
+                staging_dir / safe_devdn_filename(devdn), utc_keys
             )
             if active_power_arr.shape != p_cs_arr.shape:
                 raise ValueError(
@@ -401,7 +520,7 @@ def main(input_dir: Path, output_dir: Path, lat: float, lon: float):
                 )
 
             p_mean = float(active_power_arr.mean())
-            kt_mask = (p_cs_arr > 0.1).astype(np.float64)
+            kt_mask = (p_cs_arr > P_CS_DAYTIME_THRESHOLD).astype(np.float64)
             kt = active_power_arr / (p_cs_arr * p_mean + 1e-6)
             kt = kt * kt_mask
 
@@ -424,6 +543,7 @@ def main(input_dir: Path, output_dir: Path, lat: float, lon: float):
                     row["kt"] = f"{float(kt[i]):.6f}"
                     row["kt_mask"] = str(int(kt_mask[i]))
                     row["p_mean"] = f"{p_mean:.6f}"
+                    row["weather_score"] = f"{float(weather_score_arr[i]):.6f}"
                     writer.writerow(row)
     finally:
         shutil.rmtree(staging_dir, ignore_errors=True)
@@ -433,6 +553,7 @@ def main(input_dir: Path, output_dir: Path, lat: float, lon: float):
 
 
 def parse_args():
+    home_datasets = Path.home() / "datasets"
     p = argparse.ArgumentParser(
         description="Aggregate daily 组串式逆变器 CSVs by devDn; output UTC collectTime per devDn."
     )
@@ -440,15 +561,15 @@ def parse_args():
         "-i",
         "--input",
         type=Path,
-        default='/data/2015_all_station/',
-        help="Directory containing 组串式逆变器-YYYY-MM-DD.csv files (default: script directory).",
+        default=home_datasets / "2025_all_station",
+        help="Directory containing 组串式逆变器-YYYY-MM-DD.csv files (default: ~/datasets/2025_all_station).",
     )
     p.add_argument(
         "-o",
         "--output",
         type=Path,
-        default='/data/data/luoyang_data_626',
-        help="Directory for per-devDn CSVs (default: <input>/aggregated_by_devDn).",
+        default=home_datasets / "luoyang_data_626",
+        help="Directory for per-devDn CSVs (default: ~/datasets/luoyang_data_626).",
     )
     p.add_argument(
         "--lat",
