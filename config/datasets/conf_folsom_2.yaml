@@ -1,0 +1,59 @@
+# Folsom, CA — irradiance CSV + sky Zarr + GOES-15 satellite NPY + merged NWP CSV.
+# -----------------------------------------------------------------------------
+# **_2 sidecar of `config/datasets/conf_folsom.yaml`** with the satellite branch
+# wired in. Loaded by ``dataloader.folsom_2.FolsomIrradianceDataset`` (via
+# ``training/train_vit_test_folsom_2.py``).
+#
+# Run Folsom training (sat branch live):
+#   python training/train_vit_test_folsom_2.py --dataset-config conf_folsom_2.yaml
+# -----------------------------------------------------------------------------
+
+site:
+  name: "Folsom, CA"
+
+paths:
+  data_dir: "/work/folsom_dataset"
+  # PVDataset reads this Excel via train_vit_test.py main() to build dev_dn_list.
+  # FolsomIrradianceDataset itself never reads it (returns dev_idx=0 for the single GHI sensor),
+  # so we keep the Luoyang Excel as a placeholder; trainer's nn.Embedding lookup still works.
+  # FolsomIrradianceDataset globs `pv_path` for exactly one CSV (the Folsom irradiance file).
+  pv_path: irradiance
+  sky_format: zarr
+  sky_image_path: sky_zarr
+  # Folsom GOES-15 GridSat-CONUS per-frame shards live under
+  # ``<data_dir>/sat_goes_gridsat/YYYY/MM/goes15_YYYYMMDD_HHMM.npy`` (3 x 100 x 100 float16,
+  # values in [0, 1]; ~94k files covering 2014-01-01 -> 2016-12-31 UTC). The _2 loader
+  # resolves per-frame paths relative to this directory.
+  sat_path: sat_goes_gridsat
+  # PVDataset uses `paths.nwp_path` (folder with solar.csv / wind.csv); placeholder for Folsom.
+  nwp_path: NWP
+  # Folsom-specific: single merged NWP CSV (reftime, valtime, ssrd/cloud_cover/.../temperature/.../wind).
+  # If missing or unreadable, FolsomIrradianceDataset falls back to zero NWP + per-step invalid mask.
+  folsom_nwp_merged_csv: NWP/nwp_merged_averaged.csv
+
+# Sampling / window keys for ``dataloader.folsom_2`` and ``training/train_vit_test_folsom_2.py``
+sampling:
+  # CSV row spacing (Folsom is 1-min; Luoyang was 5-min).
+  csv_interval_min: 1
+  # PVDataset / FolsomIrradianceDataset input window (X) and forecast window (Y).
+  pv_input_interval_min: 5      # multiple of csv_interval_min
+  pv_input_len: 576             # 576 * 5min = 48 h history
+  pv_output_interval_min: 15    # multiple of csv_interval_min
+  pv_output_len: 16             # 16 * 15min = 4 h forecast (matches _LOSS_METRIC_HORIZON in train_vit_test_folsom_2)
+  # Time-based split: 60% train / 10% val / 30% test (fixed in the dataset class; this fraction
+  # is required by the schema but only `pv_train_time_fraction` is read for legacy parity).
+  pv_train_time_fraction: 0.7
+  test_anchor_stride_min: 1500
+  val_anchor_stride_min: 7000
+  test_collect_time_match_tolerance_min: 0
+  # Sky stack (last N frames ending at the anchor; zarr time series).
+  skyimg_window_size: 30
+  skyimg_time_resolution_min: 1
+  skyimg_spatial_size: 224
+  # Satellite stack: 24 frames at 15-min cadence ending floor_15(time0 - 30 min) (oldest -> newest).
+  # NPY shards on disk are CHW (3, 100, 100) float16 already in [0, 1]; the loader returns float32.
+  # ``satimg_npy_shape_hwc`` is kept in [H, W, C] order to match the PVDataset constructor signature;
+  # ``dataloader.folsom_2._load_satimg_tensor`` accepts both CHW and HWC layouts.
+  satimg_window_size: 24
+  satimg_time_resolution_min: 15
+  satimg_npy_shape_hwc: [100, 100, 3]
