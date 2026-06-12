@@ -97,6 +97,11 @@ _SKY_CHANNEL_WIDTHS: dict[str, int] = {
 }
 _DEFAULT_SKY_CHANNELS: tuple[str, ...] = (_SKY_CHANNEL_RGB,)
 
+# Default angular radius (degrees) for the ``sun_mask`` channel; overridable via
+# ``sampling.sun_mask_radius_deg`` in the dataset YAML. 1° is roughly the sun's
+# apparent diameter (~0.53° plus margin); see _compute_sun_mask_for_frames.
+_DEFAULT_SUN_MASK_RADIUS_DEG: float = 1.0
+
 
 def _normalize_sky_channels(raw: Any) -> tuple[str, ...]:
     """Validate + canonicalize a ``sky_channels`` config value to a tuple of names.
@@ -585,6 +590,7 @@ class FolsomIrradianceDataset(Dataset):
         satimg_npy_shape_hwc: tuple[int, int, int],
         use_satellite: bool = False,
         sky_channels: list[str] | tuple[str, ...] | None = None,
+        sun_mask_radius_deg: float | None = None,
     ):
         self._config_path = Path(config_path).resolve()
         if not self._config_path.is_file():
@@ -629,12 +635,29 @@ class FolsomIrradianceDataset(Dataset):
 
         # Sky-branch channel selection. ``sky_channels`` is a YAML-driven list of
         # feature names; default ``("rgb",)`` keeps existing behavior (3-channel
-        # ``skimg_tensor``). The ray map is built lazily on first use and cached
-        # since ``fisheye_raymap`` only depends on (H, W). Sun-mask is reserved
-        # for a follow-up commit and raises when listed.
+        # ``skimg_tensor``). The ray map + its companion validity mask are built
+        # lazily on first use and cached since ``fisheye_raymap`` only depends
+        # on (H, W). ``sun_mask`` reuses the same cache plus per-frame solar
+        # geometry from ``compute_solar_features``.
         self.sky_channels: tuple[str, ...] = _normalize_sky_channels(sky_channels)
         self.sky_in_channels: int = _sky_in_channels(self.sky_channels)
         self._ray_map_cache: torch.Tensor | None = None
+        self._sky_valid_cache: torch.Tensor | None = None
+        radius = (
+            _DEFAULT_SUN_MASK_RADIUS_DEG
+            if sun_mask_radius_deg is None
+            else float(sun_mask_radius_deg)
+        )
+        if not (radius > 0.0):
+            raise ValueError(
+                f"sun_mask_radius_deg must be > 0 (got {sun_mask_radius_deg!r})"
+            )
+        if radius >= 90.0:
+            raise ValueError(
+                f"sun_mask_radius_deg must be < 90 (got {sun_mask_radius_deg!r}); "
+                "a half-sky disc is almost certainly a config mistake"
+            )
+        self.sun_mask_radius_deg: float = radius
 
         # Sat config: when ``use_satellite=True`` the loader reads per-frame .npy shards
         # under ``satimg_dir/YYYY/MM/goes15_YYYYMMDD_HHMM.npy`` (GOES-15 GridSat-CONUS,
@@ -1140,17 +1163,87 @@ class FolsomIrradianceDataset(Dataset):
         ]
         return torch.stack(frames, dim=0)
 
-    def _get_ray_map(self) -> torch.Tensor:
-        """Lazy ``[3, H, W]`` float32 fisheye ray vectors at the sky spatial size.
+    def _build_ray_and_valid_cache(self) -> None:
+        """Populate ``_ray_map_cache`` and ``_sky_valid_cache`` together (one ``fisheye_raymap`` call).
 
-        Cached on the dataset instance; ``fisheye_raymap`` is a pure function of
-        (H, W) so a single instance suffices for all samples.
+        ``fisheye_raymap`` is a pure function of ``(H, W)`` so a single instance
+        suffices for all samples; ``sun_mask`` reuses the same cached arrays.
         """
+        s = self._skyimg_spatial_size
+        ray, valid = fisheye_raymap(s, s)
+        self._ray_map_cache = torch.from_numpy(np.ascontiguousarray(ray, dtype=np.float32))
+        self._sky_valid_cache = torch.from_numpy(np.ascontiguousarray(valid, dtype=np.float32))
+
+    def _get_ray_map(self) -> torch.Tensor:
+        """Lazy ``[3, H, W]`` float32 fisheye ray vectors at the sky spatial size."""
         if self._ray_map_cache is None:
-            s = self._skyimg_spatial_size
-            ray, _valid = fisheye_raymap(s, s)
-            self._ray_map_cache = torch.from_numpy(np.ascontiguousarray(ray, dtype=np.float32))
-        return self._ray_map_cache
+            self._build_ray_and_valid_cache()
+        return self._ray_map_cache  # type: ignore[return-value]
+
+    def _get_sky_valid(self) -> torch.Tensor:
+        """Lazy ``[1, H, W]`` float32 fisheye validity mask (1.0 inside the image circle)."""
+        if self._sky_valid_cache is None:
+            self._build_ray_and_valid_cache()
+        return self._sky_valid_cache  # type: ignore[return-value]
+
+    def _compute_sun_mask_for_frames(
+        self,
+        frame_timestamps_utc: list[pd.Timestamp],
+    ) -> torch.Tensor:
+        """Per-frame ``[T, 1, H, W]`` float32 sun mask via an angular threshold on the cached ray map.
+
+        For each frame, the sun unit vector is derived from
+        :func:`compute_solar_features` (``(azimuth, zenith)`` in degrees,
+        meteorological convention: 0°=N, 90°=E, increasing clockwise; zenith
+        from up) and expressed in the same image-axis frame as
+        :func:`utils.fisheye_raymap.fisheye_raymap`:
+
+        * ``ray[0]`` / sun_x = image ``+x`` (image-right)  → maps to **East**
+        * ``ray[1]`` / sun_y = image ``+y`` (image-down)   → maps to **South** (= ``-North``)
+        * ``ray[2]`` / sun_z = image ``+z`` (out of image) → maps to **Up** (zenith)
+
+        i.e. the sky camera is taken to be upward-pointing, image-top=North,
+        image-right=East. The alignment is verified empirically in
+        ``playground/2026-06-12_sky-feats-impl/smoke_sunmask.py`` (phase 6
+        overlay against an RGB frame with the sun visible).
+
+        Pixels with angle to the sun within :attr:`sun_mask_radius_deg` are 1.0;
+        pixels outside the fisheye circle (``valid == 0``) are 0. Frames with
+        ``zenith >= 90°`` (sun below horizon) return all zeros without computing
+        the threshold.
+        """
+        if not frame_timestamps_utc:
+            raise ValueError("_compute_sun_mask_for_frames: frame_timestamps_utc is empty")
+        ray = self._get_ray_map()
+        valid = self._get_sky_valid()
+        h, w = int(ray.shape[-2]), int(ray.shape[-1])
+        t = int(len(frame_timestamps_utc))
+
+        feats = compute_solar_features(frame_timestamps_utc, self.latitude, self.longitude)
+        az_deg = np.asarray(feats["azimuth"], dtype=np.float64)
+        ze_deg = np.asarray(feats["zenith"], dtype=np.float64)
+        if az_deg.shape[0] != t or ze_deg.shape[0] != t:
+            raise RuntimeError(
+                f"compute_solar_features returned T={az_deg.shape[0]}/{ze_deg.shape[0]} "
+                f"for {t} frames"
+            )
+
+        above = np.isfinite(az_deg) & np.isfinite(ze_deg) & (ze_deg < 90.0)
+        az_rad = np.deg2rad(az_deg)
+        ze_rad = np.deg2rad(ze_deg)
+        sin_z = np.sin(ze_rad)
+        sun_x = sin_z * np.sin(az_rad)
+        sun_y = -sin_z * np.cos(az_rad)
+        sun_z = np.cos(ze_rad)
+        sun_np = np.stack([sun_x, sun_y, sun_z], axis=1).astype(np.float32, copy=False)
+        sun = torch.from_numpy(np.ascontiguousarray(sun_np))  # [T, 3]
+        above_t = torch.from_numpy(above.astype(np.float32))  # [T]
+
+        cos_threshold = float(np.cos(np.deg2rad(self.sun_mask_radius_deg)))
+        cos_angle = torch.einsum("chw,tc->thw", ray, sun)  # [T, H, W]
+        mask_thw = (cos_angle >= cos_threshold).to(torch.float32) * valid  # [T, H, W] (valid is [1,H,W])
+        mask_thw = mask_thw * above_t.view(-1, 1, 1)
+        return mask_thw.unsqueeze(1).contiguous()  # [T, 1, H, W]
 
     def _build_sky_channels(
         self,
@@ -1184,10 +1277,22 @@ class FolsomIrradianceDataset(Dataset):
                     )
                 parts.append(ray.unsqueeze(0).expand(t_dim, -1, -1, -1))
             elif name == _SKY_CHANNEL_SUN_MASK:
-                raise NotImplementedError(
-                    "sky_channels: 'sun_mask' is reserved but not yet implemented; "
-                    "remove it from sky_channels for now."
-                )
+                if frame_timestamps is None:
+                    raise ValueError(
+                        "_build_sky_channels: 'sun_mask' requires frame_timestamps "
+                        "(per-frame UTC pd.Timestamps for compute_solar_features)"
+                    )
+                sun_mask = self._compute_sun_mask_for_frames(list(frame_timestamps))
+                if sun_mask.shape[0] != t_dim:
+                    raise RuntimeError(
+                        f"sun mask T={sun_mask.shape[0]} does not match rgb T={t_dim}"
+                    )
+                if tuple(sun_mask.shape[-2:]) != (h_dim, w_dim):
+                    raise RuntimeError(
+                        f"sun mask spatial size {tuple(sun_mask.shape[-2:])} does not match "
+                        f"sky frame spatial size {(h_dim, w_dim)}"
+                    )
+                parts.append(sun_mask)
             else:
                 raise ValueError(f"sky_channels: unknown feature {name!r}")
         out = torch.cat(parts, dim=1).contiguous()
@@ -1621,6 +1726,7 @@ def build_folsom_irradiance_datasets_from_conf(
         satimg_npy_shape_hwc=tuple(int(x) for x in shwc),
         use_satellite=bool(sampling_cfg.get("use_satellite", False)),
         sky_channels=sampling_cfg.get("sky_channels"),
+        sun_mask_radius_deg=sampling_cfg.get("sun_mask_radius_deg"),
     )
     train_ds = FolsomIrradianceDataset(split="train", **kwargs)
     test_ds = FolsomIrradianceDataset(split="test", **kwargs)

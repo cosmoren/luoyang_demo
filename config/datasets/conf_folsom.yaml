@@ -67,11 +67,20 @@ sampling:
   #   - "rgb"       (3 channels) — historical default, RGB frame from JPEG/Zarr.
   #   - "ray_map"   (3 channels) — fixed fisheye unit-vector field from
   #                                ``utils/fisheye_raymap.py``; same across T.
-  #   - "sun_mask"  (1 channel)  — RESERVED; raises NotImplementedError today.
+  #   - "sun_mask"  (1 channel)  — per-frame binary disc around the sun direction,
+  #                                computed via an angular threshold against the
+  #                                cached ray map (see ``sun_mask_radius_deg``
+  #                                below). Below-horizon frames are all-zero.
   # Omitting this key (or leaving it as ["rgb"]) is byte-identical to legacy
   # 3-channel behavior, including for existing checkpoints. The model's
   # sky-branch first conv is sized from ``train_dataset.sky_in_channels``.
   sky_channels: ["rgb"]
+  # Angular radius (degrees) of the ``sun_mask`` disc. Only consulted when
+  # ``sky_channels`` includes ``"sun_mask"``. Default (key absent) is 1.0°,
+  # i.e. roughly the apparent sun diameter (~0.53°) plus a small margin so the
+  # disc covers a few pixels at 224x224 / 180° FOV. Increase (e.g. 3.0) to mark
+  # the sun-glare halo as well; the disc area scales with radius squared.
+  # sun_mask_radius_deg: 1.0
   # Enable Folsom GOES-15 satellite branch. When true, the loader resolves per-frame
   # NPY shards from <data_dir>/<paths.sat_path>/YYYY/MM/goes15_YYYYMMDD_HHMM.npy and
   # emits sat_tensor [T_sat, 3, 100, 100] + sat_timefeats [T_sat, 9]. When false,
