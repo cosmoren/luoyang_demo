@@ -33,8 +33,15 @@ Training usage (same two-step pattern as ``dataloader.luoyang``):
 
 - ``skimg_timestamps``, ``input_timestamps_utc``, ``forecast_timestamps_utc``
 
-Optional keys ``skimg_tensor``, ``skimg_timefeats``, ``nwp_tensor`` may be stacked as ``None`` if a future
-sample path omits them — same guard pattern as :func:`dataloader.luoyang.collate_batched`.
+Optional keys ``skimg_tensor``, ``skimg_timefeats``, ``nwp_tensor``, ``sat_tensor``, ``sat_timefeats``
+may be stacked as ``None`` if the dataset omits them — same guard pattern as
+:func:`dataloader.luoyang_zarr.collate_batched`. The satellite branch is gated on
+``sampling.use_satellite`` in the dataset YAML (overridable via the trainer's
+``--use-satellite`` / ``--no-use-satellite`` CLI flags): when False, ``sat_tensor`` and
+``sat_timefeats`` are returned as ``None`` (see ``_sat_enabled``); when True, the loader
+resolves per-frame ``.npy`` shards under ``<data_dir>/<paths.sat_path>/YYYY/MM/`` and
+emits real tensors. The model accepts both: ``models/models.py`` zero-paths the sat arm
+when ``sat_tensor is None`` (or its max is 0).
 
 Sky imagery: ``paths.sky_format`` is ``jpg`` (default; ``YYYYMMDDHHMMSS.jpg`` under ``paths.sky_image_path``)
 or ``zarr`` (``xr.open_zarr`` on that path; see ``config/datasets/conf_folsom.yaml``). Naive CSV times are read as **UTC**.
@@ -114,12 +121,18 @@ _FOLSOM_NWP_FEATURE_COLS = (
 _SKY_INDEX_CACHE: dict[str, tuple[list[pd.Timestamp], list[Path], list[int]]] = {}
 
 
-_DEFAULT_FOLSOM_TRAIN_EPOCH_LEN = 200_000
+_DEFAULT_FOLSOM_TRAIN_EPOCH_LEN = 100_000
 
 # Train mode: a Y window is "valid" if any of its rows has finite GHI strictly above this
 # threshold (W/m^2). Mirrors PVDataset's "any inverter_state == VALID_STATE" filter so we
 # avoid sampling all-night windows where target_pv is uniformly 0.
 _FOLSOM_TRAIN_GHI_DAYTIME_THRESHOLD = 10.0
+
+# Folsom satellite (use_satellite=True): satellite history ends ``_FOLSOM_SAT_ANCHOR_OFFSET_MIN``
+# minutes before the PV anchor time0 (to leave room for real-time delivery latency that
+# GridSat-CONUS shards would have in a live forecast pipeline). Unused when
+# ``sampling.use_satellite`` is false (sat_tensor / sat_timefeats are returned as None).
+_FOLSOM_SAT_ANCHOR_OFFSET_MIN = 30
 
 # GHI scaling factor used ONLY for ``p_cs = clearsky_ghi / _FOLSOM_GHI_SCALE`` (mirrors
 # Luoyang's ``poa_global / 1000`` recipe in
@@ -522,6 +535,7 @@ class FolsomIrradianceDataset(Dataset):
         satimg_window_size: int,
         satimg_time_resolution_min: int,
         satimg_npy_shape_hwc: tuple[int, int, int],
+        use_satellite: bool = False,
     ):
         self._config_path = Path(config_path).resolve()
         if not self._config_path.is_file():
@@ -564,7 +578,13 @@ class FolsomIrradianceDataset(Dataset):
             raise ValueError("skyimg_spatial_size must be >= 1")
         self._skyimg_spatial_size = int(skyimg_spatial_size)
 
-        # Sat config: accepted for API parity with PVDataset; Folsom has no satellite data.
+        # Sat config: when ``use_satellite=True`` the loader reads per-frame .npy shards
+        # under ``satimg_dir/YYYY/MM/goes15_YYYYMMDD_HHMM.npy`` (GOES-15 GridSat-CONUS,
+        # shape ``satimg_npy_shape_hwc`` HWC or its CHW permutation, float16 [0, 1]) and
+        # emits real ``sat_tensor`` / ``sat_timefeats`` tensors. When False, sat fields are
+        # returned as None and the model's ``if sat_tensor is None`` branch zero-paths the
+        # satellite arm. The shape / cadence fields are still validated either way for
+        # API parity with PVDataset.
         if len(satimg_npy_shape_hwc) != 3 or any(x < 1 for x in satimg_npy_shape_hwc):
             raise ValueError("satimg_npy_shape_hwc must be three positive ints (H, W, C)")
         self._satimg_npy_shape_hwc = tuple(int(x) for x in satimg_npy_shape_hwc)
@@ -572,6 +592,7 @@ class FolsomIrradianceDataset(Dataset):
             raise ValueError("satimg_time_resolution_min must be positive")
         self._satimg_dt_min = int(satimg_time_resolution_min)
         self._satimg_dir = Path(satimg_dir).resolve() if str(satimg_dir) else Path(".")
+        self._sat_enabled = bool(use_satellite)
 
         if test_anchor_stride_min <= 0 or test_anchor_stride_min % csv_interval_min:
             raise ValueError(
@@ -1086,6 +1107,80 @@ class FolsomIrradianceDataset(Dataset):
         clean, bad_mask = _sanitize_nwp_interp(nwp_interp)
         return torch.from_numpy(np.concatenate([clean, bad_mask], axis=1))
 
+    # ------------------------------------------------------------------
+    # Folsom GOES-15 satellite frames (per-frame .npy shards under
+    # ``satimg_dir/YYYY/MM/goes15_YYYYMMDD_HHMM.npy``; shape (3, 100, 100)
+    # float16 in [0, 1]; structural NCEI gaps yield missing files which we
+    # zero-fill below). Only invoked when ``self._sat_enabled`` is True;
+    # the helpers themselves are pure functions of the constructor-set sat
+    # config fields and cost nothing when unused.
+    # ------------------------------------------------------------------
+    def _satimg_anchor_end_utc(self, time0: Any) -> pd.Timestamp:
+        """``time0`` shifted back by ``_FOLSOM_SAT_ANCHOR_OFFSET_MIN`` and floored to the
+        ``_satimg_dt_min`` cadence (naive UTC). This is the **newest** frame time."""
+        t = pd.Timestamp(time0)
+        if t.tzinfo is not None:
+            t = t.tz_convert("UTC").tz_localize(None)
+        t = t - pd.Timedelta(minutes=_FOLSOM_SAT_ANCHOR_OFFSET_MIN)
+        dt = int(self._satimg_dt_min)
+        floored_minute = (int(t.minute) // dt) * dt
+        return t.replace(
+            minute=floored_minute, second=0, microsecond=0, nanosecond=0
+        )
+
+    def _satimg_history_frame_times(self, time0: Any) -> list[pd.Timestamp]:
+        """``satimg_window_size`` naive-UTC timestamps at ``_satimg_dt_min`` spacing ending at
+        :meth:`_satimg_anchor_end_utc` (``time0``). Returned oldest → newest."""
+        t_end = self._satimg_anchor_end_utc(time0)
+        w = int(self.satimg_window_size)
+        dt = int(self._satimg_dt_min)
+        return [t_end - pd.Timedelta(minutes=(w - 1 - i) * dt) for i in range(w)]
+
+    def _satimg_npy_path(self, t_utc_naive: pd.Timestamp) -> Path:
+        """``<satimg_dir>/YYYY/MM/goes15_YYYYMMDD_HHMM.npy`` for a naive-UTC timestamp."""
+        u = pd.Timestamp(t_utc_naive)
+        return (
+            self._satimg_dir
+            / f"{u.year:04d}"
+            / f"{u.month:02d}"
+            / f"goes15_{u.strftime('%Y%m%d_%H%M')}.npy"
+        )
+
+    def _dummy_satimg_tensor(self) -> torch.Tensor:
+        """Zero ``[3, H, W]`` float32 (PVDataset-shaped) for missing/unreadable shards."""
+        h, w, c = self._satimg_npy_shape_hwc
+        return torch.zeros((c, h, w), dtype=torch.float32)
+
+    def _load_satimg_tensor(self, path: Path) -> torch.Tensor:
+        """Folsom GridSat .npy → ``[3, H, W]`` float32 in [0, 1].
+
+        Files on disk are CHW (``(3, 100, 100)``) float16, already pre-normalized. Accepts
+        both CHW and HWC (for forward compatibility) by matching against
+        ``_satimg_npy_shape_hwc`` (HWC) and the CHW permutation thereof. Anything else (or
+        unreadable / missing file) → zero tensor (mirrors the structural NCEI gap policy).
+        """
+        h, w, c = self._satimg_npy_shape_hwc
+        chw_shape = (c, h, w)
+        hwc_shape = (h, w, c)
+        try:
+            if path.is_file():
+                arr = np.load(path, allow_pickle=False)
+                if arr.shape == chw_shape:
+                    return torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32))
+                if arr.shape == hwc_shape:
+                    arr = np.ascontiguousarray(arr, dtype=np.float32)
+                    return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+        except Exception:
+            pass
+        return self._dummy_satimg_tensor()
+
+    def _stack_satimg_frames(self, frame_times_utc: list[pd.Timestamp]) -> torch.Tensor:
+        """Stack ``[W, 3, H, W]`` float32 sat history. Missing shards → zero frames."""
+        return torch.stack(
+            [self._load_satimg_tensor(self._satimg_npy_path(t)) for t in frame_times_utc],
+            dim=0,
+        )
+
     def __len__(self) -> int:
         if self.split == "train":
             return self._train_epoch_len
@@ -1208,6 +1303,17 @@ class FolsomIrradianceDataset(Dataset):
         f_dtf = delta_time_encoder(forecast_timestamps, time0)
         forecast_timefeats = torch.cat([f_tf, f_dtf.unsqueeze(1)], dim=1)
 
+        if self._sat_enabled:
+            sat_times = self._satimg_history_frame_times(time0)
+            sat_tensor = self._stack_satimg_frames(sat_times)
+            sat_solar = compute_solar_features(sat_times, self.latitude, self.longitude)
+            sat_tf = solar_features_encoder(sat_solar)
+            sat_dtf = delta_time_encoder(sat_times, time0)
+            sat_timefeats = torch.cat([sat_tf, sat_dtf.unsqueeze(1)], dim=1)
+        else:
+            sat_tensor = None
+            sat_timefeats = None
+
         t_x_end = sub_x[self._time_col].iloc[-1]
         if self._sky_format == "zarr":
             nominal = self._nominal_sky_frame_times(t_x_end)
@@ -1264,8 +1370,8 @@ class FolsomIrradianceDataset(Dataset):
             "target_pv": target_pv_tensor,
             "target_mask": target_mask,
             "target_p_cs": target_p_cs,
-            "sat_tensor": None,
-            "sat_timefeats": None,
+            "sat_tensor": sat_tensor,
+            "sat_timefeats": sat_timefeats,
             "skimg_tensor": skimg_tensor,
             "skimg_timefeats": skimg_timefeats,
             "nwp_tensor": nwp_tensor,
@@ -1398,6 +1504,7 @@ def build_folsom_irradiance_datasets_from_conf(
         satimg_window_size=int(_req_s("satimg_window_size")),
         satimg_time_resolution_min=int(_req_s("satimg_time_resolution_min")),
         satimg_npy_shape_hwc=tuple(int(x) for x in shwc),
+        use_satellite=bool(sampling_cfg.get("use_satellite", False)),
     )
     train_ds = FolsomIrradianceDataset(split="train", **kwargs)
     test_ds = FolsomIrradianceDataset(split="test", **kwargs)

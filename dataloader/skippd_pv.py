@@ -104,7 +104,7 @@ _ZARR_SKY_DS_CACHE: dict[str, Any] = {}
 # Default dataset YAML for SKIPP'd under ``config/datasets/`` (smoke CLI convenience).
 _DEFAULT_SKIPPD_DATASET_CONFIG = _PROJECT_ROOT / "config" / "datasets" / "conf_skippd.yaml"
 
-_DEFAULT_SKIPPD_TRAIN_EPOCH_LEN = 50_000
+_DEFAULT_SKIPPD_TRAIN_EPOCH_LEN = 100_000
 
 # Train mode: keep anchors whose Y window has at least one ``kt_mask == 1`` row
 # (i.e. clearsky-daytime). Replaces Folsom's GHI > 10 W/m² filter.
@@ -926,7 +926,7 @@ def build_skippd_pv_datasets_from_conf(
     conf: dict | None = None,
     *,
     conf_path: Path | str | None = None,
-    train_epoch_len: int = 50_000,
+    train_epoch_len: int = 100_000,
     skyimg_window_size: int | None = None,
 ) -> tuple[SkippdPvDataset, SkippdPvDataset]:
     """
