@@ -1109,10 +1109,16 @@ def collate_batched(batch):
         "target_pv": _stack("target_pv"),
         "target_mask": _stack("target_mask"),
         "target_p_cs": _stack("target_p_cs"),
-        "target_weather_score": _stack("target_weather_score"),
     }
-    for key in ("nwp_tensor", "sat_tensor", "sat_timefeats", "skimg_tensor", "skimg_timefeats"):
-        vals = [s[key] for s in batch]
+    for key in (
+        "nwp_tensor",
+        "sat_tensor",
+        "sat_timefeats",
+        "skimg_tensor",
+        "skimg_timefeats",
+        "target_weather_score",
+    ):
+        vals = [s.get(key) for s in batch]
         if vals[0] is None:
             if not all(v is None for v in vals):
                 raise ValueError(f"collate_batched: mixed None and tensor for {key!r}")
