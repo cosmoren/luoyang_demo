@@ -121,7 +121,7 @@ _FOLSOM_NWP_FEATURE_COLS = (
 _SKY_INDEX_CACHE: dict[str, tuple[list[pd.Timestamp], list[Path], list[int]]] = {}
 
 
-_DEFAULT_FOLSOM_TRAIN_EPOCH_LEN = 200_000
+_DEFAULT_FOLSOM_TRAIN_EPOCH_LEN = 100_000
 
 # Train mode: a Y window is "valid" if any of its rows has finite GHI strictly above this
 # threshold (W/m^2). Mirrors PVDataset's "any inverter_state == VALID_STATE" filter so we
