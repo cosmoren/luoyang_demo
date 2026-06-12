@@ -7,7 +7,10 @@ injects **zarr** (see ``_folsom_pv_dataset_config_path``).
 
 Compared to ``training/train_vit_test.py`` (Luoyang), this file adds Folsom semantics (NWP remap /
 zero baseline, ``--eval_max_batches``, GHI-scale metrics, optional ``--zero-sky``) while keeping
-TensorBoard logging and optional EMA (same pattern as ``train_vit_test.py``).
+TensorBoard logging and optional EMA (same pattern as ``train_vit_test.py``). The 4-modality
+satellite branch (formerly the ``train_vit_test_folsom_2.py`` sidecar) is unified in: feeding
+``sat_tensor`` to the model is toggled by ``sampling.use_satellite`` in the dataset YAML and the
+``--use-satellite`` / ``--no-use-satellite`` CLI overrides (default off; CLI > YAML > False).
 
 Local smoke (1 logical GPU, tiny run):
 
@@ -16,6 +19,9 @@ Local smoke (1 logical GPU, tiny run):
 
   # Manager-style PV+NWP (real NWP, sky tensors zeroed after load; dataloader still reads Zarr):
   python training/train_vit_test_folsom.py --use-nwp --zero-sky  # add your usual epoch/batch flags
+
+  # 4-modality run (PV + sky + NWP + GOES-15 sat); overrides the dataset YAML's use_satellite key:
+  python training/train_vit_test_folsom.py --use-satellite --use-nwp  # add your usual epoch/batch flags
 
 Training hyperparameters: ``config/train/conf_train.yaml`` (``--config``). Dataset paths:
 ``config/datasets/conf_folsom.yaml`` (``--dataset-config``).
@@ -666,6 +672,27 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--use-satellite",
+        dest="use_satellite",
+        action="store_true",
+        help=(
+            "Enable the Folsom GOES-15 satellite branch (loads per-frame NPY shards from "
+            "<data_dir>/<paths.sat_path>/YYYY/MM/goes15_*.npy and feeds sat_tensor / "
+            "sat_timefeats into the model). Overrides ``sampling.use_satellite`` in the "
+            "dataset YAML when set."
+        ),
+    )
+    parser.add_argument(
+        "--no-use-satellite",
+        dest="use_satellite",
+        action="store_false",
+        help=(
+            "Force the satellite branch off (sat_tensor / sat_timefeats = None; model uses its "
+            "zero-sat embedding). Overrides ``sampling.use_satellite`` in the dataset YAML."
+        ),
+    )
+    parser.set_defaults(use_satellite=None)
+    parser.add_argument(
         "--tb-log-dir",
         type=str,
         default=None,
@@ -680,7 +707,11 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
     return parser
 
 
-def _dataset_kwargs(dataset_config_name: str, split: str) -> dict:
+def _dataset_kwargs(
+    dataset_config_name: str,
+    split: str,
+    use_satellite_override: bool | None = None,
+) -> dict:
     base_cfg_path = _resolve_named_config(_DATASETS_CONFIG_DIR, dataset_config_name, "dataset-config")
     cfg_path = _folsom_pv_dataset_config_path(base_cfg_path)
     cfg = _load_yaml(cfg_path)
@@ -712,6 +743,11 @@ def _dataset_kwargs(dataset_config_name: str, split: str) -> dict:
     if not isinstance(shwc, (list, tuple)) or len(shwc) != 3:
         raise ValueError(f"sampling.satimg_npy_shape_hwc must be [H, W, C] (in {base_cfg_path})")
 
+    if use_satellite_override is None:
+        use_satellite = bool(sampling_cfg.get("use_satellite", False))
+    else:
+        use_satellite = bool(use_satellite_override)
+
     return dict(
         config_path=str(cfg_path),
         pv_dir=str(pv_dir),
@@ -733,7 +769,18 @@ def _dataset_kwargs(dataset_config_name: str, split: str) -> dict:
         satimg_window_size=int(_req_sampling("satimg_window_size")),
         satimg_time_resolution_min=int(_req_sampling("satimg_time_resolution_min")),
         satimg_npy_shape_hwc=tuple(int(x) for x in shwc),
+        use_satellite=use_satellite,
     )
+
+
+def _resolve_use_satellite(dataset_config_name: str, cli_value: bool | None) -> bool:
+    """Resolve ``use_satellite``: CLI flag > YAML ``sampling.use_satellite`` > False."""
+    if cli_value is not None:
+        return bool(cli_value)
+    base_cfg_path = _resolve_named_config(_DATASETS_CONFIG_DIR, dataset_config_name, "dataset-config")
+    cfg_path = _folsom_pv_dataset_config_path(base_cfg_path)
+    cfg = _load_yaml(cfg_path)
+    return bool((cfg.get("sampling", {}) or {}).get("use_satellite", False))
 
 
 def _resolve_train_epoch_len(dataset_config_name: str, cli_value: int | None) -> int | None:
@@ -792,9 +839,20 @@ def main() -> None:
     torch.backends.cudnn.deterministic = False
 
     dataset_cfg = args.dataset_config
-    train_dataset = FolsomIrradianceDataset(**_dataset_kwargs(dataset_cfg, "train"))
-    val_dataset = FolsomIrradianceDataset(**_dataset_kwargs(dataset_cfg, "val"))
-    test_dataset = FolsomIrradianceDataset(**_dataset_kwargs(dataset_cfg, "test"))
+    use_satellite = _resolve_use_satellite(dataset_cfg, args.use_satellite)
+    _use_sat_src = (
+        "CLI flag" if args.use_satellite is not None else f"YAML ({dataset_cfg})"
+    )
+    print(f"use_satellite: {use_satellite} (source: {_use_sat_src})")
+    train_dataset = FolsomIrradianceDataset(
+        **_dataset_kwargs(dataset_cfg, "train", use_satellite_override=use_satellite)
+    )
+    val_dataset = FolsomIrradianceDataset(
+        **_dataset_kwargs(dataset_cfg, "val", use_satellite_override=use_satellite)
+    )
+    test_dataset = FolsomIrradianceDataset(
+        **_dataset_kwargs(dataset_cfg, "test", use_satellite_override=use_satellite)
+    )
     _epoch_len_override = _resolve_train_epoch_len(dataset_cfg, args.train_epoch_len)
     if _epoch_len_override is not None:
         train_dataset._train_epoch_len = max(1, int(_epoch_len_override))
