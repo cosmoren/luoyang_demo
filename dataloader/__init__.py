@@ -20,6 +20,12 @@ Smoke test (optional ``--last-input-time`` for anchor = last input row time):
 
     python -m dataloader.folsom
     python -m dataloader.folsom --last-input-time "2014-01-04 07:59:00"
+
+# SKIPP'd (Stanford rooftop PV + sky JPEGs / Zarr; no NWP, no satellite):
+#   from dataloader.skippd_pv import SkippdPvDataset
+#
+# Smoke test:
+#   python -m dataloader.skippd_pv --split val
 """
 
 __all__ = []

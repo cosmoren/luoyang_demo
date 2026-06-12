@@ -1,24 +1,47 @@
 """
-Canonical **Folsom** trainer for ``pv_forecasting_model_vit_imgs`` (long-lived entrypoint).
+Canonical **SKIPP'd** trainer for ``pv_forecasting_model_vit_imgs`` (long-lived entrypoint).
 
-Uses ``dataloader.folsom.FolsomIrradianceDataset`` (zarr/JPEG skies, merged NWP, Luoyang-shaped
-``collate_batched`` batches). If ``paths.sky_format`` is omitted in the dataset YAML, this script
-injects **zarr** (see ``_folsom_pv_dataset_config_path``).
+Uses ``dataloader.skippd_pv.SkippdPvDataset`` (PV CSV + sky-Zarr; no NWP, no satellite)
+with the Luoyang-shaped ``collate_batched`` batches. If ``paths.sky_format`` is omitted
+in the dataset YAML, this script injects **zarr** (see ``_skippd_pv_dataset_config_path``).
 
-Compared to ``training/train_vit_test.py`` (Luoyang), this file adds Folsom semantics (NWP remap /
-zero baseline, ``--eval_max_batches``, GHI-scale metrics, optional ``--zero-sky``) while keeping
-TensorBoard logging and optional EMA (same pattern as ``train_vit_test.py``).
+This is a near-1:1 port of ``training/train_vit_test_folsom.py`` on this branch. The
+substitutions versus Folsom are:
+
+* GHI scale ``1100`` (W/m²) → PV capacity ``30.0`` (kW). Used in masked-MAE / RMSE
+  conversion (normalized → kW) and the ACC denominator.
+* Folsom-only NWP-merge code paths are dropped (no ``--use-nwp`` flag, no
+  ``remap_nwp_tensor_for_pv_vit_imgs``, no ``_prepare_nwp_for_vit``). The SKIPP'd
+  dataloader emits a zero ``nwp_tensor`` of Folsom's missing-NWP shape
+  (``[T_out, len(_FOLSOM_NWP_FEATURE_COLS) + 1]``), so the model's
+  ``nwp_tensor[:, :, 0|2|-1]`` indexing receives zeros / a 1.0 invalid-mask channel.
+* Checkpoint dir ``checkpoints_folsom_pv`` → ``checkpoints_skippd_pv``;
+  TB dir ``runs/folsom_pv_*`` → ``runs/skippd_pv_*``;
+  best/final checkpoint stems ``folsom_pv_forecast_vit_*`` → ``skippd_pv_forecast_vit_*``.
+* Default ``--dataset-config`` ``conf_folsom.yaml`` → ``conf_skippd.yaml``.
+
+The kt-aware forward/loss/eval path is identical to Folsom:
+
+    kt_pred = model(...) * 20.0
+    pv_pred = kt_pred * target_p_cs * p_mean.unsqueeze(1)
+    loss    = HuberLoss(pv_pred[:, :H] * target_mask[:, :H], target_pv[:, :H] * target_mask[:, :H])
+
+with ``H = _LOSS_METRIC_HORIZON = 16`` (same constant as Folsom). The SKIPP'd
+dataloader puts both ``target_pv = pv_kW / 30`` and ``target_p_cs = clearsky_ghi / 1000``
+in normalized space; ``p_mean = 1.0`` (literal Folsom constant), which keeps the
+identity ``pv_pred ≈ target_pv`` algebraically clean. The reported MAE in kW is
+``mae_norm * 30.0`` (analog of Folsom's ``mae_norm * 1100.0`` W/m² conversion).
 
 Local smoke (1 logical GPU, tiny run):
 
-  python training/train_vit_test_folsom.py --epochs 1 --train_max_batches_per_epoch 3 \\
+  python training/train_vit_test_skippd.py --epochs 1 --train_max_batches_per_epoch 3 \
     --eval_max_batches 20 --num_workers 0 --batch_size 1
 
-  # Manager-style PV+NWP (real NWP, sky tensors zeroed after load; dataloader still reads Zarr):
-  python training/train_vit_test_folsom.py --use-nwp --zero-sky  # add your usual epoch/batch flags
+  # Sky-ablation (dataloader still loads real Zarr but sky tensors are zeroed before forward):
+  python training/train_vit_test_skippd.py --zero-sky  # plus your usual epoch/batch flags
 
 Training hyperparameters: ``config/train/conf_train.yaml`` (``--config``). Dataset paths:
-``config/datasets/conf_folsom.yaml`` (``--dataset-config``).
+``config/datasets/conf_skippd.yaml`` (``--dataset-config``).
 """
 
 from __future__ import annotations
@@ -28,13 +51,11 @@ import atexit
 import contextlib
 import copy
 import os
-import random
 import shutil
 import sys
 import tempfile
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim.lr_scheduler as lr_scheduler
@@ -48,160 +69,24 @@ _CONFIG_DIR = _PROJECT_ROOT / "config"
 _TRAIN_CONFIG_DIR = _CONFIG_DIR / "train"
 _DATASETS_CONFIG_DIR = _CONFIG_DIR / "datasets"
 _DEFAULT_TRAIN_CONF_NAME = "conf_train.yaml"
-_DEFAULT_FOLSOM_DATASET_CONFIG = "conf_folsom.yaml"
-# When the dataset YAML omits ``paths.sky_format``, ``dataloader.folsom`` would default to jpg;
-# this trainer injects ``zarr`` instead (JPEG users must set ``paths.sky_format: jpg``).
+_DEFAULT_SKIPPD_DATASET_CONFIG = "conf_skippd.yaml"
+# When the dataset YAML omits ``paths.sky_format``, ``dataloader.skippd_pv`` would
+# error (only ``zarr`` is supported); this trainer injects ``zarr`` to match Folsom's
+# trainer-side convention.
 _DEFAULT_SKY_FORMAT_FOR_PV_TRAINER = "zarr"
-_FOLSOM_PV_TEMP_CFG_DIRS: list[Path] = []
+_SKIPPD_PV_TEMP_CFG_DIRS: list[Path] = []
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from dataloader.folsom import (  # noqa: E402
-    _FOLSOM_HUBER_DELTA,
-    _FOLSOM_KT_INPUT_SCALE,
-    _FOLSOM_NWP_FEATURE_COLS,
-    FolsomIrradianceDataset,
-)
 from dataloader.luoyang_zarr import collate_batched  # noqa: E402
-from models.models import (  # noqa: E402
-    NWP_FEATURE_NORMALIZERS,
-    pv_forecasting_model_vit_imgs,
-)
+from dataloader.skippd_pv import SkippdPvDataset  # noqa: E402
+from models.models import pv_forecasting_model_vit_imgs  # noqa: E402
 
-# Column indices in ``nwp_tensor`` **before** remap: 8 features from ``_FOLSOM_NWP_FEATURE_COLS`` + 1 trailing mask.
-_FOLSOM_NWP_TEMPERATURE_INDEX = _FOLSOM_NWP_FEATURE_COLS.index("temperature")
-# ``pv_forecasting_model_vit_imgs`` reads ``nwp_tensor[:, :, 0]`` as shortwave-like and ``[:, :, 2]`` as Kelvin temp.
-_VIT_IMGS_NWP_TEMPERATURE_SLOT = 2
-# Folsom forecast horizon: first 16 output steps (~4 h at 15 min; Folsom uses 15 min output).
-# Capped at 16 (~4 h) to mirror Luoyang; the dataset's ``pv_output_len`` is set to 16 so the
-# model output, loss, and masked RMSE/MAE all cover the same 4 h forecast window.
+# Match Folsom (and ``train_vit_test.py``): first 16 output steps (~4 h at 15 min;
+# SKIPP'd uses the same 15-min output cadence).
 _LOSS_METRIC_HORIZON = 16
-
-# Special token in ``--nwp-features`` that toggles the per-step invalid-mask channel
-# (``nwp_tensor[:, :, -1]``); not a real NWP feature so kept out of the features list.
-_NWP_INVALID_MASK_TOKEN = "invalid_mask"
-# Presets resolved by ``_parse_nwp_features``.
-_NWP_FEATURE_PRESETS: dict[str, tuple[tuple[str, ...], bool]] = {
-    "minimal": (("dwsw", "temperature"), False),
-    "all": (tuple(_FOLSOM_NWP_FEATURE_COLS), True),
-}
-
-
-def remap_nwp_tensor_for_pv_vit_imgs(nwp_tensor: torch.Tensor) -> torch.Tensor:
-    """
-    Reorder Folsom merged-NWP features for ``pv_forecasting_model_vit_imgs``.
-
-    Folsom ``_interpolate_nwp`` stacks columns in ``_FOLSOM_NWP_FEATURE_COLS`` order, then appends
-    an invalid mask. The PV ViT used to assume channel 0 ≈ surface shortwave (W/m²) and channel 2
-    ≈ air temperature (K), matching Luoyang's ``ssrd`` / ``t2m`` positions. Here ``dwsw`` is
-    already at index 0; ``temperature`` is at index 6 and used to be copied into index 2.
-
-    NOTE: this helper is no longer used by ``pv_forecasting_model_vit_imgs`` (which now reads
-    raw ``_FOLSOM_NWP_FEATURE_COLS`` indices directly via the per-feature dispatch dict; see
-    ``models.models.NWP_FEATURE_NORMALIZERS`` and the model's ``nwp_features`` constructor
-    argument). Kept here as a no-touch reference for any older variant that might still want the
-    Luoyang-style channel layout.
-    """
-    if nwp_tensor.ndim != 3:
-        raise ValueError(f"nwp_tensor expected [B, T, C], got shape {tuple(nwp_tensor.shape)}")
-    n_feat = len(_FOLSOM_NWP_FEATURE_COLS)
-    if nwp_tensor.shape[-1] != n_feat + 1:
-        raise ValueError(
-            f"nwp_tensor last dim expected {n_feat + 1} (features + mask), got {nwp_tensor.shape[-1]}"
-        )
-    out = nwp_tensor.clone()
-    out[:, :, _VIT_IMGS_NWP_TEMPERATURE_SLOT] = nwp_tensor[:, :, _FOLSOM_NWP_TEMPERATURE_INDEX]
-    # Channel 0 is already ``dwsw`` (first column of ``_FOLSOM_NWP_FEATURE_COLS``).
-    return out
-
-
-def _parse_nwp_features(spec: str) -> tuple[list[str], bool]:
-    """Resolve ``--nwp-features`` into ``(features, use_invalid_mask)``.
-
-    Accepts a preset name (see ``_NWP_FEATURE_PRESETS``) or a comma-separated list of
-    canonical feature names. The special token ``invalid_mask`` (or ``+invalid_mask``)
-    toggles the per-step invalid mask channel instead of adding a feature.
-
-    Raises ``ValueError`` with a clear message on unknown / duplicate names.
-    """
-    spec = (spec or "").strip()
-    if not spec:
-        raise ValueError("--nwp-features may not be empty")
-    if spec in _NWP_FEATURE_PRESETS:
-        feats, use_mask = _NWP_FEATURE_PRESETS[spec]
-        return list(feats), bool(use_mask)
-
-    features: list[str] = []
-    use_invalid_mask = False
-    valid = set(NWP_FEATURE_NORMALIZERS)
-    seen: set[str] = set()
-    for raw in spec.split(","):
-        token = raw.strip()
-        if not token:
-            continue
-        if token in (_NWP_INVALID_MASK_TOKEN, "+" + _NWP_INVALID_MASK_TOKEN):
-            use_invalid_mask = True
-            continue
-        if token not in valid:
-            raise ValueError(
-                f"--nwp-features: unknown feature {token!r}. Valid features: "
-                f"{sorted(valid)} (presets: {sorted(_NWP_FEATURE_PRESETS)}; "
-                f"add {_NWP_INVALID_MASK_TOKEN!r} to include the per-step invalid mask)."
-            )
-        if token in seen:
-            raise ValueError(f"--nwp-features: duplicate feature {token!r}")
-        seen.add(token)
-        features.append(token)
-
-    if not features:
-        raise ValueError(
-            "--nwp-features must select at least one feature "
-            f"(got spec {spec!r}; valid features: {sorted(valid)})"
-        )
-    return features, use_invalid_mask
-
-
-def _format_nwp_features_for_log(features: list[str], use_invalid_mask: bool) -> str:
-    """Compact, deterministic string for logs / TensorBoard hparams."""
-    parts = list(features)
-    if use_invalid_mask:
-        parts.append(_NWP_INVALID_MASK_TOKEN)
-    return ",".join(parts) if parts else "<none>"
-
-
-# Default ``nwp_features`` / ``nwp_use_invalid_mask`` for checkpoints that pre-date the
-# per-feature selector (i.e. saved with the hardcoded ``(ssrd, t2m)`` query). Matches
-# ``models.models._DEFAULT_VIT_IMGS_NWP_FEATURES`` and the ``minimal`` preset.
-_LEGACY_CKPT_NWP_FEATURES: tuple[str, ...] = ("dwsw", "temperature")
-_LEGACY_CKPT_NWP_USE_INVALID_MASK: bool = False
-
-
-def resolve_nwp_features_from_ckpt(ckpt: dict) -> tuple[list[str], bool]:
-    """Read ``nwp_features`` / ``nwp_use_invalid_mask`` from a loaded checkpoint dict.
-
-    Falls back to the pre-refactor defaults (``["dwsw", "temperature"]`` / ``False``) when
-    the keys are absent so older checkpoints can be reloaded by the same code path.
-    Also validates that any feature name listed in the checkpoint is currently known to
-    the dispatch dict; otherwise the model factory would explode further downstream.
-    """
-    raw_feats = ckpt.get("nwp_features")
-    if raw_feats is None:
-        features = list(_LEGACY_CKPT_NWP_FEATURES)
-    else:
-        features = [str(n) for n in raw_feats]
-        unknown = [n for n in features if n not in NWP_FEATURE_NORMALIZERS]
-        if unknown:
-            raise ValueError(
-                f"checkpoint nwp_features contains unknown name(s) {unknown}; "
-                f"valid features are {sorted(NWP_FEATURE_NORMALIZERS)}"
-            )
-
-    raw_mask = ckpt.get("nwp_use_invalid_mask")
-    if raw_mask is None:
-        use_invalid_mask = _LEGACY_CKPT_NWP_USE_INVALID_MASK
-    else:
-        use_invalid_mask = bool(raw_mask)
-
-    return features, use_invalid_mask
+# PV capacity (kW). Analog of Folsom's ``ghi_scale = 1100.0`` (W/m²). Used to
+# convert normalized MAE/RMSE back to kW and as the ACC denominator.
+_SKIPPD_PV_CAPACITY_KW = 30.0
 
 
 def _gpu_id_for_checkpoint() -> int:
@@ -240,32 +125,11 @@ def _batch_to_device(batch: dict, device: torch.device) -> dict:
     return out
 
 
-def _prepare_nwp_for_vit(d: dict, *, use_nwp: bool) -> dict:
-    """
-    Prepare ``d['nwp_tensor']`` for the ViT, in place.
-
-    Two parallel paths share the same downstream call signature so the model code is unchanged:
-      * ``use_nwp=True``  -> pass the raw merged-NWP tensor through unchanged (post-refactor:
-        ``pv_forecasting_model_vit_imgs`` reads ``_FOLSOM_NWP_FEATURE_COLS`` indices itself via
-        the per-feature dispatch dict; channel remap is no longer needed).
-      * ``use_nwp=False`` -> overwrite with ``zeros_like`` (blacked-out / NWP-ablation baseline).
-
-    The model always indexes ``nwp_tensor`` columns, so we keep the original
-    shape/dtype/device and only swap the values; ``None`` would crash the forward pass.
-    """
-    nwp = d.get("nwp_tensor")
-    if nwp is None:
-        return d
-    if not use_nwp:
-        d["nwp_tensor"] = torch.zeros_like(nwp)
-    return d
-
-
 def _prepare_sky_for_vit(d: dict, *, zero_sky: bool) -> dict:
     """
-    Optionally zero sky tensors after ``_batch_to_device`` so the ViT sees no sky signal while the
-    dataloader still loads real Zarr/JPEG (avoids bogus paths). Matches the model branch for
-    ``skimg_tensor.max() == 0`` (see ``pv_forecasting_model_vit_imgs``).
+    Optionally zero sky tensors after ``_batch_to_device`` so the ViT uses the
+    empty-sky branch while the dataloader still loads real Zarr frames. Same
+    behaviour as Folsom's ``_prepare_sky_for_vit``.
     """
     if not zero_sky:
         return d
@@ -276,28 +140,14 @@ def _prepare_sky_for_vit(d: dict, *, zero_sky: bool) -> dict:
     return d
 
 
-def _seed_worker(worker_id: int) -> None:
-    """DataLoader ``worker_init_fn``: distinct-but-deterministic per-worker RNGs.
-
-    ``dataloader.folsom`` calls ``np.random.choice`` per ``__getitem__``, so without this each
-    worker would share whatever numpy/random state it forked with.
-    """
-    worker_seed = (torch.initial_seed() + worker_id) % 2**32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-
-
 def forward_vit(model: nn.Module, d: dict) -> torch.Tensor:
-    """Mirrors ``training/train_vit_test.py::forward_vit``: the ViT is fed normalized
-    ``kt`` (clear-sky index / 4000.0) and the daytime ``kt_mask``; the caller scales the
-    output back to ``kt`` and multiplies by ``target_p_cs * p_mean`` to recover ``pv``.
-    Folsom's divisor is 4000 (vs Luoyang's 20) because Folsom kt is in W/m^2-ish units
-    (numerator is raw GHI ~1000 W/m^2, denominator is dimensionless ``p_cs``) so empirical
-    kt p99 ~= 1434 / max ~= 2630; ``/4000`` lands the ViT input at p99 ~= 0.36 and max ~=
-    0.66, matching Luoyang's headroom (Luoyang p99/20 = 0.38, max/20 = 0.60)."""
+    """Mirrors ``training/train_vit_test_folsom.py::forward_vit``: the ViT is fed
+    normalized ``kt`` (``kt / 20.0``) and the daytime ``kt_mask``; the caller scales
+    the output back to ``kt`` and multiplies by ``target_p_cs * p_mean`` to recover
+    ``pv``."""
     return model(
         d["device_id"],
-        d["kt"] / _FOLSOM_KT_INPUT_SCALE,
+        d["kt"] / 20.0,
         pv_mask=d["kt_mask"],
         pv_timefeats=d["pv_timefeats"],
         forecast_timefeats=d["forecast_timefeats"],
@@ -310,7 +160,7 @@ def forward_vit(model: nn.Module, d: dict) -> torch.Tensor:
 
 
 class ModelEMA:
-    """Exponential Moving Average of model weights (same idea as ``training/train_vit_test.py``)."""
+    """Exponential Moving Average of model weights (same idea as ``train_vit_test_folsom.py``)."""
 
     def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
         self.decay = decay
@@ -352,7 +202,6 @@ def train_one_epoch(
     max_batches: int | None = None,
     ema: ModelEMA | None = None,
     *,
-    use_nwp: bool = False,
     zero_sky: bool = False,
 ) -> float:
     model.train()
@@ -363,11 +212,10 @@ def train_one_epoch(
         if max_batches is not None and batch_idx >= max_batches:
             break
         d = _batch_to_device(batch, device)
-        _prepare_nwp_for_vit(d, use_nwp=use_nwp)
         _prepare_sky_for_vit(d, zero_sky=zero_sky)
         B = d["device_id"].size(0)
         optimizer.zero_grad()
-        kt_pred = forward_vit(model, d) * _FOLSOM_KT_INPUT_SCALE
+        kt_pred = forward_vit(model, d) * 20.0
         pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
         t_out = int(pv_pred.shape[1])
         assert d["target_pv"].shape[1] == t_out, (pv_pred.shape, d["target_pv"].shape)
@@ -382,7 +230,7 @@ def train_one_epoch(
         if ema is not None:
             ema.update(model)
         total_loss += loss.item()
-        n += 1
+        n += B
     print()
     return total_loss / max(n, 1)
 
@@ -394,15 +242,15 @@ def evaluate(
     criterion: nn.Module,
     *,
     max_batches: int | None = None,
-    use_nwp: bool = False,
     zero_sky: bool = False,
 ) -> tuple[float, float, float]:
-    """Returns mean Huber loss (first ``_LOSS_METRIC_HORIZON`` steps, masked like train), RMSE and
-    MAE in **normalized** GHI space over the same slice (``target_mask``; predictions at night
-    cos-zenith < 0 are zeroed before residuals, matching ``train_vit_test.py``).
+    """Returns mean Huber loss (first ``_LOSS_METRIC_HORIZON`` steps, masked like train),
+    RMSE and MAE in **normalized** PV space over the same slice (``target_mask``;
+    predictions at night cos-zenith < 0 are zeroed before residuals, matching the
+    Folsom / Luoyang trainers).
 
-    If ``max_batches`` is set, only the first N batches are used (smoke / faster dev runs; metrics
-    are not a full pass over the split).
+    If ``max_batches`` is set, only the first N batches are used (smoke / faster dev
+    runs; metrics are not a full pass over the split).
     """
     model.eval()
     total_loss = 0.0
@@ -415,9 +263,8 @@ def evaluate(
             if max_batches is not None and batch_idx >= int(max_batches):
                 break
             d = _batch_to_device(batch, device)
-            _prepare_nwp_for_vit(d, use_nwp=use_nwp)
             _prepare_sky_for_vit(d, zero_sky=zero_sky)
-            kt_pred = forward_vit(model, d) * _FOLSOM_KT_INPUT_SCALE
+            kt_pred = forward_vit(model, d) * 20.0
             pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
             t_out = int(pv_pred.shape[1])
             h = min(_LOSS_METRIC_HORIZON, t_out)
@@ -426,7 +273,7 @@ def evaluate(
             loss = criterion((pv_pred[:, :h] * m), (tgt * m))
             total_loss += loss.item()
             n_batches += 1
-            # Night mask on predictions (``forecast_timefeats[:, :, 3]`` == cos zenith), like ``train_vit_test``.
+            # Night mask on predictions (``forecast_timefeats[:, :, 3]`` == cos zenith), like Folsom.
             pred_h = pv_pred[:, :h].clone()
             night = d["forecast_timefeats"][:, :h, 3] < 0
             pred_h[night] = 0.0
@@ -436,16 +283,27 @@ def evaluate(
             n_elem += m.sum().item()
 
     mean_loss = total_loss / max(n_batches, 1)
-    # Post-alignment (commit 518dca9) target_pv is raw W/m^2, so per-element residual
-    # means are already in W/m^2 -- no denormalization needed.
-    mae_wm2 = sum_abs / max(n_elem, 1.0)
-    rmse_wm2 = (sum_sq / max(n_elem, 1.0)) ** 0.5
+    mae_norm = sum_abs / max(n_elem, 1.0)
+    rmse_norm = (sum_sq / max(n_elem, 1.0)) ** 0.5
+    # Dataset stores PV / 30 kW; convert error back to kW for readability.
+    pv_scale = _SKIPPD_PV_CAPACITY_KW
+    mae_kw = mae_norm * pv_scale
+    rmse_kw = rmse_norm * pv_scale
+    capacity = pv_scale
     print(
-        f"First-{_LOSS_METRIC_HORIZON}-step metrics (masked GHI; pred zeroed at night): "
-        f"MAE={mae_wm2:.4f} W/m²  RMSE={rmse_wm2:.4f} W/m²  "
-        f"(~4 h horizon at 15 min)"
+        f"First-{_LOSS_METRIC_HORIZON}-step metrics (masked PV; pred zeroed at night): "
+        f"MAE(norm)={mae_norm:.6f}  RMSE(norm)={rmse_norm:.6f}  "
+        f"MAE≈{mae_kw:.2f} kW  RMSE≈{rmse_kw:.2f} kW"
     )
-    return mean_loss, rmse_wm2, mae_wm2
+    print(
+        f"RMSE/MAE on first {_LOSS_METRIC_HORIZON} forecast steps (~4 h at 15 min). "
+        f"Capacity: {capacity:.0f} (kW PV rated)"
+    )
+    print(
+        f"MAE: {mae_kw:.6f}, RMSE: {rmse_kw:.6f}, "
+        f"ACC(MAE): {1.0 - mae_kw / capacity:.6f}, ACC(RMSE): {1.0 - rmse_kw / capacity:.6f}"
+    )
+    return mean_loss, rmse_norm, mae_norm
 
 
 def _build_lr_scheduler(
@@ -496,17 +354,17 @@ def _load_yaml(path: Path) -> dict:
     return data or {}
 
 
-def _cleanup_folsom_pv_temp_cfg_dirs() -> None:
-    for d in _FOLSOM_PV_TEMP_CFG_DIRS:
+def _cleanup_skippd_pv_temp_cfg_dirs() -> None:
+    for d in _SKIPPD_PV_TEMP_CFG_DIRS:
         shutil.rmtree(d, ignore_errors=True)
 
 
-atexit.register(_cleanup_folsom_pv_temp_cfg_dirs)
+atexit.register(_cleanup_skippd_pv_temp_cfg_dirs)
 
 
-def _folsom_pv_dataset_config_path(base: Path) -> Path:
+def _skippd_pv_dataset_config_path(base: Path) -> Path:
     """
-    YAML path for ``FolsomIrradianceDataset``: ``base`` as-is, or a temp copy with
+    YAML path for ``SkippdPvDataset``: ``base`` as-is, or a temp copy with
     ``paths.sky_format`` set to ``_DEFAULT_SKY_FORMAT_FOR_PV_TRAINER`` when missing/blank.
     """
     cfg = _load_yaml(base)
@@ -515,8 +373,8 @@ def _folsom_pv_dataset_config_path(base: Path) -> Path:
         return base
     cfg2 = copy.deepcopy(cfg)
     cfg2.setdefault("paths", {})["sky_format"] = _DEFAULT_SKY_FORMAT_FOR_PV_TRAINER
-    tmp = Path(tempfile.mkdtemp(prefix="folsom_pv_ds_cfg_"))
-    _FOLSOM_PV_TEMP_CFG_DIRS.append(tmp)
+    tmp = Path(tempfile.mkdtemp(prefix="skippd_pv_ds_cfg_"))
+    _SKIPPD_PV_TEMP_CFG_DIRS.append(tmp)
     out = tmp / "dataset.yaml"
     with open(out, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg2, f, sort_keys=False, allow_unicode=True)
@@ -533,7 +391,7 @@ def _resolve_data_dir(paths_cfg: dict, cfg_path: Path) -> Path:
 
 def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train pv_forecasting_model_vit_imgs on Folsom (GHI as PV target)"
+        description="Train pv_forecasting_model_vit_imgs on SKIPP'd (single rooftop PV + sky Zarr)"
     )
     parser.add_argument(
         "--config",
@@ -544,8 +402,8 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataset-config",
         type=str,
-        default=_DEFAULT_FOLSOM_DATASET_CONFIG,
-        help=f"Dataset YAML filename under config/datasets/ (default: {_DEFAULT_FOLSOM_DATASET_CONFIG!r}).",
+        default=_DEFAULT_SKIPPD_DATASET_CONFIG,
+        help=f"Dataset YAML filename under config/datasets/ (default: {_DEFAULT_SKIPPD_DATASET_CONFIG!r}).",
     )
     parser.add_argument("--epochs", type=int, default=int(h["epochs"]))
     parser.add_argument("--lr", type=float, default=float(h["lr"]))
@@ -593,12 +451,6 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
         help="Skip EMA updates for the first N epochs (default 5).",
     )
     parser.add_argument("--batch_size", type=int, default=int(h["batch_size"]))
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=0,
-        help="RNG seed for python/numpy/torch + dataloader workers (default 0).",
-    )
     parser.add_argument("--checkpoint_dir", type=str, default=None)
     parser.add_argument("--save_every", type=int, default=int(h["save_every"]))
     parser.add_argument("--num_workers", type=int, default=int(h["num_workers"]))
@@ -617,64 +469,12 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
         help="If set, cap val/test ``evaluate()`` to the first N batches each call (default: full loader).",
     )
     parser.add_argument(
-        "--train_epoch_len",
-        type=int,
-        default=None,
-        metavar="N",
-        help=(
-            "Random anchor draws per epoch from the valid train pool. "
-            "Precedence: this flag > sampling.train_epoch_len in the dataset YAML > "
-            "dataloader default (_DEFAULT_FOLSOM_TRAIN_EPOCH_LEN). With replacement; "
-            "more draws -> better anchor coverage at the cost of per-epoch wall time."
-        ),
-    )
-    parser.add_argument(
-        "--use-nwp",
-        action="store_true",
-        help=(
-            "Feed the real Folsom merged-NWP tensor to the ViT. Default is OFF: the NWP "
-            "tensor is replaced with zeros (blacked-out baseline). The per-feature selection "
-            "is controlled by --nwp-features below; --use-nwp toggles whether the data is real "
-            "or zeroed-out at input."
-        ),
-    )
-    parser.add_argument(
-        "--nwp-features",
-        type=str,
-        default="minimal",
-        help=(
-            "Which NWP feature channels to feed into the forecast-query MLP of "
-            "pv_forecasting_model_vit_imgs (also fixes the model's query_mlp input dim). "
-            "Comma-separated list from "
-            f"{sorted(NWP_FEATURE_NORMALIZERS)} (canonical order: "
-            f"{list(_FOLSOM_NWP_FEATURE_COLS)}); add the special token "
-            f"'{_NWP_INVALID_MASK_TOKEN}' (or '+{_NWP_INVALID_MASK_TOKEN}') to also append the "
-            "per-step invalid mask channel. Presets: "
-            f"{sorted(_NWP_FEATURE_PRESETS)}. Default 'minimal' = "
-            f"{list(_NWP_FEATURE_PRESETS['minimal'][0])} (mask off). When --use-nwp is off, this "
-            "flag still picks the architecture but the input data is zeroed (existing "
-            "_prepare_nwp_for_vit behaviour)."
-        ),
-    )
-    parser.add_argument(
         "--zero-sky",
         action="store_true",
         help=(
-            "After each batch is on device, replace sky image tensors (and sky time features) with "
-            "zeros so the ViT uses the empty-sky branch while the dataset still loads real Zarr/JPEG. "
-            "Use with --use-nwp for PV+NWP vs PV+NWP+sky comparisons."
-        ),
-    )
-    parser.add_argument(
-        "--tb-log-dir",
-        type=str,
-        default=None,
-        help=(
-            "Explicit TensorBoard log directory for this run. Precedence: "
-            "(1) this flag if set; (2) else derived from --checkpoint_dir as runs/<basename>; "
-            "(3) else legacy default runs/folsom_pv_gpu{N}. "
-            "Set this (or a distinct --checkpoint_dir) when launching parallel runs to avoid "
-            "SummaryWriter event-file collisions."
+            "After each batch is on device, replace sky image tensors (and sky time features) "
+            "with zeros so the ViT uses the empty-sky branch while the dataset still loads real "
+            "Zarr frames. Useful for PV-only / PV+(zero-NWP) ablations."
         ),
     )
     return parser
@@ -682,7 +482,7 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
 
 def _dataset_kwargs(dataset_config_name: str, split: str) -> dict:
     base_cfg_path = _resolve_named_config(_DATASETS_CONFIG_DIR, dataset_config_name, "dataset-config")
-    cfg_path = _folsom_pv_dataset_config_path(base_cfg_path)
+    cfg_path = _skippd_pv_dataset_config_path(base_cfg_path)
     cfg = _load_yaml(cfg_path)
     paths_cfg = cfg.get("paths", {}) or {}
     sampling_cfg = cfg.get("sampling", {}) or {}
@@ -736,28 +536,10 @@ def _dataset_kwargs(dataset_config_name: str, split: str) -> dict:
     )
 
 
-def _resolve_train_epoch_len(dataset_config_name: str, cli_value: int | None) -> int | None:
-    """Pick ``train_epoch_len`` precedence: CLI flag > YAML ``sampling.train_epoch_len`` > None.
-
-    ``None`` means "leave the dataset's own default" (``_DEFAULT_FOLSOM_TRAIN_EPOCH_LEN``).
-    The dataset constructor does not accept this kwarg; the trainer applies the result
-    by writing ``train_dataset._train_epoch_len`` after construction.
-    """
-    if cli_value is not None:
-        return int(cli_value)
-    base_cfg_path = _resolve_named_config(_DATASETS_CONFIG_DIR, dataset_config_name, "dataset-config")
-    cfg_path = _folsom_pv_dataset_config_path(base_cfg_path)
-    cfg = _load_yaml(cfg_path)
-    yaml_value = (cfg.get("sampling", {}) or {}).get("train_epoch_len")
-    if yaml_value is None:
-        return None
-    return int(yaml_value)
-
-
 def main() -> None:
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--config", type=str, default=_DEFAULT_TRAIN_CONF_NAME)
-    pre_parser.add_argument("--dataset-config", type=str, default=_DEFAULT_FOLSOM_DATASET_CONFIG)
+    pre_parser.add_argument("--dataset-config", type=str, default=_DEFAULT_SKIPPD_DATASET_CONFIG)
     pre_args, _ = pre_parser.parse_known_args()
 
     train_conf_path = _resolve_named_config(_TRAIN_CONFIG_DIR, pre_args.config, "config")
@@ -766,12 +548,10 @@ def main() -> None:
     if not h:
         raise KeyError(f"training config {train_conf_path} is missing a 'training:' section")
 
-    # Dataset YAML may carry a ``training:`` override block (Folsom uses this for
-    # epochs=40 etc, so dataset-specific knobs live alongside dataset paths/sampling
-    # without forking the shared conf_train.yaml). Override only keys explicitly set
-    # to a non-None value; missing keys inherit from the shared base.
+    # Dataset YAML may carry a ``training:`` override block (mirrors the Folsom
+    # trainer); only keys explicitly set non-None override the shared base.
     dataset_cfg_path = _resolve_named_config(_DATASETS_CONFIG_DIR, pre_args.dataset_config, "dataset-config")
-    dataset_cfg_raw = _load_yaml(_folsom_pv_dataset_config_path(dataset_cfg_path))
+    dataset_cfg_raw = _load_yaml(_skippd_pv_dataset_config_path(dataset_cfg_path))
     _ds_training_override = dataset_cfg_raw.get("training") or {}
     for _k, _v in _ds_training_override.items():
         if _v is not None:
@@ -780,44 +560,15 @@ def main() -> None:
     parser = _build_parser(h, config_default=pre_args.config)
     args = parser.parse_args()
 
-    seed = int(args.seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    # Soft seeding: keep cudnn autotuner on (benchmark=True) and skip the deterministic
-    # algo selection so we don't pay the perf hit. Multi-seed A/Bs still see real variance
-    # since the python/numpy/torch RNGs above pin sample order, init, and worker draws.
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.deterministic = False
-
     dataset_cfg = args.dataset_config
-    train_dataset = FolsomIrradianceDataset(**_dataset_kwargs(dataset_cfg, "train"))
-    val_dataset = FolsomIrradianceDataset(**_dataset_kwargs(dataset_cfg, "val"))
-    test_dataset = FolsomIrradianceDataset(**_dataset_kwargs(dataset_cfg, "test"))
-    _epoch_len_override = _resolve_train_epoch_len(dataset_cfg, args.train_epoch_len)
-    if _epoch_len_override is not None:
-        train_dataset._train_epoch_len = max(1, int(_epoch_len_override))
-    print(
-        f"train_epoch_len: {train_dataset._train_epoch_len:,} "
-        f"(valid train anchors: {len(train_dataset._train_anchor_valid_positions):,})"
-    )
+    train_dataset = SkippdPvDataset(**_dataset_kwargs(dataset_cfg, "train"))
+    val_dataset = SkippdPvDataset(**_dataset_kwargs(dataset_cfg, "val"))
+    test_dataset = SkippdPvDataset(**_dataset_kwargs(dataset_cfg, "test"))
 
     dev_dn_list = train_dataset.devDn_list
 
-    nwp_features, nwp_use_invalid_mask = _parse_nwp_features(args.nwp_features)
-    nwp_features_str = _format_nwp_features_for_log(nwp_features, nwp_use_invalid_mask)
-    print(
-        f"NWP features (resolved from --nwp-features={args.nwp_features!r}): "
-        f"{nwp_features_str}  (use_invalid_mask={nwp_use_invalid_mask})"
-    )
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = pv_forecasting_model_vit_imgs(
-        dev_dn_list=dev_dn_list,
-        nwp_features=nwp_features,
-        use_invalid_mask=nwp_use_invalid_mask,
-    ).to(device)
+    model = pv_forecasting_model_vit_imgs(dev_dn_list=dev_dn_list).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -831,17 +582,12 @@ def main() -> None:
         warmup_epochs=args.warmup_epochs,
         lr_min=args.lr_min,
     )
-    # delta is sized to Folsom's W/m^2 residual scale (Luoyang uses delta=1 kW
-    # ~= 3% of 33 kW peak; Folsom analog is 3% of 1000 W/m^2 peak ~= 33 W/m^2,
-    # rounded to 30). Keeps the Huber MSE region active for "good" predictions
-    # and the MAE region for outliers, matching Luoyang's effective behavior.
-    criterion = nn.HuberLoss(delta=_FOLSOM_HUBER_DELTA)
+    criterion = nn.HuberLoss(delta=1.0)
     ema: ModelEMA | None = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
     print(
         f"EMA: {'enabled' if args.use_ema else 'disabled'}"
         + (f" (decay={args.ema_decay}, warmup={args.ema_warmup_epochs} epoch)" if args.use_ema else "")
     )
-    print(f"Seed: {seed} (soft cudnn: benchmark=True, deterministic=False)")
 
     nw = int(args.num_workers)
     pin = torch.cuda.is_available()
@@ -853,7 +599,6 @@ def main() -> None:
         num_workers=nw,
         pin_memory=pin,
         persistent_workers=nw > 0,
-        worker_init_fn=_seed_worker,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -863,7 +608,6 @@ def main() -> None:
         num_workers=nw,
         pin_memory=pin,
         persistent_workers=nw > 0,
-        worker_init_fn=_seed_worker,
     )
     test_loader = DataLoader(
         test_dataset,
@@ -873,52 +617,35 @@ def main() -> None:
         num_workers=nw,
         pin_memory=pin,
         persistent_workers=nw > 0,
-        worker_init_fn=_seed_worker,
     )
 
-    checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else _PROJECT_ROOT / "checkpoints_folsom_pv"
+    checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else _PROJECT_ROOT / "checkpoints_skippd_pv"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     if device.type == "cuda":
         _gpu_id = _gpu_id_for_checkpoint()
         _ckpt_suffix = f"gpu{_gpu_id}"
     else:
         _ckpt_suffix = "cpu"
-    best_ckpt_path = checkpoint_dir / f"folsom_pv_forecast_vit_best_{_ckpt_suffix}.pt"
+    best_ckpt_path = checkpoint_dir / f"skippd_pv_forecast_vit_best_{_ckpt_suffix}.pt"
 
-    if getattr(args, "tb_log_dir", None):
-        tb_log_dir = Path(args.tb_log_dir)
-        if not tb_log_dir.is_absolute():
-            tb_log_dir = _PROJECT_ROOT / tb_log_dir
-    elif args.checkpoint_dir:
-        tb_log_dir = _PROJECT_ROOT / "runs" / Path(args.checkpoint_dir).name
-    else:
-        tb_log_dir = _PROJECT_ROOT / "runs" / f"folsom_pv_{_ckpt_suffix}"
+    tb_log_dir = _PROJECT_ROOT / "runs" / f"skippd_pv_{_ckpt_suffix}"
     writer = SummaryWriter(log_dir=str(tb_log_dir))
     print(f"TensorBoard log dir: {tb_log_dir}")
-    # Persist the resolved feature selection in TB so the run is self-describing in the UI.
-    writer.add_text(
-        "nwp/features",
-        f"--nwp-features={args.nwp_features!r} -> resolved={nwp_features_str} "
-        f"(use_invalid_mask={nwp_use_invalid_mask})",
-    )
 
     max_batches = args.train_max_batches_per_epoch
     if max_batches is not None and max_batches < 0:
         max_batches = None
 
     eval_cap = args.eval_max_batches
-    use_nwp = bool(args.use_nwp)
     zero_sky = bool(args.zero_sky)
-    print(f"NWP input: {'REAL (raw _FOLSOM_NWP_FEATURE_COLS)' if use_nwp else 'ZEROED-OUT (baseline)'}")
-    print(f"NWP features (model arch): {nwp_features_str}  use_invalid_mask={nwp_use_invalid_mask}")
-    print(f"Sky images: {'ZEROED (--zero-sky; PV+NWP-style ablation)' if zero_sky else 'REAL from dataset'}")
+    print("NWP input: ZERO (SKIPP'd has no NWP; dataloader emits zeros + ones mask)")
+    print(f"Sky images: {'ZEROED (--zero-sky; PV-only ablation)' if zero_sky else 'REAL from dataset'}")
     initial_test_loss, _, _ = evaluate(
         model,
         device,
         test_loader,
         criterion,
         max_batches=eval_cap,
-        use_nwp=use_nwp,
         zero_sky=zero_sky,
     )
     print(f"Initial test loss: {initial_test_loss:.6f}")
@@ -939,7 +666,6 @@ def main() -> None:
             optimizer,
             max_batches,
             ema=ema if ema_active else None,
-            use_nwp=use_nwp,
             zero_sky=zero_sky,
         )
         if ema_active:
@@ -951,7 +677,6 @@ def main() -> None:
                     val_loader,
                     criterion,
                     max_batches=eval_cap,
-                    use_nwp=use_nwp,
                     zero_sky=zero_sky,
                 )
         else:
@@ -961,12 +686,11 @@ def main() -> None:
                 val_loader,
                 criterion,
                 max_batches=eval_cap,
-                use_nwp=use_nwp,
                 zero_sky=zero_sky,
             )
         print(
             f"Epoch {epoch}/{args.epochs}  lr={cur_lr:.2e}  "
-            f"train_loss={avg_loss:.6f}  val_loss={val_loss:.6f}  val_RMSE={val_rmse:.4f} W/m²"
+            f"train_loss={avg_loss:.6f}  val_loss={val_loss:.6f}  val_RMSE(norm)={val_rmse:.6f}"
         )
         writer.add_scalar("loss/train", avg_loss, epoch)
         writer.add_scalar("loss/val", val_loss, epoch)
@@ -976,7 +700,7 @@ def main() -> None:
         scheduler.step()
 
         if args.save_every and epoch % args.save_every == 0:
-            path = checkpoint_dir / f"folsom_pv_forecast_vit_epoch_{epoch}_{_ckpt_suffix}.pt"
+            path = checkpoint_dir / f"skippd_pv_forecast_vit_epoch_{epoch}_{_ckpt_suffix}.pt"
             torch.save(
                 {
                     "epoch": epoch,
@@ -988,9 +712,6 @@ def main() -> None:
                     "dataset_config": dataset_cfg,
                     "ema": ema_active,
                     "zero_sky": zero_sky,
-                    "use_nwp": use_nwp,
-                    "nwp_features": list(nwp_features),
-                    "nwp_use_invalid_mask": bool(nwp_use_invalid_mask),
                 },
                 path,
             )
@@ -1010,14 +731,11 @@ def main() -> None:
                     "dataset_config": dataset_cfg,
                     "ema": ema_active,
                     "zero_sky": zero_sky,
-                    "use_nwp": use_nwp,
-                    "nwp_features": list(nwp_features),
-                    "nwp_use_invalid_mask": bool(nwp_use_invalid_mask),
                 },
                 best_ckpt_path,
             )
 
-    final_path = checkpoint_dir / f"folsom_pv_forecast_vit_final_{_ckpt_suffix}.pt"
+    final_path = checkpoint_dir / f"skippd_pv_forecast_vit_final_{_ckpt_suffix}.pt"
     final_state = ema.state_dict() if ema is not None else model.state_dict()
     torch.save(
         {
@@ -1029,9 +747,6 @@ def main() -> None:
             "dataset_config": dataset_cfg,
             "ema": ema is not None,
             "zero_sky": zero_sky,
-            "use_nwp": use_nwp,
-            "nwp_features": list(nwp_features),
-            "nwp_use_invalid_mask": bool(nwp_use_invalid_mask),
         },
         final_path,
     )
@@ -1046,12 +761,11 @@ def main() -> None:
             test_loader,
             criterion,
             max_batches=eval_cap,
-            use_nwp=use_nwp,
             zero_sky=zero_sky,
         )
         print(
             f"Test set with best val-RMSE checkpoint ({best_ckpt_path.name}, epoch={ckpt.get('epoch', '?')}): "
-            f"loss={test_loss_best:.6f}, RMSE={test_rmse_best:.4f} W/m², MAE={test_mae_best:.4f} W/m²"
+            f"loss={test_loss_best:.6f}, RMSE(norm)={test_rmse_best:.6f}, MAE(norm)={test_mae_best:.6f}"
         )
         writer.add_scalar("metric/test_rmse", test_rmse_best, args.epochs)
         writer.add_scalar("metric/test_mae", test_mae_best, args.epochs)
@@ -1062,11 +776,7 @@ def main() -> None:
                 "epochs": args.epochs,
                 "warmup_epochs": args.warmup_epochs,
                 "weight_decay": args.weight_decay,
-                "seed": int(args.seed),
-                "use_nwp": int(use_nwp),
                 "zero_sky": int(zero_sky),
-                "nwp_features": nwp_features_str,
-                "nwp_use_invalid_mask": int(nwp_use_invalid_mask),
                 "dataset_config": dataset_cfg,
                 "eval_max_batches": -1 if eval_cap is None else int(eval_cap),
                 "use_ema": int(args.use_ema),
@@ -1076,7 +786,7 @@ def main() -> None:
                 "hparam/test_mae": test_mae_best,
             },
         )
-        metrics_log = checkpoint_dir / f"folsom_pv_forecast_metrics_{_ckpt_suffix}.txt"
+        metrics_log = checkpoint_dir / f"skippd_pv_forecast_metrics_{_ckpt_suffix}.txt"
         with open(metrics_log, "a", encoding="utf-8") as mf:
             mf.write(
                 f"{test_loss_best:.8f}\t{test_rmse_best:.8f}\t{test_mae_best:.8f}\n"

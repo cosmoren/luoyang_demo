@@ -106,8 +106,48 @@ venv.bak/
 
 # Checkpoints (model weights, not for repo)
 checkpoints/
+checkpoints_*/
 runs/
+logs/
+inference_results/
+
+# Training / experiment logs
+logs/
+logs_*/
+
+# Cursor IDE local config
+.cursor/
+
+# Generated reports / slide decks (not for repo)
+report_*/
+progress_report_*.pptx
+*.pptx
 
 # NFS silly-rename stubs (created when a file is deleted while still open)
 .nfs*
 **/.nfs*
+
+# large local bundles / experiment shippers
+handoff_*/
+
+# preprocessing smoke-report figures
+SPMF_preprocessing/folsom/*_figs/
+
+# Animated forecast outputs (generated artifacts; regenerate via inference/animate_forecast.py)
+# Ignore everything inside inference/animations/ except the RUNS.md manifest.
+inference/animations/*
+!inference/animations/RUNS.md
+
+# personal scratch space for throwaway agent/human experiments
+# (never committed; see AGENTS.md for the playground/ convention)
+playground/
+
+# local cache databases (e.g. requests-cache)
+*.sqlite
+*.sqlite3
+
+# personal info-share folder (weekly bundles shared off-server; NO codebase coupling)
+info_share/
+
+# personal AGENTS.md (kept local; not for team merges)
+AGENTS.md

@@ -114,38 +114,33 @@ _FOLSOM_NWP_FEATURE_COLS = (
 _SKY_INDEX_CACHE: dict[str, tuple[list[pd.Timestamp], list[Path], list[int]]] = {}
 
 
-_DEFAULT_FOLSOM_TRAIN_EPOCH_LEN = 200_000
+_DEFAULT_FOLSOM_TRAIN_EPOCH_LEN = 50_000
 
 # Train mode: a Y window is "valid" if any of its rows has finite GHI strictly above this
 # threshold (W/m^2). Mirrors PVDataset's "any inverter_state == VALID_STATE" filter so we
 # avoid sampling all-night windows where target_pv is uniformly 0.
 _FOLSOM_TRAIN_GHI_DAYTIME_THRESHOLD = 10.0
 
-# GHI scaling factor used ONLY for ``p_cs = clearsky_ghi / _FOLSOM_GHI_SCALE`` (mirrors
-# Luoyang's ``poa_global / 1000`` recipe in
-# ``SPMF_preprocessing/luoyang/aggregate_by_devdn_solarfeats.py``). 1000 W/m^2 is the
-# standard "1 sun" reference irradiance (STC), so ``p_cs`` is dimensionless and ~1.0 at
-# a perfectly clear noon. The raw GHI signal (``pv`` / ``target_pv`` / numerator of
-# ``kt``) is NOT divided by this constant; ``p_mean`` is held at 1.0 (see ``__init__``),
-# so ``kt = ghi_raw / (p_cs + eps) * kt_mask`` is in W/m^2-ish units and the ViT input
-# rescale is handled trainer-side (``kt / 4000`` and ``* 4000``).
+# Folsom satellite sidecar (_2): satellite history ends ``_FOLSOM_SAT_ANCHOR_OFFSET_MIN``
+# minutes before the PV anchor time0 (to leave room for real-time delivery latency that
+# GridSat-CONUS shards would have in a live forecast pipeline).
+_FOLSOM_SAT_ANCHOR_OFFSET_MIN = 30
+
+# Folsom kt / p_cs / loss constants (canonical Folsom recipe; mirrors ``folsom-test-new``).
+# Single source of truth: the trainer imports these symbols so trainer / dataloader stay in
+# lockstep. ``ghi`` here means raw GHI in W/m^2.
+#
+# - ``_FOLSOM_GHI_SCALE``: clear-sky normalization for ``p_cs`` only (``p_cs = ghi_cs / 1000``,
+#   clipped to [0, 1.2]). 1000 W/m^2 ≈ 1 sun (STC), so ``p_cs`` ~ 1 at clear noon.
+# - ``_FOLSOM_KT_DAYTIME_THRESHOLD`` + ``_FOLSOM_KT_EPS``: ``kt_mask = (p_cs > 0.1)``,
+#   ``kt = ghi / (p_cs * p_mean + eps) * kt_mask`` → kt = 0 at night.
+# - ``_FOLSOM_KT_INPUT_SCALE``: ViT input/output rescale for ``kt``. Trainer divides input
+#   by 4000 and multiplies output by 4000 (reconstructed kt is in W/m^2-ish units).
+# - ``_FOLSOM_HUBER_DELTA``: Huber delta in W/m^2 (matches the residual scale on raw GHI).
 _FOLSOM_GHI_SCALE = 1000.0
-# Daytime guard: matches Luoyang's preprocessing ``kt_mask = (p_cs > 0.1)`` rule. Anchors
-# where ``p_cs <= 0.1`` (nighttime / very low sun) get ``kt = 0`` via the mask product.
 _FOLSOM_KT_DAYTIME_THRESHOLD = 0.1
 _FOLSOM_KT_EPS = 1e-6
-# Daytime gate for ``target_mask`` (folsom-kt overlay). Forecast-horizon rows are kept iff
-# clear-sky GHI is at least this value in normalized ``p_cs`` units. The value below is
-# 20.0 W/m^2 / _FOLSOM_GHI_SCALE = 20.0 / 1000.0 = 0.02, the exact p_cs equivalent of
-# folsom-kt's ``GHI_CS_NIGHT_THRESHOLD = 20.0`` W/m^2. Looser than ``_FOLSOM_KT_DAYTIME_THRESHOLD``
-# (0.1) on purpose: that constant gates the kt regression target, this one gates the loss
-# mask, and kt-side semantics are the source of truth for the latter.
-_FOLSOM_TARGET_MASK_NIGHT_THRESHOLD_P_CS = 0.02
-# ViT input/output scaling for ``kt`` (W/m^2-ish; see ``forward_vit`` docstring in the
-# trainer). Single source of truth so trainer / eval / inference stay in lockstep.
 _FOLSOM_KT_INPUT_SCALE = 4000.0
-# Huber loss delta in W/m^2, sized for the PV-target residual scale (~3% of 1000 W/m^2
-# peak, rounded to 30). Shared by trainer + eval Huber sites.
 _FOLSOM_HUBER_DELTA = 30.0
 
 
@@ -705,17 +700,13 @@ class FolsomIrradianceDataset(Dataset):
 
         # ``p_mean`` is held at 1.0 for Folsom (single GHI sensor; the reconstruction
         # ``pv_pred = kt_pred * target_p_cs * p_mean`` therefore reduces to
-        # ``pv_pred = kt_pred * target_p_cs``). Other normalization choices (raw-GHI mean,
-        # capacity, daytime-only mean) are intentionally NOT used here yet -- this is the
-        # first surgical step in a wider Folsom-vs-Luoyang alignment pass; the kt-input
-        # rescale and loss-space changes are tracked separately.
+        # ``pv_pred = kt_pred * target_p_cs``).
         self._p_mean_scalar = 1.0
 
-        # Precompute normalized clear-sky GHI per CSV row once (1.5M rows for Folsom is fast
-        # in pvlib). ``_build_tensors`` slices into this array for both the input window and
-        # the forecast window (both are integer CSV row offsets from the anchor), so no
-        # per-sample pvlib call is needed. Mirrors the Luoyang offline preprocessing that
-        # stores ``p_cs`` in the CSV (see ``SPMF_preprocessing/luoyang/...``).
+        # Precompute normalized clear-sky GHI per CSV row once (pvlib ``ineichen``). The
+        # ``_build_tensors`` slices into this array for both the input window and the
+        # forecast window (both are integer CSV row offsets from the anchor), so no
+        # per-sample pvlib call is needed.
         _folsom_progress("computing per-row clear-sky GHI via pvlib (ineichen) ...")
         _times_utc = pd.DatetimeIndex(
             pd.to_datetime(self._df[self._time_col].to_numpy(), utc=True)
@@ -1086,6 +1077,78 @@ class FolsomIrradianceDataset(Dataset):
         clean, bad_mask = _sanitize_nwp_interp(nwp_interp)
         return torch.from_numpy(np.concatenate([clean, bad_mask], axis=1))
 
+    # ------------------------------------------------------------------
+    # Folsom GOES-15 satellite frames (per-frame .npy shards under
+    # ``satimg_dir/YYYY/MM/goes15_YYYYMMDD_HHMM.npy``; shape (3, 100, 100)
+    # float16 in [0, 1]; structural NCEI gaps yield missing files which we
+    # zero-fill below).
+    # ------------------------------------------------------------------
+    def _satimg_anchor_end_utc(self, time0: Any) -> pd.Timestamp:
+        """``time0`` shifted back by ``_FOLSOM_SAT_ANCHOR_OFFSET_MIN`` and floored to the
+        ``_satimg_dt_min`` cadence (naive UTC). This is the **newest** frame time."""
+        t = pd.Timestamp(time0)
+        if t.tzinfo is not None:
+            t = t.tz_convert("UTC").tz_localize(None)
+        t = t - pd.Timedelta(minutes=_FOLSOM_SAT_ANCHOR_OFFSET_MIN)
+        dt = int(self._satimg_dt_min)
+        floored_minute = (int(t.minute) // dt) * dt
+        return t.replace(
+            minute=floored_minute, second=0, microsecond=0, nanosecond=0
+        )
+
+    def _satimg_history_frame_times(self, time0: Any) -> list[pd.Timestamp]:
+        """``satimg_window_size`` naive-UTC timestamps at ``_satimg_dt_min`` spacing ending at
+        :meth:`_satimg_anchor_end_utc` (``time0``). Returned oldest → newest."""
+        t_end = self._satimg_anchor_end_utc(time0)
+        w = int(self.satimg_window_size)
+        dt = int(self._satimg_dt_min)
+        return [t_end - pd.Timedelta(minutes=(w - 1 - i) * dt) for i in range(w)]
+
+    def _satimg_npy_path(self, t_utc_naive: pd.Timestamp) -> Path:
+        """``<satimg_dir>/YYYY/MM/goes15_YYYYMMDD_HHMM.npy`` for a naive-UTC timestamp."""
+        u = pd.Timestamp(t_utc_naive)
+        return (
+            self._satimg_dir
+            / f"{u.year:04d}"
+            / f"{u.month:02d}"
+            / f"goes15_{u.strftime('%Y%m%d_%H%M')}.npy"
+        )
+
+    def _dummy_satimg_tensor(self) -> torch.Tensor:
+        """Zero ``[3, H, W]`` float32 (PVDataset-shaped) for missing/unreadable shards."""
+        h, w, c = self._satimg_npy_shape_hwc
+        return torch.zeros((c, h, w), dtype=torch.float32)
+
+    def _load_satimg_tensor(self, path: Path) -> torch.Tensor:
+        """Folsom GridSat .npy → ``[3, H, W]`` float32 in [0, 1].
+
+        Files on disk are CHW (``(3, 100, 100)``) float16, already pre-normalized. Accepts
+        both CHW and HWC (for forward compatibility) by matching against
+        ``_satimg_npy_shape_hwc`` (HWC) and the CHW permutation thereof. Anything else (or
+        unreadable / missing file) → zero tensor (mirrors the structural NCEI gap policy).
+        """
+        h, w, c = self._satimg_npy_shape_hwc
+        chw_shape = (c, h, w)
+        hwc_shape = (h, w, c)
+        try:
+            if path.is_file():
+                arr = np.load(path, allow_pickle=False)
+                if arr.shape == chw_shape:
+                    return torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32))
+                if arr.shape == hwc_shape:
+                    arr = np.ascontiguousarray(arr, dtype=np.float32)
+                    return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+        except Exception:
+            pass
+        return self._dummy_satimg_tensor()
+
+    def _stack_satimg_frames(self, frame_times_utc: list[pd.Timestamp]) -> torch.Tensor:
+        """Stack ``[W, 3, H, W]`` float32 sat history. Missing shards → zero frames."""
+        return torch.stack(
+            [self._load_satimg_tensor(self._satimg_npy_path(t)) for t in frame_times_utc],
+            dim=0,
+        )
+
     def __len__(self) -> int:
         if self.split == "train":
             return self._train_epoch_len
@@ -1157,26 +1220,20 @@ class FolsomIrradianceDataset(Dataset):
         dy = sub_y[self._ghi_dni_dhi_cols[1]]
         hy = sub_y[self._ghi_dni_dhi_cols[2]]
         y_raw = np.stack([gy.to_numpy(), dy.to_numpy(), hy.to_numpy()], axis=0).astype(np.float32)
-        # Mask depends on GHI only (row 0 of y_raw); DNI/DHI validity is intentionally ignored.
-        # folsom-kt overlay: AND finite-GHI mask with a daytime gate sourced from the
-        # precomputed clear-sky ``_p_cs_full`` (normalized clearsky_ghi / _FOLSOM_GHI_SCALE).
-        # See ``_FOLSOM_TARGET_MASK_NIGHT_THRESHOLD_P_CS`` for the kt-equivalent threshold.
+        # target_mask = GHI-finite on forecast window (used for loss + metric masking).
         valid_out = np.isfinite(y_raw[0])
-        daytime_out = self._p_cs_full[y_idx] >= _FOLSOM_TARGET_MASK_NIGHT_THRESHOLD_P_CS
-        target_mask_np = (valid_out & daytime_out).astype(np.float32)
-        target_mask = torch.from_numpy(target_mask_np)
+        target_mask = torch.from_numpy(valid_out.astype(np.float32))
         y_stack = np.nan_to_num(y_raw, nan=0.0, posinf=0.0, neginf=0.0)
 
         ghi, dni, dhi = x_stack[0], x_stack[1], x_stack[2]
         tg, td, th = y_stack[0], y_stack[1], y_stack[2]
 
-        # Clear-sky / kt fields. ``p_cs`` is the normalized clear-sky GHI
-        # ``clearsky_ghi / _FOLSOM_GHI_SCALE``; ``p_mean`` is held at 1.0 (see ``__init__``)
-        # so ``kt = ghi_raw / (p_cs + eps) * kt_mask`` and the reconstruction
-        # ``pv_pred = kt_pred * target_p_cs * p_mean`` reduces to
-        # ``pv_pred = kt_pred * target_p_cs``. Note: ``ghi_raw`` is in W/m^2, so ``kt`` here
-        # is unbounded (~up to a few thousand) until the kt-input rescale is added in a
-        # follow-up change.
+        # Folsom clear-sky / kt fields (canonical recipe; mirrors ``folsom-test-new``).
+        # ``p_cs`` is the per-row normalized clear-sky GHI (``ghi_cs / _FOLSOM_GHI_SCALE``,
+        # clipped to [0, 1.2]); ``p_mean`` is held at 1.0 so the reconstruction
+        # ``pv_pred = kt_pred * target_p_cs * p_mean`` reduces to ``kt_pred * target_p_cs``.
+        # ``kt_mask = (p_cs > 0.1)`` is the daytime guard fed to the ViT under the model's
+        # ``pv_mask=`` kwarg (see ``forward_vit`` in ``train_vit_test_folsom_2``).
         p_cs_x = self._p_cs_full[x_idx]
         p_cs_y = self._p_cs_full[y_idx]
         kt_mask_np = (p_cs_x > _FOLSOM_KT_DAYTIME_THRESHOLD).astype(np.float32)
@@ -1208,6 +1265,13 @@ class FolsomIrradianceDataset(Dataset):
         f_dtf = delta_time_encoder(forecast_timestamps, time0)
         forecast_timefeats = torch.cat([f_tf, f_dtf.unsqueeze(1)], dim=1)
 
+        sat_times = self._satimg_history_frame_times(time0)
+        sat_tensor = self._stack_satimg_frames(sat_times)
+        sat_solar = compute_solar_features(sat_times, self.latitude, self.longitude)
+        sat_tf = solar_features_encoder(sat_solar)
+        sat_dtf = delta_time_encoder(sat_times, time0)
+        sat_timefeats = torch.cat([sat_tf, sat_dtf.unsqueeze(1)], dim=1)
+
         t_x_end = sub_x[self._time_col].iloc[-1]
         if self._sky_format == "zarr":
             nominal = self._nominal_sky_frame_times(t_x_end)
@@ -1236,11 +1300,10 @@ class FolsomIrradianceDataset(Dataset):
         # Single-sensor station; index into ``self.devDn_list = [0]``.
         dev_idx = torch.tensor(700, dtype=torch.long)
 
-        # Match PVDataset: pv is [1, T_in] (sensor/dev dim leading), target_pv is [T_out].
-        # Luoyang-parity: pv / target_pv are the RAW signal (W/m^2 for Folsom GHI). The
-        # normalization role is played by ``p_mean`` inside the ``kt`` denominator, not by
-        # dividing the signal here. Reconstruction ``pv = kt * p_cs * p_mean`` then recovers
-        # raw GHI in W/m^2, and the loss ``criterion(pv_pred, target_pv)`` is in raw W/m^2.
+        # Raw GHI (W/m^2) in / out: the trainer feeds the model ``kt / _FOLSOM_KT_INPUT_SCALE``
+        # (not ``pv``) and the loss runs in raw-W/m^2 space, so no /1100 normalization here.
+        # ``pv`` is kept for back-compat callers (smoke / debug); the canonical model input
+        # is ``kt`` (see ``forward_vit`` in ``train_vit_test_folsom_2``).
         pv_tensor = torch.from_numpy(ghi.astype(np.float32)).unsqueeze(0)
         target_pv_tensor = torch.from_numpy(tg.astype(np.float32))
         return {
@@ -1252,6 +1315,7 @@ class FolsomIrradianceDataset(Dataset):
             "kt_mask": kt_mask,
             "p_cs": p_cs,
             "p_mean": p_mean,
+            "target_p_cs": target_p_cs,
             "ghi": torch.from_numpy(ghi.astype(np.float32)),
             "dni": torch.from_numpy(dni.astype(np.float32)),
             "dhi": torch.from_numpy(dhi.astype(np.float32)),
@@ -1263,9 +1327,8 @@ class FolsomIrradianceDataset(Dataset):
             "target_dhi": torch.from_numpy(th.astype(np.float32)),
             "target_pv": target_pv_tensor,
             "target_mask": target_mask,
-            "target_p_cs": target_p_cs,
-            "sat_tensor": None,
-            "sat_timefeats": None,
+            "sat_tensor": sat_tensor,
+            "sat_timefeats": sat_timefeats,
             "skimg_tensor": skimg_tensor,
             "skimg_timefeats": skimg_timefeats,
             "nwp_tensor": nwp_tensor,
@@ -1294,6 +1357,18 @@ def collate_folsom_irradiance(batch: list[dict]) -> dict:
         return torch.stack([s[key] for s in batch])
 
     out: dict[str, Any] = {
+        # PV-trainer-shaped keys (consumed by ``train_vit_test_folsom_2._batch_to_device``).
+        "dev_idx": _stack("dev_idx"),
+        "pv": _stack("pv"),
+        "pv_mask": _stack("pv_mask"),
+        "pv_timefeats": _stack("pv_timefeats"),
+        "kt": _stack("kt"),
+        "kt_mask": _stack("kt_mask"),
+        "p_cs": _stack("p_cs"),
+        "p_mean": _stack("p_mean"),
+        "target_p_cs": _stack("target_p_cs"),
+        "target_pv": _stack("target_pv"),
+        # GHI/DNI/DHI smoke / debug keys (already in HEAD).
         "ghi": _stack("ghi"),
         "dni": _stack("dni"),
         "dhi": _stack("dhi"),
@@ -1305,7 +1380,7 @@ def collate_folsom_irradiance(batch: list[dict]) -> dict:
         "target_dhi": _stack("target_dhi"),
         "target_mask": _stack("target_mask"),
     }
-    for key in ("skimg_tensor", "skimg_timefeats", "nwp_tensor"):
+    for key in ("sat_tensor", "sat_timefeats", "skimg_tensor", "skimg_timefeats", "nwp_tensor"):
         vals = [s[key] for s in batch]
         if vals[0] is None:
             if not all(v is None for v in vals):
@@ -1339,7 +1414,7 @@ def build_folsom_irradiance_datasets_from_conf(
     conf: dict | None = None,
     *,
     conf_path: Path | str | None = None,
-    train_epoch_len: int = _DEFAULT_FOLSOM_TRAIN_EPOCH_LEN,
+    train_epoch_len: int = 50_000,
     skyimg_window_size: int | None = None,
 ) -> tuple[FolsomIrradianceDataset, FolsomIrradianceDataset]:
     """
