@@ -577,11 +577,15 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         dev_dn_list: Optional[list] = None,
         nwp_features: Optional[list[str]] = None,
         use_invalid_mask: bool = _DEFAULT_VIT_IMGS_NWP_USE_INVALID_MASK,
+        sky_in_channels: int = 3,
     ):
         super().__init__()
 
         self.use_batchnorm = use_batchnorm
         self.dropout = dropout
+        if sky_in_channels < 1:
+            raise ValueError(f"sky_in_channels must be >= 1, got {sky_in_channels}")
+        self.sky_in_channels = int(sky_in_channels)
 
         if nwp_features is None:
             nwp_features = list(_DEFAULT_VIT_IMGS_NWP_FEATURES)
@@ -646,7 +650,10 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         
         self.sky_embed_dim = 64
         self.sky_patch_embed = SkyPatchSpatiotemporalEmbed(
-            embed_dim=self.sky_embed_dim, patch_size=16, image_size=224
+            embed_dim=self.sky_embed_dim,
+            patch_size=16,
+            image_size=224,
+            in_channels=self.sky_in_channels,
         )
         self.sky_alt_attn = SkyAlternatingIntraInterFrameAttention(
             embed_dim=self.sky_embed_dim, num_heads=8, num_cycles=4, dropout=dropout
@@ -766,15 +773,18 @@ class pv_forecasting_model_vit_imgs(nn.Module):
             sky_mask = torch.zeros(B, 48, device=pv.device, dtype=pv.dtype)
         else:
             B_sky, T_sky, C_sky, H_sky, W_sky = skimg_tensor.shape
-            if C_sky != 3:
-                raise ValueError(f"skimg_tensor expected 3 channels, got {C_sky}")
+            if C_sky != self.sky_in_channels:
+                raise ValueError(
+                    f"skimg_tensor expected {self.sky_in_channels} channels, got {C_sky}"
+                )
             skimg_timefeats = skimg_timefeats[:, :, [2, 3, 8]]
             if H_sky != 224 or W_sky != 224:
                 sky_hr = nn.functional.interpolate(
                     skimg_tensor.reshape(B_sky * T_sky, C_sky, H_sky, W_sky),
                     size=(224, 224),
                     mode="bilinear",
-                    align_corners=False,).view(B_sky, T_sky, 3, 224, 224)
+                    align_corners=False,
+                ).view(B_sky, T_sky, C_sky, 224, 224)
             else:
                 sky_hr = skimg_tensor
 

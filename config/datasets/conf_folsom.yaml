@@ -63,6 +63,15 @@ sampling:
   skyimg_window_size: 30
   skyimg_time_resolution_min: 1
   skyimg_spatial_size: 224
+  # Sky-branch input channels (concatenated along C in list order). Valid names:
+  #   - "rgb"       (3 channels) — historical default, RGB frame from JPEG/Zarr.
+  #   - "ray_map"   (3 channels) — fixed fisheye unit-vector field from
+  #                                ``utils/fisheye_raymap.py``; same across T.
+  #   - "sun_mask"  (1 channel)  — RESERVED; raises NotImplementedError today.
+  # Omitting this key (or leaving it as ["rgb"]) is byte-identical to legacy
+  # 3-channel behavior, including for existing checkpoints. The model's
+  # sky-branch first conv is sized from ``train_dataset.sky_in_channels``.
+  sky_channels: ["rgb"]
   # Enable Folsom GOES-15 satellite branch. When true, the loader resolves per-frame
   # NPY shards from <data_dir>/<paths.sat_path>/YYYY/MM/goes15_YYYYMMDD_HHMM.npy and
   # emits sat_tensor [T_sat, 3, 100, 100] + sat_timefeats [T_sat, 9]. When false,

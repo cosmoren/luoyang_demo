@@ -871,10 +871,22 @@ def main() -> None:
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # ``sky_in_channels`` is the dataset-side source of truth for sky-branch input
+    # width (rgb=3, +ray_map=+3, +sun_mask=+1; configured via
+    # ``sampling.sky_channels`` in the Folsom dataset YAML). Default of 3 is what
+    # the loader returns when the key is omitted, so legacy configs / checkpoints
+    # remain unchanged.
+    sky_in_channels = int(getattr(train_dataset, "sky_in_channels", 3))
+    sky_channels_resolved = tuple(getattr(train_dataset, "sky_channels", ("rgb",)))
+    print(
+        f"Sky channels (resolved from dataset YAML): {list(sky_channels_resolved)} "
+        f"-> sky_in_channels={sky_in_channels}"
+    )
     model = pv_forecasting_model_vit_imgs(
         dev_dn_list=dev_dn_list,
         nwp_features=nwp_features,
         use_invalid_mask=nwp_use_invalid_mask,
+        sky_in_channels=sky_in_channels,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),

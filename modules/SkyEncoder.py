@@ -18,27 +18,38 @@ class SkyPatchSpatiotemporalEmbed(nn.Module):
     Mirrors :class:`modules.SatEncoder.VideoPatchSpatiotemporalEmbed` for symmetry.
     """
 
-    def __init__(self, embed_dim: int = 192, patch_size: int = 16, image_size: int = 112):
+    def __init__(
+        self,
+        embed_dim: int = 192,
+        patch_size: int = 16,
+        image_size: int = 112,
+        in_channels: int = 3,
+    ):
         super().__init__()
         if image_size % patch_size != 0:
             raise ValueError(
                 f"image_size ({image_size}) must be divisible by patch_size ({patch_size})"
             )
+        if in_channels < 1:
+            raise ValueError(f"in_channels must be >= 1, got {in_channels}")
         self.embed_dim = embed_dim
         self.patch_size = patch_size
         self.image_size = image_size
+        self.in_channels = int(in_channels)
         self.grid_h = image_size // patch_size
         self.grid_w = image_size // patch_size
         self.num_patches = self.grid_h * self.grid_w
 
-        self.patch_embed = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.patch_embed = nn.Conv2d(
+            self.in_channels, embed_dim, kernel_size=patch_size, stride=patch_size
+        )
         self.spatial_pos_embed = nn.Parameter(torch.zeros(1, 1, self.num_patches, embed_dim))
         nn.init.trunc_normal_(self.spatial_pos_embed, std=0.02)
 
     def forward(self, x: torch.Tensor, timefeats: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
-            x: ``[B, T, 3, H, W]`` where ``H=W=image_size``.
+            x: ``[B, T, C, H, W]`` where ``H=W=image_size`` and ``C=in_channels``.
             timefeats: ``[B, T, 1]`` single ``delta_t`` scalar per frame.
         Returns:
             ``[B, T, P, D]`` where ``P=num_patches`` and ``D=embed_dim``.
@@ -46,8 +57,10 @@ class SkyPatchSpatiotemporalEmbed(nn.Module):
         bsz, num_frames, channels, height, width = x.shape
         if height != self.image_size or width != self.image_size:
             raise ValueError(f"expected H=W={self.image_size}, got {height}x{width}")
-        if channels != 3:
-            raise ValueError(f"expected 3 input channels, got {channels}")
+        if channels != self.in_channels:
+            raise ValueError(
+                f"expected {self.in_channels} input channels, got {channels}"
+            )
         if timefeats is None:
             raise ValueError("timefeats is required with shape [B, T, 1]")
 

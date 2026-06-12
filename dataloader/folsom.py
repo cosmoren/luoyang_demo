@@ -80,6 +80,54 @@ if str(_PROJECT_ROOT) not in sys.path:
 from config_utils import get_resolved_paths
 from dataloader.luoyang_mem import list_csv_files
 from modules.solar_encoder import compute_solar_features, delta_time_encoder, solar_features_encoder
+from utils.fisheye_raymap import fisheye_raymap
+
+# Sky-branch channel-selection abstraction (Folsom only, for now). The dataset YAML
+# may set ``sampling.sky_channels`` to a list of feature names; the resulting
+# ``skimg_tensor`` concatenates each feature along the channel dim in list order.
+# Default (key absent or ``["rgb"]``) is byte-identical to the historical 3-channel
+# behavior. Sun-mask is reserved for a follow-up commit and currently raises.
+_SKY_CHANNEL_RGB = "rgb"
+_SKY_CHANNEL_RAY_MAP = "ray_map"
+_SKY_CHANNEL_SUN_MASK = "sun_mask"
+_SKY_CHANNEL_WIDTHS: dict[str, int] = {
+    _SKY_CHANNEL_RGB: 3,
+    _SKY_CHANNEL_RAY_MAP: 3,
+    _SKY_CHANNEL_SUN_MASK: 1,
+}
+_DEFAULT_SKY_CHANNELS: tuple[str, ...] = (_SKY_CHANNEL_RGB,)
+
+
+def _normalize_sky_channels(raw: Any) -> tuple[str, ...]:
+    """Validate + canonicalize a ``sky_channels`` config value to a tuple of names.
+
+    ``None`` (or missing) → default ``("rgb",)``. Otherwise the value must be a
+    non-empty sequence of unique known names from :data:`_SKY_CHANNEL_WIDTHS`.
+    """
+    if raw is None:
+        return _DEFAULT_SKY_CHANNELS
+    if isinstance(raw, str) or not hasattr(raw, "__iter__"):
+        raise TypeError(
+            f"sky_channels must be a list/tuple of feature names, got {type(raw).__name__}"
+        )
+    names = [str(x).strip() for x in raw]
+    if len(names) == 0:
+        raise ValueError("sky_channels must contain at least one feature name")
+    seen: set[str] = set()
+    for n in names:
+        if n not in _SKY_CHANNEL_WIDTHS:
+            raise ValueError(
+                f"sky_channels: unknown feature {n!r}; valid names are "
+                f"{sorted(_SKY_CHANNEL_WIDTHS)}"
+            )
+        if n in seen:
+            raise ValueError(f"sky_channels: duplicate feature {n!r}")
+        seen.add(n)
+    return tuple(names)
+
+
+def _sky_in_channels(channels: tuple[str, ...]) -> int:
+    return int(sum(_SKY_CHANNEL_WIDTHS[c] for c in channels))
 
 # Default dataset YAML for Folsom under the new ``config/datasets/`` layout. Used only by the
 # smoke CLI as a convenience default; ``FolsomIrradianceDataset`` itself takes ``config_path``
@@ -536,6 +584,7 @@ class FolsomIrradianceDataset(Dataset):
         satimg_time_resolution_min: int,
         satimg_npy_shape_hwc: tuple[int, int, int],
         use_satellite: bool = False,
+        sky_channels: list[str] | tuple[str, ...] | None = None,
     ):
         self._config_path = Path(config_path).resolve()
         if not self._config_path.is_file():
@@ -577,6 +626,15 @@ class FolsomIrradianceDataset(Dataset):
         if skyimg_spatial_size < 1:
             raise ValueError("skyimg_spatial_size must be >= 1")
         self._skyimg_spatial_size = int(skyimg_spatial_size)
+
+        # Sky-branch channel selection. ``sky_channels`` is a YAML-driven list of
+        # feature names; default ``("rgb",)`` keeps existing behavior (3-channel
+        # ``skimg_tensor``). The ray map is built lazily on first use and cached
+        # since ``fisheye_raymap`` only depends on (H, W). Sun-mask is reserved
+        # for a follow-up commit and raises when listed.
+        self.sky_channels: tuple[str, ...] = _normalize_sky_channels(sky_channels)
+        self.sky_in_channels: int = _sky_in_channels(self.sky_channels)
+        self._ray_map_cache: torch.Tensor | None = None
 
         # Sat config: when ``use_satellite=True`` the loader reads per-frame .npy shards
         # under ``satimg_dir/YYYY/MM/goes15_YYYYMMDD_HHMM.npy`` (GOES-15 GridSat-CONUS,
@@ -1082,6 +1140,61 @@ class FolsomIrradianceDataset(Dataset):
         ]
         return torch.stack(frames, dim=0)
 
+    def _get_ray_map(self) -> torch.Tensor:
+        """Lazy ``[3, H, W]`` float32 fisheye ray vectors at the sky spatial size.
+
+        Cached on the dataset instance; ``fisheye_raymap`` is a pure function of
+        (H, W) so a single instance suffices for all samples.
+        """
+        if self._ray_map_cache is None:
+            s = self._skyimg_spatial_size
+            ray, _valid = fisheye_raymap(s, s)
+            self._ray_map_cache = torch.from_numpy(np.ascontiguousarray(ray, dtype=np.float32))
+        return self._ray_map_cache
+
+    def _build_sky_channels(
+        self,
+        rgb_frames: torch.Tensor,
+        frame_timestamps: list[pd.Timestamp] | None = None,
+    ) -> torch.Tensor:
+        """Assemble ``[T, sky_in_channels, H, W]`` sky tensor per ``self.sky_channels``.
+
+        ``rgb_frames`` is the existing ``[T, 3, H, W]`` float32 tensor produced by
+        :meth:`_stack_sky_from_zarr` / :meth:`_stack_sky_frames`. Channel order in the
+        output follows ``self.sky_channels`` exactly. Default config (``("rgb",)``)
+        returns ``rgb_frames`` unchanged so behavior is byte-identical to today.
+        """
+        if self.sky_channels == _DEFAULT_SKY_CHANNELS:
+            return rgb_frames
+        if rgb_frames.ndim != 4 or rgb_frames.shape[1] != 3:
+            raise ValueError(
+                f"_build_sky_channels: expected rgb_frames [T, 3, H, W], got {tuple(rgb_frames.shape)}"
+            )
+        t_dim, _, h_dim, w_dim = rgb_frames.shape
+        parts: list[torch.Tensor] = []
+        for name in self.sky_channels:
+            if name == _SKY_CHANNEL_RGB:
+                parts.append(rgb_frames)
+            elif name == _SKY_CHANNEL_RAY_MAP:
+                ray = self._get_ray_map()
+                if ray.shape[-2:] != (h_dim, w_dim):
+                    raise RuntimeError(
+                        f"ray map cache shape {tuple(ray.shape)} does not match "
+                        f"sky frames spatial size {(h_dim, w_dim)}"
+                    )
+                parts.append(ray.unsqueeze(0).expand(t_dim, -1, -1, -1))
+            elif name == _SKY_CHANNEL_SUN_MASK:
+                raise NotImplementedError(
+                    "sky_channels: 'sun_mask' is reserved but not yet implemented; "
+                    "remove it from sky_channels for now."
+                )
+            else:
+                raise ValueError(f"sky_channels: unknown feature {name!r}")
+        out = torch.cat(parts, dim=1).contiguous()
+        if out.dtype != torch.float32:
+            out = out.to(torch.float32)
+        return out
+
     def _interpolate_nwp(self, forecast_timestamps: list[pd.Timestamp]) -> torch.Tensor:
         """
         Interpolate merged NWP features to forecast timestamps (strict, no extrapolation).
@@ -1317,7 +1430,8 @@ class FolsomIrradianceDataset(Dataset):
         t_x_end = sub_x[self._time_col].iloc[-1]
         if self._sky_format == "zarr":
             nominal = self._nominal_sky_frame_times(t_x_end)
-            skimg_tensor = self._stack_sky_from_zarr(t_x_end)
+            rgb_frames = self._stack_sky_from_zarr(t_x_end)
+            skimg_tensor = self._build_sky_channels(rgb_frames, nominal)
             skimg_solar_features = compute_solar_features(nominal, self.latitude, self.longitude)
             skimg_tf = solar_features_encoder(skimg_solar_features)
             skimg_dtf = delta_time_encoder(nominal, time0)
@@ -1331,7 +1445,8 @@ class FolsomIrradianceDataset(Dataset):
             skimg_tf = solar_features_encoder(skimg_solar_features)
             skimg_dtf = delta_time_encoder(skimg_timestamps, time0)
             skimg_timefeats = torch.cat([skimg_tf, skimg_dtf.unsqueeze(1)], dim=1)
-            skimg_tensor = self._stack_sky_frames(skimg_paths)
+            rgb_frames = self._stack_sky_frames(skimg_paths)
+            skimg_tensor = self._build_sky_channels(rgb_frames, skimg_timestamps)
             skimg_timestamps = [
                 (None if p is None else pd.Timestamp(t).strftime("%Y%m%d%H%M%S"))
                 for t, p in zip(skimg_timestamps, skimg_paths)
@@ -1505,6 +1620,7 @@ def build_folsom_irradiance_datasets_from_conf(
         satimg_time_resolution_min=int(_req_s("satimg_time_resolution_min")),
         satimg_npy_shape_hwc=tuple(int(x) for x in shwc),
         use_satellite=bool(sampling_cfg.get("use_satellite", False)),
+        sky_channels=sampling_cfg.get("sky_channels"),
     )
     train_ds = FolsomIrradianceDataset(split="train", **kwargs)
     test_ds = FolsomIrradianceDataset(split="test", **kwargs)
