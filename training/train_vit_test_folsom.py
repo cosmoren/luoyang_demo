@@ -770,6 +770,8 @@ def _dataset_kwargs(
         satimg_time_resolution_min=int(_req_sampling("satimg_time_resolution_min")),
         satimg_npy_shape_hwc=tuple(int(x) for x in shwc),
         use_satellite=use_satellite,
+        sky_channels=sampling_cfg.get("sky_channels"),
+        sun_mask_radius_deg=sampling_cfg.get("sun_mask_radius_deg"),
     )
 
 
