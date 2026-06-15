@@ -275,29 +275,36 @@ def _read_header_line(path: Path) -> str:
         return f.readline().rstrip("\n\r")
 
 
-def _load_folsom_irradiance_csv(path: Path) -> tuple[pd.DataFrame, str, list[str]]:
+def _load_folsom_irradiance_csv(path: Path) -> tuple[pd.DataFrame, str, list[str], list[str]]:
     """
     Load the single Folsom irradiance CSV into memory with parsed time + float irradiance columns.
 
-    Returns ``(df, time_col, ghi_dni_dhi_cols)`` where ``df`` has columns
-    ``[time_col, ghi, dni, dhi]`` (names auto-detected from the header).
+    Returns ``(df, time_col, ghi_dni_dhi_cols, kt_cols)`` where ``df`` has columns
+    ``[time_col, ghi, dni, dhi, p_cs, kt, kt_mask, p_mean]``.
+
+    Strict mode: precomputed ``p_cs`` / ``kt`` / ``kt_mask`` / ``p_mean`` are required.
     """
     p = path.resolve()
     _folsom_progress(f"loading irradiance CSV {p.name} into memory ...")
     raw = pd.read_csv(p, engine="c")
     time_col, _order, _all_cols = _pick_time_and_ghi_dni_dhi_columns(list(raw.columns))
     ghi_dni_dhi_cols = _order[1:]
-    df = raw[[time_col, *ghi_dni_dhi_cols]].copy()
+    kt_cols = _pick_precomputed_kt_columns(list(raw.columns))
+    df = raw[[time_col, *ghi_dni_dhi_cols, *kt_cols]].copy()
     df[time_col] = pd.to_datetime(df[time_col], format="%Y-%m-%d %H:%M:%S", errors="coerce")
     if bool(df[time_col].isna().any()):
         raise ValueError(f"{p.name}: NaT in {time_col!r} after parsing")
     for c in ghi_dni_dhi_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
+    for c in kt_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+        if bool(df[c].isna().any()):
+            raise ValueError(f"{p.name}: NaN found in required precomputed column {c!r}")
     _folsom_progress(
         f"irradiance CSV ready: {len(df):,} rows in RAM "
-        f"({time_col!r}, {', '.join(ghi_dni_dhi_cols)})"
+        f"({time_col!r}, {', '.join(ghi_dni_dhi_cols + kt_cols)})"
     )
-    return df, time_col, ghi_dni_dhi_cols
+    return df, time_col, ghi_dni_dhi_cols, kt_cols
 
 
 def _resolve_folsom_csv_path(conf: dict, project_root: Path | None = None) -> Path:
@@ -340,7 +347,8 @@ def _resolve_folsom_csv_path(conf: dict, project_root: Path | None = None) -> Pa
             f"Folsom GHI/DNI/DHI CSV not found: {p}\n"
             f"  data_dir={data_dir}\n"
             f"  folsom_irradiance_csv={rel_s!r}\n"
-            "Create or copy the file under data_dir (see paths.folsom_irradiance_csv)."
+            "Create or copy the file under data_dir (see paths.folsom_irradiance_csv). "
+            "This loader also requires precomputed columns: kt, kt_mask, p_cs, p_mean."
         )
     return p
 
@@ -403,6 +411,30 @@ def _pick_time_and_ghi_dni_dhi_columns(header_cells: list[str]) -> tuple[str, li
 
     order = [time_col, ghi, dni, dhi]
     return time_col, order, raw
+
+
+def _pick_precomputed_kt_columns(header_cells: list[str]) -> list[str]:
+    """Map header to required precomputed kt-related columns in strict mode."""
+    raw = [h.strip() for h in header_cells]
+    norm = [_normalize_col(h) for h in raw]
+    lower_to_orig: dict[str, str] = {}
+    for o, n in zip(raw, norm):
+        lower_to_orig.setdefault(n, o)
+
+    def pick_one(cands: set[str], label: str) -> str:
+        for n in norm:
+            if n in cands:
+                return lower_to_orig[n]
+        raise ValueError(
+            "Folsom irradiance CSV is missing required precomputed column "
+            f"{label!r}. Expected one of {sorted(cands)} in header {raw!r}"
+        )
+
+    p_cs = pick_one({"p_cs", "pcs", "clear_sky_power", "clear_sky_ghi"}, "p_cs")
+    kt = pick_one({"kt"}, "kt")
+    kt_mask = pick_one({"kt_mask", "ktmask"}, "kt_mask")
+    p_mean = pick_one({"p_mean", "pmean"}, "p_mean")
+    return [p_cs, kt, kt_mask, p_mean]
 
 
 def load_folsom_conf(path: Path | str) -> dict:
@@ -719,31 +751,19 @@ class FolsomIrradianceDataset(Dataset):
                 )
 
         # Irradiance CSV: one in-memory table (Luoyang ``_csv_cache`` style).
-        self._df, self._time_col, self._ghi_dni_dhi_cols = _load_folsom_irradiance_csv(self._csv_path)
+        # Strict mode: CSV must already include precomputed ``p_cs`` / ``kt`` / ``kt_mask`` / ``p_mean``.
+        self._df, self._time_col, self._ghi_dni_dhi_cols, self._kt_cols = _load_folsom_irradiance_csv(self._csv_path)
         self._n = int(len(self._df))
         if self._n < 1:
             raise RuntimeError(f"{self._csv_path.name}: expected at least one data row")
-
-        # ``p_mean`` is held at 1.0 for Folsom (single GHI sensor; the reconstruction
-        # ``pv_pred = kt_pred * target_p_cs * p_mean`` therefore reduces to
-        # ``pv_pred = kt_pred * target_p_cs``). Other normalization choices (raw-GHI mean,
-        # capacity, daytime-only mean) are intentionally NOT used here yet -- this is the
-        # first surgical step in a wider Folsom-vs-Luoyang alignment pass; the kt-input
-        # rescale and loss-space changes are tracked separately.
-        self._p_mean_scalar = 1.0
-
-        # Precompute normalized clear-sky GHI per CSV row once (1.5M rows for Folsom is fast
-        # in pvlib). ``_build_tensors`` slices into this array for both the input window and
-        # the forecast window (both are integer CSV row offsets from the anchor), so no
-        # per-sample pvlib call is needed. Mirrors the Luoyang offline preprocessing that
-        # stores ``p_cs`` in the CSV (see ``SPMF_preprocessing/luoyang/...``).
-        _folsom_progress("computing per-row clear-sky GHI via pvlib (ineichen) ...")
-        _times_utc = pd.DatetimeIndex(
-            pd.to_datetime(self._df[self._time_col].to_numpy(), utc=True)
-        )
-        self._p_cs_full = _compute_folsom_p_cs(self.latitude, self.longitude, _times_utc)
+        self._p_cs_col, self._kt_col, self._kt_mask_col, self._p_mean_col = self._kt_cols
+        self._p_cs_full = self._df[self._p_cs_col].to_numpy(dtype=np.float32, copy=False)
+        self._kt_full = self._df[self._kt_col].to_numpy(dtype=np.float32, copy=False)
+        self._kt_mask_full = self._df[self._kt_mask_col].to_numpy(dtype=np.float32, copy=False)
+        self._p_mean_full = self._df[self._p_mean_col].to_numpy(dtype=np.float32, copy=False)
         _folsom_progress(
-            f"p_cs ready: {len(self._p_cs_full):,} rows, max={float(self._p_cs_full.max()):.3f}"
+            "using precomputed kt fields from CSV: "
+            f"{self._p_cs_col}, {self._kt_col}, {self._kt_mask_col}, {self._p_mean_col}"
         )
 
         # Anchor bookkeeping.
@@ -816,13 +836,10 @@ class FolsomIrradianceDataset(Dataset):
         # Internal: train epoch length (random anchors per epoch). Builders may override.
         self._train_epoch_len = _DEFAULT_FOLSOM_TRAIN_EPOCH_LEN
 
-        # Train anchor validity filter: keep only anchors whose Y window has at least one
-        # row with finite GHI > _FOLSOM_TRAIN_GHI_DAYTIME_THRESHOLD (avoid all-night windows).
-        # Only computed for split=="train" — val/test use deterministic strided positions.
-        if self.split == "train":
-            self._train_anchor_valid_positions = self._compute_train_anchor_valid_positions()
-        else:
-            self._train_anchor_valid_positions = self._train_anchor_positions
+        # Skip daytime anchor scan for startup speed; train samples from full train anchors.
+        # (Previously this called _compute_train_anchor_valid_positions(), which is a costly
+        # one-time scan over large anchor windows.)
+        self._train_anchor_valid_positions = self._train_anchor_positions
 
     def _compute_train_anchor_valid_positions(self) -> np.ndarray:
         """
@@ -1265,22 +1282,20 @@ class FolsomIrradianceDataset(Dataset):
         ghi, dni, dhi = x_stack[0], x_stack[1], x_stack[2]
         tg, td, th = y_stack[0], y_stack[1], y_stack[2]
 
-        # Clear-sky / kt fields. ``p_cs`` is the normalized clear-sky GHI
-        # ``clearsky_ghi / _FOLSOM_GHI_SCALE``; ``p_mean`` is held at 1.0 (see ``__init__``)
-        # so ``kt = ghi_raw / (p_cs + eps) * kt_mask`` and the reconstruction
-        # ``pv_pred = kt_pred * target_p_cs * p_mean`` reduces to
-        # ``pv_pred = kt_pred * target_p_cs``. Note: ``ghi_raw`` is in W/m^2, so ``kt`` here
-        # is unbounded (~up to a few thousand) until the kt-input rescale is added in a
-        # follow-up change.
+        # Precomputed clear-sky / kt fields from irradiance CSV.
         p_cs_x = self._p_cs_full[x_idx]
         p_cs_y = self._p_cs_full[y_idx]
-        kt_mask_np = (p_cs_x > _FOLSOM_KT_DAYTIME_THRESHOLD).astype(np.float32)
-        kt_np = (ghi / (p_cs_x * self._p_mean_scalar + _FOLSOM_KT_EPS)) * kt_mask_np
-        kt = torch.from_numpy(kt_np.astype(np.float32)).unsqueeze(0)
-        kt_mask = torch.from_numpy(kt_mask_np).unsqueeze(0)
-        p_cs = torch.from_numpy(p_cs_x.astype(np.float32)).unsqueeze(0)
-        target_p_cs = torch.from_numpy(p_cs_y.astype(np.float32))
-        p_mean = torch.tensor(self._p_mean_scalar, dtype=torch.float32)
+        kt_np = self._kt_full[x_idx]
+        kt_mask_np = self._kt_mask_full[x_idx]
+        p_mean_np = self._p_mean_full[x_idx]
+        kt = torch.from_numpy(np.asarray(kt_np, dtype=np.float32)).unsqueeze(0)
+        kt_mask = torch.from_numpy(np.asarray(kt_mask_np, dtype=np.float32)).unsqueeze(0)
+        p_cs = torch.from_numpy(np.asarray(p_cs_x, dtype=np.float32)).unsqueeze(0)
+        target_p_cs = torch.from_numpy(np.asarray(p_cs_y, dtype=np.float32))
+        p_mean = torch.tensor(
+            float(np.asarray(p_mean_np, dtype=np.float32)[-1]) if len(p_mean_np) else 1.0,
+            dtype=torch.float32,
+        )
 
         x_times = sub_x[self._time_col]
         if bool(x_times.isna().any()):

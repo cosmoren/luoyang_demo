@@ -1,0 +1,43 @@
+training:
+  epochs: 20
+  lr: 1e-4
+  weight_decay: 0.01
+  warmup_epochs: 5
+  lr_min: 1e-6
+  batch_size: 64
+  num_workers: 8
+  save_every: 5
+  seed: 0
+
+  # EMA
+  use_ema: false
+  ema_decay: 0.99
+  ema_warmup_epochs: 5
+
+  # Mixed source sampling probabilities.
+  luoyang_prob: 0.8
+  folsom_prob: 0.2
+
+  # Length of one mixed train epoch (number of mixed samples).
+  mixed_train_epoch_len: 50000
+
+  # Keep both datasets on a common forecast horizon so mixed collate can stack.
+  common_output_len: 16
+
+  # Robust target scaling estimation cap per source.
+  p95_samples_cap: 8192
+
+  # Fast smoke: limit Luoyang inverter CSV count (null = all).
+  luoyang_max_inverters: null
+
+  # Optional runtime caps; null means full pass.
+  train_max_batches_per_epoch: null
+  eval_max_batches: null
+
+  # Optional modalities
+  use_nwp: true
+  zero_sky: false
+
+  # Optional output dirs (null => trainer defaults)
+  checkpoint_dir: null
+  tb_log_dir: null

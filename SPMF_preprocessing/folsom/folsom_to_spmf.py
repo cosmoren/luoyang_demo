@@ -13,15 +13,23 @@ import shutil
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
 import pandas as pd
+import pvlib
 
 # =============================================================================
 # Main control — set exactly one task (only that branch runs).
 # =============================================================================
 
-ActiveTask = Literal["none", "flatten_jpegs", "merge_nwp_csvs", "rename_jpg_date_time"]
+ActiveTask = Literal[
+    "none",
+    "flatten_jpegs",
+    "merge_nwp_csvs",
+    "rename_jpg_date_time",
+    "augment_irradiance_csv",
+]
 
-ACTIVE_TASK: ActiveTask = "rename_jpg_date_time"
+ACTIVE_TASK: ActiveTask = "augment_irradiance_csv"
 
 # --- Task: flatten_jpegs ------------------------------------------------------
 FOLSOM_INPUT_DIR = Path("/home/kyber/projects/digital energy/folsom_ds/original/sky image/raw")
@@ -56,6 +64,24 @@ NWP_ROUND_CLOUD_COVER_AND_REL_HUMIDITY = True
 
 # --- Task: rename_jpg_date_time (``20140101_000011.jpg`` -> ``20140101000011.jpg``) -
 RENAME_JPG_DATE_TIME_DIR = Path("/home/kyber/projects/digital energy/folsom_ds/processed/sky")
+
+# --- Task: augment_irradiance_csv (add p_cs/kt/kt_mask/p_mean to irradiance CSV) ----
+IRR_INPUT_CSV = Path("/work/folsom_dataset/irradiance/Folsom_irradiance.csv")
+IRR_OUTPUT_CSV = Path("/work/folsom_dataset/irradiance/Folsom_irradiance_with_kt.csv")
+IRR_TIME_COL = "timeStamp"
+IRR_GHI_COL = "ghi"
+IRR_DNI_COL = "dni"
+IRR_DHI_COL = "dhi"
+# Folsom site (from dataset info.yaml)
+FOLSOM_LATITUDE = 38.67895
+FOLSOM_LONGITUDE = -121.17688
+# Match dataloader/folsom.py semantics.
+FOLSOM_GHI_SCALE = 1000.0
+P_CS_CLIP_MIN = 0.0
+P_CS_CLIP_MAX = 1.2
+KT_DAYTIME_THRESHOLD = 0.1
+KT_EPS = 1e-6
+P_MEAN_SCALAR = 1.0
 
 
 # =============================================================================
@@ -154,6 +180,55 @@ def rename_jpg_remove_date_time_underscore(folder: Path) -> int:
         path.rename(new_path)
         n += 1
     return n
+
+
+def augment_irradiance_with_kt_fields() -> Path:
+    """
+    Read one Folsom irradiance CSV and append:
+      - p_cs    : clearsky_ghi / 1000, clipped to [0, 1.2]
+      - kt_mask : 1 if p_cs > 0.1 else 0
+      - p_mean  : constant 1.0 (matches dataloader/folsom.py)
+      - kt      : ghi / (p_cs * p_mean + 1e-6) * kt_mask
+
+    ``weather_score`` is intentionally NOT produced.
+    """
+    src = IRR_INPUT_CSV.resolve()
+    dst = IRR_OUTPUT_CSV.resolve()
+    if not src.is_file():
+        raise FileNotFoundError(f"Irradiance input CSV not found: {src}")
+
+    df = pd.read_csv(src)
+    required = [IRR_TIME_COL, IRR_GHI_COL, IRR_DNI_COL, IRR_DHI_COL]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"{src.name}: missing required column(s): {missing}")
+
+    ts = pd.to_datetime(df[IRR_TIME_COL], format="%Y-%m-%d %H:%M:%S", errors="coerce")
+    if bool(ts.isna().any()):
+        raise ValueError(f"{src.name}: NaT found after parsing {IRR_TIME_COL!r}")
+    idx_utc = pd.DatetimeIndex(ts).tz_localize("UTC")
+
+    ghi = pd.to_numeric(df[IRR_GHI_COL], errors="coerce").to_numpy(dtype=np.float64)
+    ghi = np.where(np.isfinite(ghi), ghi, 0.0)
+
+    loc = pvlib.location.Location(float(FOLSOM_LATITUDE), float(FOLSOM_LONGITUDE))
+    cs = loc.get_clearsky(idx_utc, model="ineichen")
+    cs_ghi = np.asarray(cs["ghi"].values, dtype=np.float64)
+    p_cs = np.clip(cs_ghi / FOLSOM_GHI_SCALE, P_CS_CLIP_MIN, P_CS_CLIP_MAX).astype(np.float32)
+
+    kt_mask = (p_cs > KT_DAYTIME_THRESHOLD).astype(np.int8)
+    p_mean = np.full_like(p_cs, fill_value=float(P_MEAN_SCALAR), dtype=np.float32)
+    kt = (ghi / (p_cs.astype(np.float64) * float(P_MEAN_SCALAR) + KT_EPS)) * kt_mask.astype(np.float64)
+
+    out = df.copy()
+    out["p_cs"] = p_cs.astype(np.float32)
+    out["kt"] = kt.astype(np.float32)
+    out["kt_mask"] = kt_mask.astype(np.int8)
+    out["p_mean"] = p_mean.astype(np.float32)
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(dst, index=False)
+    return dst
 
 
 # =============================================================================
@@ -286,6 +361,11 @@ def main() -> None:
     if ACTIVE_TASK == "rename_jpg_date_time":
         n = rename_jpg_remove_date_time_underscore(RENAME_JPG_DATE_TIME_DIR)
         print(f"rename_jpg_date_time: renamed {n} file(s) in {RENAME_JPG_DATE_TIME_DIR.resolve()}")
+        return
+
+    if ACTIVE_TASK == "augment_irradiance_csv":
+        out = augment_irradiance_with_kt_fields()
+        print(f"augment_irradiance_csv: wrote {out}")
         return
 
     raise ValueError(f"Unknown ACTIVE_TASK: {ACTIVE_TASK!r}")

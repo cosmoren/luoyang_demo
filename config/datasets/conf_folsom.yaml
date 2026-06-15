@@ -79,4 +79,5 @@ sampling:
   satimg_window_size: 24
   satimg_time_resolution_min: 15
   satimg_npy_shape_hwc: [100, 100, 3]
+  use_satellite: false
 
