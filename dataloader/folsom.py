@@ -80,7 +80,8 @@ if str(_PROJECT_ROOT) not in sys.path:
 from config_utils import get_resolved_paths
 from dataloader.luoyang_mem import list_csv_files
 from modules.solar_encoder import compute_solar_features, delta_time_encoder, solar_features_encoder
-from utils.fisheye_raymap import fisheye_raymap
+from SPMF_preprocessing.fisheye_calib import fisheye_sunmask
+from SPMF_preprocessing.fisheye_calib.fisheye_raymap import compute_ray_map
 
 # Sky-branch channel-selection abstraction (Folsom only, for now). The dataset YAML
 # may set ``sampling.sky_channels`` to a list of feature names; the resulting
@@ -98,10 +99,16 @@ _SKY_CHANNEL_WIDTHS: dict[str, int] = {
 _DEFAULT_SKY_CHANNELS: tuple[str, ...] = (_SKY_CHANNEL_RGB,)
 
 # Default angular radius (degrees) for the ``sun_mask`` channel; overridable via
-# ``sampling.sun_mask_radius_deg`` in the dataset YAML. 1° is roughly the sun's
-# apparent diameter (~0.53° plus margin); see _compute_sun_mask_for_frames.
-_DEFAULT_SUN_MASK_RADIUS_DEG: float = 1.0
-
+# ``sampling.sun_mask_radius_deg`` in the dataset YAML. The sun's apparent radius
+# is ~0.27°, but the bright glare halo on the Folsom fisheye saturates pixels
+# out to ~18-19° from the sun center on overhead-noon clear-sky frames
+# (empirically measured in playground/2026-06-15_sunmask-bigger/measure_halo_v2.py
+# on 2014-05-11: r_max = 18.70° at 20:00Z noon, much smaller at low-sun hours).
+# 30° gives ~60% safety margin so the mask reliably covers sun+halo at all sun
+# positions including frames where the lens-projection FoV correction below
+# isn't perfectly fitted; at 224x224 this is ~37 px linear radius.
+# See ``_compute_sun_mask_for_frames``.
+_DEFAULT_SUN_MASK_RADIUS_DEG: float = 30.0
 
 def _normalize_sky_channels(raw: Any) -> tuple[str, ...]:
     """Validate + canonicalize a ``sky_channels`` config value to a tuple of names.
@@ -635,14 +642,16 @@ class FolsomIrradianceDataset(Dataset):
 
         # Sky-branch channel selection. ``sky_channels`` is a YAML-driven list of
         # feature names; default ``("rgb",)`` keeps existing behavior (3-channel
-        # ``skimg_tensor``). The ray map + its companion validity mask are built
-        # lazily on first use and cached since ``fisheye_raymap`` only depends
-        # on (H, W). ``sun_mask`` reuses the same cache plus per-frame solar
-        # geometry from ``compute_solar_features``.
+        # ``skimg_tensor``). The calibrated ray map + its companion validity
+        # mask are built lazily on first use and cached since
+        # ``compute_ray_map`` is a pure function of ``(H, W, fit)``. ``sun_mask``
+        # reuses the same fit cache plus per-frame solar geometry from
+        # ``compute_solar_features``.
         self.sky_channels: tuple[str, ...] = _normalize_sky_channels(sky_channels)
         self.sky_in_channels: int = _sky_in_channels(self.sky_channels)
         self._ray_map_cache: torch.Tensor | None = None
         self._sky_valid_cache: torch.Tensor | None = None
+        self._fisheye_fit: dict | None = None
         radius = (
             _DEFAULT_SUN_MASK_RADIUS_DEG
             if sun_mask_radius_deg is None
@@ -1163,14 +1172,25 @@ class FolsomIrradianceDataset(Dataset):
         ]
         return torch.stack(frames, dim=0)
 
-    def _build_ray_and_valid_cache(self) -> None:
-        """Populate ``_ray_map_cache`` and ``_sky_valid_cache`` together (one ``fisheye_raymap`` call).
+    def _get_fisheye_fit(self) -> dict:
+        """Lazy-load + cache the Folsom fisheye fit (``cx, cy, f, alpha0``).
 
-        ``fisheye_raymap`` is a pure function of ``(H, W)`` so a single instance
-        suffices for all samples; ``sun_mask`` reuses the same cached arrays.
+        Shared by :meth:`_build_ray_and_valid_cache` (for the calibrated
+        ``ray_map``) and :meth:`_compute_sun_mask_for_frames` (for the sun
+        mask). The CSV is read at most once per dataset instance.
+        """
+        if self._fisheye_fit is None:
+            self._fisheye_fit = fisheye_sunmask.load_fisheye_fit("folsom")
+        return self._fisheye_fit
+
+    def _build_ray_and_valid_cache(self) -> None:
+        """Populate ``_ray_map_cache`` and ``_sky_valid_cache`` together (one ``compute_ray_map`` call).
+
+        ``compute_ray_map`` is a pure function of ``(H, W, fit)`` so a single
+        instance suffices for all samples; ``sun_mask`` reuses the same fit.
         """
         s = self._skyimg_spatial_size
-        ray, valid = fisheye_raymap(s, s)
+        ray, valid = compute_ray_map(s, s, self._get_fisheye_fit())
         self._ray_map_cache = torch.from_numpy(np.ascontiguousarray(ray, dtype=np.float32))
         self._sky_valid_cache = torch.from_numpy(np.ascontiguousarray(valid, dtype=np.float32))
 
@@ -1190,33 +1210,26 @@ class FolsomIrradianceDataset(Dataset):
         self,
         frame_timestamps_utc: list[pd.Timestamp],
     ) -> torch.Tensor:
-        """Per-frame ``[T, 1, H, W]`` float32 sun mask via an angular threshold on the cached ray map.
+        """Per-frame ``[T, 1, H, W]`` float32 sun mask in calibrated fisheye coords.
 
-        For each frame, the sun unit vector is derived from
-        :func:`compute_solar_features` (``(azimuth, zenith)`` in degrees,
-        meteorological convention: 0°=N, 90°=E, increasing clockwise; zenith
-        from up) and expressed in the same image-axis frame as
-        :func:`utils.fisheye_raymap.fisheye_raymap`:
+        Thin wrapper around
+        :func:`SPMF_preprocessing.fisheye_calib.fisheye_sunmask.compute_sun_mask`,
+        which owns the lens math (calibrated ``cx``, ``cy``, ``f``, ``alpha0``
+        from ``folsom_fisheye_fit.csv`` + the same horizontal flip the
+        calibration assumed). This method only:
 
-        * ``ray[0]`` / sun_x = image ``+x`` (image-right)  → maps to **East**
-        * ``ray[1]`` / sun_y = image ``+y`` (image-down)   → maps to **South** (= ``-North``)
-        * ``ray[2]`` / sun_z = image ``+z`` (out of image) → maps to **Up** (zenith)
+        1. Calls :func:`compute_solar_features` for the per-frame
+           ``(azimuth, zenith)`` (meteorological convention: 0°=N, 90°=E,
+           clockwise; zenith from up).
+        2. Lazily loads the Folsom fit on first call.
+        3. Delegates the actual mask construction to the calibration module.
+        4. Wraps the result as a contiguous ``[T, 1, H, W]`` ``torch.float32``
+           tensor with a channel dim.
 
-        i.e. the sky camera is taken to be upward-pointing, image-top=North,
-        image-right=East. The alignment is verified empirically in
-        ``playground/2026-06-12_sky-feats-impl/smoke_sunmask.py`` (phase 6
-        overlay against an RGB frame with the sun visible).
-
-        Pixels with angle to the sun within :attr:`sun_mask_radius_deg` are 1.0;
-        pixels outside the fisheye circle (``valid == 0``) are 0. Frames with
-        ``zenith >= 90°`` (sun below horizon) return all zeros without computing
-        the threshold.
+        Frames with ``zen >= 90°`` (sun below horizon) return all zeros.
         """
         if not frame_timestamps_utc:
             raise ValueError("_compute_sun_mask_for_frames: frame_timestamps_utc is empty")
-        ray = self._get_ray_map()
-        valid = self._get_sky_valid()
-        h, w = int(ray.shape[-2]), int(ray.shape[-1])
         t = int(len(frame_timestamps_utc))
 
         feats = compute_solar_features(frame_timestamps_utc, self.latitude, self.longitude)
@@ -1228,22 +1241,15 @@ class FolsomIrradianceDataset(Dataset):
                 f"for {t} frames"
             )
 
-        above = np.isfinite(az_deg) & np.isfinite(ze_deg) & (ze_deg < 90.0)
-        az_rad = np.deg2rad(az_deg)
-        ze_rad = np.deg2rad(ze_deg)
-        sin_z = np.sin(ze_rad)
-        sun_x = sin_z * np.sin(az_rad)
-        sun_y = -sin_z * np.cos(az_rad)
-        sun_z = np.cos(ze_rad)
-        sun_np = np.stack([sun_x, sun_y, sun_z], axis=1).astype(np.float32, copy=False)
-        sun = torch.from_numpy(np.ascontiguousarray(sun_np))  # [T, 3]
-        above_t = torch.from_numpy(above.astype(np.float32))  # [T]
-
-        cos_threshold = float(np.cos(np.deg2rad(self.sun_mask_radius_deg)))
-        cos_angle = torch.einsum("chw,tc->thw", ray, sun)  # [T, H, W]
-        mask_thw = (cos_angle >= cos_threshold).to(torch.float32) * valid  # [T, H, W] (valid is [1,H,W])
-        mask_thw = mask_thw * above_t.view(-1, 1, 1)
-        return mask_thw.unsqueeze(1).contiguous()  # [T, 1, H, W]
+        mask_np = fisheye_sunmask.compute_sun_mask(
+            az_deg=az_deg,
+            zen_deg=ze_deg,
+            image_size=self._skyimg_spatial_size,
+            radius_deg=self.sun_mask_radius_deg,
+            fit=self._get_fisheye_fit(),
+        )
+        mask_t = torch.from_numpy(np.ascontiguousarray(mask_np, dtype=np.float32))
+        return mask_t.unsqueeze(1).contiguous()  # [T, 1, H, W]
 
     def _build_sky_channels(
         self,
