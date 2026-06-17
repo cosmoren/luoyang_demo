@@ -9,8 +9,10 @@ training:
 # Same schema as Luoyang `pv_*` keys (no `irr_*`, no `dataset_profile: folsom`).
 # Used by ``dataloader.folsom`` and ``training/train_vit_test_folsom.py``.
 #
-# Run Folsom training:
+# Run Folsom training (rgb-only default; add sky extras via CLI):
 #   python training/train_vit_test_folsom.py --dataset-config conf_folsom.yaml
+#   python training/train_vit_test_folsom.py --sun-mask --sun-mask-radius-deg 20
+#   python training/train_vit_test_folsom.py --ray-map --sun-mask --sun-mask-radius-deg 20
 # -----------------------------------------------------------------------------
 
 site:

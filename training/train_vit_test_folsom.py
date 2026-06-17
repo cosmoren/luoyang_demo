@@ -25,6 +25,12 @@ Local smoke (1 logical GPU, tiny run):
 
 Training hyperparameters: ``config/train/conf_train.yaml`` (``--config``). Dataset paths:
 ``config/datasets/conf_folsom.yaml`` (``--dataset-config``).
+
+Sky-branch extras (default rgb-only) via CLI flags; precedence CLI > YAML > loader default::
+
+  python training/train_vit_test_folsom.py --sun-mask --sun-mask-radius-deg 20
+  python training/train_vit_test_folsom.py --ray-map
+  python training/train_vit_test_folsom.py --ray-map --sun-mask --sun-mask-radius-deg 20
 """
 
 from __future__ import annotations
@@ -693,6 +699,36 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
     )
     parser.set_defaults(use_satellite=None)
     parser.add_argument(
+        "--ray-map",
+        dest="ray_map",
+        action="store_true",
+        help=(
+            "Add the fixed fisheye ray_map sky channels (3ch). When this flag or "
+            "--sun-mask is set, overrides sampling.sky_channels in the dataset YAML "
+            "(rgb is always included)."
+        ),
+    )
+    parser.add_argument(
+        "--sun-mask",
+        dest="sun_mask",
+        action="store_true",
+        help=(
+            "Add the per-frame sun_mask sky channel (1ch). When this flag or "
+            "--ray-map is set, overrides sampling.sky_channels in the dataset YAML."
+        ),
+    )
+    parser.set_defaults(ray_map=None, sun_mask=None)
+    parser.add_argument(
+        "--sun-mask-radius-deg",
+        type=float,
+        default=None,
+        metavar="DEG",
+        help=(
+            "Angular radius of the sun_mask disc in degrees. Precedence: this flag > "
+            "sampling.sun_mask_radius_deg in the dataset YAML > dataloader default."
+        ),
+    )
+    parser.add_argument(
         "--tb-log-dir",
         type=str,
         default=None,
@@ -711,6 +747,8 @@ def _dataset_kwargs(
     dataset_config_name: str,
     split: str,
     use_satellite_override: bool | None = None,
+    sky_channels_override: tuple[str, ...] | None = None,
+    sun_mask_radius_deg_override: float | None = None,
 ) -> dict:
     base_cfg_path = _resolve_named_config(_DATASETS_CONFIG_DIR, dataset_config_name, "dataset-config")
     cfg_path = _folsom_pv_dataset_config_path(base_cfg_path)
@@ -770,9 +808,54 @@ def _dataset_kwargs(
         satimg_time_resolution_min=int(_req_sampling("satimg_time_resolution_min")),
         satimg_npy_shape_hwc=tuple(int(x) for x in shwc),
         use_satellite=use_satellite,
-        sky_channels=sampling_cfg.get("sky_channels"),
-        sun_mask_radius_deg=sampling_cfg.get("sun_mask_radius_deg"),
+        sky_channels=(
+            list(sky_channels_override)
+            if sky_channels_override is not None
+            else sampling_cfg.get("sky_channels")
+        ),
+        sun_mask_radius_deg=(
+            sun_mask_radius_deg_override
+            if sun_mask_radius_deg_override is not None
+            else sampling_cfg.get("sun_mask_radius_deg")
+        ),
     )
+
+
+def _resolve_sky_channels(
+    dataset_config_name: str,
+    cli_ray_map: bool | None,
+    cli_sun_mask: bool | None,
+) -> tuple[str, ...] | None:
+    """Resolve sky channel list: CLI flags > YAML ``sampling.sky_channels`` > loader default.
+
+    Returns ``None`` when no CLI override was requested (delegate to YAML / default).
+    When either ``--ray-map`` or ``--sun-mask`` is passed, builds ``rgb`` + optional extras
+    in canonical order (rgb, ray_map, sun_mask).
+    """
+    if cli_ray_map is None and cli_sun_mask is None:
+        return None
+    channels = ["rgb"]
+    if cli_ray_map:
+        channels.append("ray_map")
+    if cli_sun_mask:
+        channels.append("sun_mask")
+    return tuple(channels)
+
+
+def _resolve_sun_mask_radius_deg(
+    dataset_config_name: str,
+    cli_value: float | None,
+) -> float | None:
+    """Resolve ``sun_mask_radius_deg``: CLI flag > YAML > ``None`` (loader default)."""
+    if cli_value is not None:
+        return float(cli_value)
+    base_cfg_path = _resolve_named_config(_DATASETS_CONFIG_DIR, dataset_config_name, "dataset-config")
+    cfg_path = _folsom_pv_dataset_config_path(base_cfg_path)
+    cfg = _load_yaml(cfg_path)
+    yaml_value = (cfg.get("sampling", {}) or {}).get("sun_mask_radius_deg")
+    if yaml_value is None:
+        return None
+    return float(yaml_value)
 
 
 def _resolve_use_satellite(dataset_config_name: str, cli_value: bool | None) -> bool:
@@ -846,14 +929,23 @@ def main() -> None:
         "CLI flag" if args.use_satellite is not None else f"YAML ({dataset_cfg})"
     )
     print(f"use_satellite: {use_satellite} (source: {_use_sat_src})")
+    sky_channels_override = _resolve_sky_channels(dataset_cfg, args.ray_map, args.sun_mask)
+    sun_mask_radius_deg_override = _resolve_sun_mask_radius_deg(
+        dataset_cfg, args.sun_mask_radius_deg
+    )
+    _ds_kw = dict(
+        use_satellite_override=use_satellite,
+        sky_channels_override=sky_channels_override,
+        sun_mask_radius_deg_override=sun_mask_radius_deg_override,
+    )
     train_dataset = FolsomIrradianceDataset(
-        **_dataset_kwargs(dataset_cfg, "train", use_satellite_override=use_satellite)
+        **_dataset_kwargs(dataset_cfg, "train", **_ds_kw)
     )
     val_dataset = FolsomIrradianceDataset(
-        **_dataset_kwargs(dataset_cfg, "val", use_satellite_override=use_satellite)
+        **_dataset_kwargs(dataset_cfg, "val", **_ds_kw)
     )
     test_dataset = FolsomIrradianceDataset(
-        **_dataset_kwargs(dataset_cfg, "test", use_satellite_override=use_satellite)
+        **_dataset_kwargs(dataset_cfg, "test", **_ds_kw)
     )
     _epoch_len_override = _resolve_train_epoch_len(dataset_cfg, args.train_epoch_len)
     if _epoch_len_override is not None:
@@ -874,16 +966,30 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # ``sky_in_channels`` is the dataset-side source of truth for sky-branch input
-    # width (rgb=3, +ray_map=+3, +sun_mask=+1; configured via
-    # ``sampling.sky_channels`` in the Folsom dataset YAML). Default of 3 is what
-    # the loader returns when the key is omitted, so legacy configs / checkpoints
-    # remain unchanged.
+    # width (rgb=3, +ray_map=+3, +sun_mask=+1). Configured via ``--ray-map`` /
+    # ``--sun-mask`` CLI flags or ``sampling.sky_channels`` in the dataset YAML.
     sky_in_channels = int(getattr(train_dataset, "sky_in_channels", 3))
     sky_channels_resolved = tuple(getattr(train_dataset, "sky_channels", ("rgb",)))
+    if args.ray_map is not None or args.sun_mask is not None:
+        _sky_src = "CLI flags"
+    else:
+        _sky_src = f"YAML ({dataset_cfg})"
     print(
-        f"Sky channels (resolved from dataset YAML): {list(sky_channels_resolved)} "
+        f"Sky channels (source: {_sky_src}): {list(sky_channels_resolved)} "
         f"-> sky_in_channels={sky_in_channels}"
     )
+    if "sun_mask" in sky_channels_resolved:
+        if args.sun_mask_radius_deg is not None:
+            _radius_src = "CLI flag"
+        else:
+            _yaml_radius = (dataset_cfg_raw.get("sampling") or {}).get("sun_mask_radius_deg")
+            _radius_src = (
+                f"YAML ({dataset_cfg})" if _yaml_radius is not None else "dataloader default"
+            )
+        print(
+            f"sun_mask_radius_deg: {train_dataset.sun_mask_radius_deg} "
+            f"(source: {_radius_src})"
+        )
     model = pv_forecasting_model_vit_imgs(
         dev_dn_list=dev_dn_list,
         nwp_features=nwp_features,
