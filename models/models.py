@@ -163,7 +163,8 @@ class FC(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [..., in_dim]. Returns: [..., out_dim]."""
-        kt = torch.sigmoid( self.fc(x) ) * 1.2
+        # kt = torch.sigmoid( self.fc(x) ) * 1.2
+        kt = self.fc(x)
         return kt
 
 
@@ -350,6 +351,8 @@ class pv_forecasting_model_vit(nn.Module):
                 sat_timefeats: Optional[torch.Tensor] = None,
                 skimg_tensor: Optional[torch.Tensor] = None,
                 skimg_timefeats: Optional[torch.Tensor] = None,
+                sat_valid_mask: Optional[torch.Tensor] = None,
+                skimg_valid_mask: Optional[torch.Tensor] = None,
                 nwp_tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
         
         # PV features
@@ -422,6 +425,8 @@ class pv_forecasting_model_vit_nwp(nn.Module):
                 sat_timefeats: Optional[torch.Tensor] = None,
                 skimg_tensor: Optional[torch.Tensor] = None,
                 skimg_timefeats: Optional[torch.Tensor] = None,
+                sat_valid_mask: Optional[torch.Tensor] = None,
+                skimg_valid_mask: Optional[torch.Tensor] = None,
                 nwp_tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
         
         # PV features
@@ -513,6 +518,8 @@ class pv_forecasting_model_vit_nwp_short(nn.Module):
                 sat_timefeats: Optional[torch.Tensor] = None,
                 skimg_tensor: Optional[torch.Tensor] = None,
                 skimg_timefeats: Optional[torch.Tensor] = None,
+                sat_valid_mask: Optional[torch.Tensor] = None,
+                skimg_valid_mask: Optional[torch.Tensor] = None,
                 nwp_tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
         
         # PV history features
@@ -675,6 +682,8 @@ class pv_forecasting_model_vit_imgs(nn.Module):
                 sat_timefeats: Optional[torch.Tensor] = None,
                 skimg_tensor: Optional[torch.Tensor] = None,
                 skimg_timefeats: Optional[torch.Tensor] = None,
+                sat_valid_mask: Optional[torch.Tensor] = None,
+                skimg_valid_mask: Optional[torch.Tensor] = None,
                 nwp_tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
         
         # PV history features
@@ -760,6 +769,13 @@ class pv_forecasting_model_vit_imgs(nn.Module):
             # print('sat_patch_tokens: ', sat_patch_tokens.shape, sat_compressed.shape)
             sat_mask = torch.ones(B, sat_compressed.shape[1], device=pv.device, dtype=pv.dtype)
 
+        if sat_valid_mask is not None:
+            if sat_valid_mask.dim() != 1 or sat_valid_mask.shape[0] != B:
+                raise ValueError(f"sat_valid_mask expected [B], got {sat_valid_mask.shape}")
+            sat_valid_mask = sat_valid_mask.to(device=pv.device, dtype=pv.dtype).unsqueeze(1)
+            sat_compressed = sat_compressed * sat_valid_mask.unsqueeze(2)
+            sat_mask = sat_mask * sat_valid_mask
+
         # sky images encoder
         if skimg_tensor is None or skimg_tensor.max() == 0:
             sky_compressed = torch.zeros(B, 48, 64, device=pv.device, dtype=pv.dtype) + self.sky_mod_embed
@@ -801,6 +817,13 @@ class pv_forecasting_model_vit_imgs(nn.Module):
             sky_compressed = sky_compressed + sky_timefeats_48_hd
 
             sky_mask = torch.ones(B, 48, device=pv.device, dtype=pv.dtype)
+
+        if skimg_valid_mask is not None:
+            if skimg_valid_mask.dim() != 1 or skimg_valid_mask.shape[0] != B:
+                raise ValueError(f"skimg_valid_mask expected [B], got {skimg_valid_mask.shape}")
+            skimg_valid_mask = skimg_valid_mask.to(device=pv.device, dtype=pv.dtype).unsqueeze(1)
+            sky_compressed = sky_compressed * skimg_valid_mask.unsqueeze(2)
+            sky_mask = sky_mask * skimg_valid_mask
 
         hist_mem_compressed = torch.cat([KV_hist_mem_compressed, sat_compressed, sky_compressed], dim=1)
         key_value_mask = torch.cat([pv_mask, sat_mask, sky_mask], dim=1)

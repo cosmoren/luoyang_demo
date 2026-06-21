@@ -392,8 +392,22 @@ class PVDataset(Dataset):
             raise ValueError("satimg_time_resolution_min must be positive")
         self._satimg_dt_min = satimg_time_resolution_min
         self._satimg_dir = Path(satimg_dir).resolve()
-        self.satimg_ds = xr.open_zarr(self._satimg_dir)
-        self.skyimg_ds = xr.open_zarr(self._skyimg_dir)
+        self.satimg_ds = None
+        self.skyimg_ds = None
+        if self._satimg_dir.exists():
+            try:
+                self.satimg_ds = xr.open_zarr(self._satimg_dir)
+            except Exception as e:
+                print(f"[PVDataset] WARNING: failed to open sat zarr {self._satimg_dir}: {e}")
+        else:
+            print(f"[PVDataset] WARNING: sat zarr dir not found: {self._satimg_dir} (sat_* outputs will be None)")
+        if self._skyimg_dir.exists():
+            try:
+                self.skyimg_ds = xr.open_zarr(self._skyimg_dir)
+            except Exception as e:
+                print(f"[PVDataset] WARNING: failed to open sky zarr {self._skyimg_dir}: {e}")
+        else:
+            print(f"[PVDataset] WARNING: sky zarr dir not found: {self._skyimg_dir} (skimg_* outputs will be None)")
 
         if test_anchor_stride_min <= 0 or test_anchor_stride_min % csv_interval_min:
             raise ValueError(
@@ -910,39 +924,60 @@ class PVDataset(Dataset):
         target_weather_score = torch.from_numpy(ws_y)
         prof.mark("build.targets")
 
-        
-        # Select satellite images from the window
-        sat_t0 = time0_utc - timedelta(minutes=(245+30))
-        sat_t1 = time0_utc - timedelta(minutes=30)
-        sat_t0 = pd.Timestamp(sat_t0).tz_convert("UTC").tz_localize(None)
-        sat_t1 = pd.Timestamp(sat_t1).tz_convert("UTC").tz_localize(None)
-        sat_data = self.satimg_ds.sel(time_utc=slice(sat_t0, sat_t1))
-        prof.mark("build.sat_zarr_sel")
+        sat_tensor = None
+        sat_timefeats = None
+        if self.satimg_ds is not None:
+            # Select satellite images from the window
+            sat_t0 = time0_utc - timedelta(minutes=(245 + 30))
+            sat_t1 = time0_utc - timedelta(minutes=30)
+            sat_t0 = pd.Timestamp(sat_t0).tz_convert("UTC").tz_localize(None)
+            sat_t1 = pd.Timestamp(sat_t1).tz_convert("UTC").tz_localize(None)
+            sat_data = self.satimg_ds.sel(time_utc=slice(sat_t0, sat_t1))
+            prof.mark("build.sat_zarr_sel")
 
-        sat_solar_features = {'azimuth': sat_data['azimuth'].values, 
-                              'zenith': sat_data['zenith'].values, 
-                              'day_of_year': sat_data['day_of_year'].values, 
-                              'hour_of_day': sat_data['hour_of_day'].values}
-        sat_timestamps_utc = sat_data['time_utc'].values
-        prof.mark("build.sat_meta_values")
+            sat_solar_features = {
+                'azimuth': sat_data['azimuth'].values,
+                'zenith': sat_data['zenith'].values,
+                'day_of_year': sat_data['day_of_year'].values,
+                'hour_of_day': sat_data['hour_of_day'].values,
+            }
+            sat_timestamps_utc = sat_data['time_utc'].values
+            prof.mark("build.sat_meta_values")
 
-        sat_timefeats = solar_features_encoder(sat_solar_features)
-        sat_dtimefeats = delta_time_encoder(sat_timestamps_utc, time0_utc)
-        sat_timefeats = torch.cat([sat_timefeats, sat_dtimefeats.unsqueeze(1)], dim=1)
-        prof.mark("build.sat_timefeats")
+            sat_timefeats = solar_features_encoder(sat_solar_features)
+            sat_dtimefeats = delta_time_encoder(sat_timestamps_utc, time0_utc)
+            sat_timefeats = torch.cat([sat_timefeats, sat_dtimefeats.unsqueeze(1)], dim=1)
+            prof.mark("build.sat_timefeats")
 
-        sat_tensor = torch.from_numpy(
-            np.asarray(sat_data['images'].values, dtype=np.float32)
-        )
-        prof.mark("build.sat_images_values")
+            sat_tensor = torch.from_numpy(
+                np.asarray(sat_data['images'].values, dtype=np.float32)
+            )
+            prof.mark("build.sat_images_values")
 
-        if sat_tensor.shape[0]>24:
-            sat_tensor = sat_tensor[-24:, :, :, :]
-            sat_timefeats = sat_timefeats[-24:, :]
-        else:
-            sat_tensor = torch.cat([torch.zeros(24-sat_tensor.shape[0], sat_tensor.shape[1], sat_tensor.shape[2], sat_tensor.shape[3]), sat_tensor], dim=0)
-            sat_timefeats = torch.cat([torch.zeros(24-sat_timefeats.shape[0], sat_timefeats.shape[1]), sat_timefeats], dim=0)
-        prof.mark("build.sat_pad_trim")
+            if sat_tensor.shape[0] > 24:
+                sat_tensor = sat_tensor[-24:, :, :, :]
+                sat_timefeats = sat_timefeats[-24:, :]
+            else:
+                sat_tensor = torch.cat(
+                    [
+                        torch.zeros(
+                            24 - sat_tensor.shape[0],
+                            sat_tensor.shape[1],
+                            sat_tensor.shape[2],
+                            sat_tensor.shape[3],
+                        ),
+                        sat_tensor,
+                    ],
+                    dim=0,
+                )
+                sat_timefeats = torch.cat(
+                    [
+                        torch.zeros(24 - sat_timefeats.shape[0], sat_timefeats.shape[1]),
+                        sat_timefeats,
+                    ],
+                    dim=0,
+                )
+            prof.mark("build.sat_pad_trim")
 
         '''
         import matplotlib.pyplot as plt
@@ -972,27 +1007,69 @@ class PVDataset(Dataset):
         plt.close(fig)
         '''
 
-        '''
-        # Select sky images from the window
-        sky_t0 = time0_utc - timedelta(minutes=(30))
-        sky_t1 = time0_utc - timedelta(minutes=0)
-        sky_t0 = pd.Timestamp(sky_t0).tz_convert("UTC").tz_localize(None)
-        sky_t1 = pd.Timestamp(sky_t1).tz_convert("UTC").tz_localize(None)
-        sky_data = self.skyimg_ds.sel(time_utc=slice(sky_t0, sky_t1))
-        sky_solar_features = {'azimuth': sky_data['azimuth'].values, 
-                              'zenith': sky_data['zenith'].values, 
-                              'day_of_year': sky_data['day_of_year'].values, 
-                              'hour_of_day': sky_data['hour_of_day'].values}
-        
-        sky_timestamps_utc = sky_data['time_utc'].values
-
-        sky_timefeats = solar_features_encoder(sky_solar_features)
-        sky_dtimefeats = delta_time_encoder(sky_timestamps_utc, time0_utc)
-        sky_timefeats = torch.cat([sky_timefeats, sky_dtimefeats.unsqueeze(1)], dim=1)
-        sky_tensor = torch.from_numpy(
-            np.asarray(sky_data['images'].values, dtype=np.float32)
-        )
-        '''
+        sky_tensor = None
+        sky_timefeats = None
+        if self.skyimg_ds is not None:
+            # Select sky images from the window
+            sky_t0 = time0_utc - timedelta(minutes=30)
+            sky_t1 = time0_utc - timedelta(minutes=0)
+            sky_t0 = pd.Timestamp(sky_t0).tz_convert("UTC").tz_localize(None)
+            sky_t1 = pd.Timestamp(sky_t1).tz_convert("UTC").tz_localize(None)
+            try:
+                sky_data = self.skyimg_ds.sel(time_utc=slice(sky_t0, sky_t1))
+                n_sky = int(sky_data.sizes.get("time_utc", 0))
+                expected_sky = int(self.skyimg_window_size)  # model expects 30
+                if n_sky > 0:
+                    sky_solar_features = {
+                        "azimuth": sky_data["azimuth"].values,
+                        "zenith": sky_data["zenith"].values,
+                        "day_of_year": sky_data["day_of_year"].values,
+                        "hour_of_day": sky_data["hour_of_day"].values,
+                    }
+                    sky_timestamps_utc = sky_data["time_utc"].values
+                    sky_timefeats = solar_features_encoder(sky_solar_features)
+                    sky_dtimefeats = delta_time_encoder(sky_timestamps_utc, time0_utc)
+                    sky_timefeats = torch.cat([sky_timefeats, sky_dtimefeats.unsqueeze(1)], dim=1)
+                    sky_tensor = torch.from_numpy(
+                        np.asarray(sky_data["images"].values, dtype=np.float32)
+                    )
+                    # Normalize to fixed T=30 for SkyCompressor.
+                    if sky_tensor.shape[0] > expected_sky:
+                        sky_tensor = sky_tensor[-expected_sky:, :, :, :]
+                        sky_timefeats = sky_timefeats[-expected_sky:, :]
+                    elif sky_tensor.shape[0] < expected_sky:
+                        pad_t = expected_sky - sky_tensor.shape[0]
+                        sky_tensor = torch.cat(
+                            [
+                                torch.zeros(
+                                    pad_t,
+                                    sky_tensor.shape[1],
+                                    sky_tensor.shape[2],
+                                    sky_tensor.shape[3],
+                                    dtype=sky_tensor.dtype,
+                                ),
+                                sky_tensor,
+                            ],
+                            dim=0,
+                        )
+                        sky_timefeats = torch.cat(
+                            [
+                                torch.zeros(
+                                    pad_t,
+                                    sky_timefeats.shape[1],
+                                    dtype=sky_timefeats.dtype,
+                                ),
+                                sky_timefeats,
+                            ],
+                            dim=0,
+                        )
+                else:
+                    # Coverage gap: make sky branch optional for this sample.
+                    sky_tensor = None
+                    sky_timefeats = None
+            except Exception:
+                sky_tensor = None
+                sky_timefeats = None
 
         return {
             "dev_idx": dev_idx,
@@ -1004,10 +1081,10 @@ class PVDataset(Dataset):
             "p_cs": p_cs,
             "p_mean": p_mean,
             "forecast_timefeats": forecast_timefeats,
-            "sat_tensor": None, # sat_tensor,
-            "sat_timefeats": None, #sat_timefeats,
-            "skimg_tensor": None,
-            "skimg_timefeats": None,
+            "sat_tensor": sat_tensor,
+            "sat_timefeats": sat_timefeats,
+            "skimg_tensor": sky_tensor,
+            "skimg_timefeats": sky_timefeats,
             "nwp_tensor": nwp_tensor,
             "target_pv": target_pv,
             "target_mask": target_mask,
@@ -1119,11 +1196,28 @@ def collate_batched(batch):
         "target_weather_score",
     ):
         vals = [s.get(key) for s in batch]
-        if vals[0] is None:
-            if not all(v is None for v in vals):
-                raise ValueError(f"collate_batched: mixed None and tensor for {key!r}")
+        non_none = [v for v in vals if v is not None]
+        if not non_none:
             out[key] = None
-        else:
-            out[key] = torch.stack(vals)
+            continue
+        template = non_none[0]
+        if not torch.is_tensor(template):
+            kinds = [type(v).__name__ for v in vals]
+            raise TypeError(f"collate_batched: key {key!r} must be tensor/None, got {kinds}")
+        filled: list[torch.Tensor] = []
+        for v in vals:
+            if v is None:
+                filled.append(torch.zeros_like(template))
+            else:
+                if not torch.is_tensor(v):
+                    kinds = [type(x).__name__ for x in vals]
+                    raise TypeError(f"collate_batched: key {key!r} must be tensor/None, got {kinds}")
+                if tuple(v.shape) != tuple(template.shape):
+                    raise ValueError(
+                        f"collate_batched: shape mismatch for {key!r}: "
+                        f"expected {tuple(template.shape)}, got {tuple(v.shape)}"
+                    )
+                filled.append(v)
+        out[key] = torch.stack(filled)
     return out
 

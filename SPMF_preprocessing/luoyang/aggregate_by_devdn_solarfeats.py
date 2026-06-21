@@ -10,10 +10,6 @@ Aggregate 365 daily CSV files by devDn:
   from collectTime (UTC) + device lat/lon via pvlib:
   solar_zenith, solar_azimuth, local_solar_time, day_of_year, hour_of_day.
   day_of_year and hour_of_day are taken from local solar time.
-- ``weather_score``: station-level PV slope-jitter in [0, 1] (~1 = slopes jump violently /
-  cloudy-unstable, ~0 = slopes change smoothly / sunny); identical across all devDn at
-  the same ``collectTime``. In a ±1h window, consecutive 5-min slopes are compared;
-  smooth slope evolution scores low, erratic slope changes score high. Night: 0.
 
 Each daily file is read once; staging CSVs on disk then one devDn at a time in RAM
 for the final grid. Staging is deleted when done.
@@ -43,6 +39,7 @@ import pvlib
 _logged_empty_csv_paths: Set[Path] = set()
 
 STAGING_DIRNAME = "_staging_by_devdn"
+STATION_TOTAL_FILENAME = "NE_totel.csv"
 
 # Source tables use China wall time (UTC+8, no DST).
 CN_UTC_OFFSET = timedelta(hours=8)
@@ -70,19 +67,12 @@ NUMERIC_COL_NAMES = [
 SOLAR_EXTRA_COLS = [
     "solar_zenith", "solar_azimuth", "local_solar_time",
     "day_of_year", "hour_of_day", "p_cs", "kt", "kt_mask", "p_mean",
-    "weather_score",
 ]
 OUTPUT_HEADER = HEADER + SOLAR_EXTRA_COLS
 
 # Minimum normalized clear-sky POA (``p_cs``) to treat a timestep as daytime.
-# Shared by per-inverter ``kt_mask`` and station-level ``weather_score``.
+# Shared by per-inverter ``kt_mask``.
 P_CS_DAYTIME_THRESHOLD = 0.1
-
-# ``weather_score``: ±1h window on the 5-min grid (12 steps each side → 25 points).
-WEATHER_WINDOW_HALF_STEPS = 12
-WEATHER_WINDOW_SIZE = 2 * WEATHER_WINDOW_HALF_STEPS + 1
-WEATHER_WINDOW_MIN_PERIODS = 13
-WEATHER_NORM_PERCENTILE = 95.0
 
 
 def format_ts(dt):
@@ -365,6 +355,194 @@ def zero_like_row():
     return {k: "0" if k in NUMERIC_COL_NAMES else "" for k in HEADER}
 
 
+def zero_like_output_row():
+    row = {k: "0" if k in NUMERIC_COL_NAMES else "" for k in HEADER}
+    row.update(
+        {
+            "solar_zenith": "0",
+            "solar_azimuth": "0",
+            "local_solar_time": "",
+            "day_of_year": "0",
+            "hour_of_day": "0",
+            "p_cs": "0",
+            "kt": "0",
+            "kt_mask": "0",
+            "p_mean": "0",
+        }
+    )
+    return row
+
+
+def _station_partial_add(partials: dict, collect_time: str, row: dict) -> None:
+    p = partials.get(collect_time)
+    if p is None:
+        p = {
+            "n": 0,
+            "stationCode": "",
+            "lat_sum": 0.0,
+            "lat_n": 0,
+            "lon_sum": 0.0,
+            "lon_n": 0,
+            "capacity_sum": 0.0,
+            "inverter_state_sum": 0.0,
+            "efficiency_sum": 0.0,
+            "temperature_sum": 0.0,
+            "power_factor_sum": 0.0,
+            "elec_freq_sum": 0.0,
+            "active_power_sum": 0.0,
+            "reactive_power_sum": 0.0,
+            "day_cap_sum": 0.0,
+            "mppt_power_sum": 0.0,
+            "total_cap_sum": 0.0,
+            "mppt_total_cap_sum": 0.0,
+            "p_mean_sum": 0.0,
+            "solar_zenith": "0",
+            "solar_azimuth": "0",
+            "local_solar_time": "",
+            "day_of_year": "0",
+            "hour_of_day": "0",
+            "p_cs": "0",
+            "kt_mask": "0",
+        }
+        partials[collect_time] = p
+
+    p["n"] += 1
+
+    station_code = (row.get("stationCode") or "").strip()
+    if station_code and not p["stationCode"]:
+        p["stationCode"] = station_code
+
+    lat = parse_float(row.get("latitude_device", "0"))
+    lon = parse_float(row.get("longitude_device", "0"))
+    p["lat_sum"] += lat
+    p["lon_sum"] += lon
+    p["lat_n"] += 1
+    p["lon_n"] += 1
+
+    p["capacity_sum"] += parse_float(row.get("capacity", "0"))
+    p["inverter_state_sum"] += parse_float(row.get("inverter_state", "0"))
+    p["efficiency_sum"] += parse_float(row.get("efficiency", "0"))
+    p["temperature_sum"] += parse_float(row.get("temperature", "0"))
+    p["power_factor_sum"] += parse_float(row.get("power_factor", "0"))
+    p["elec_freq_sum"] += parse_float(row.get("elec_freq", "0"))
+    p["active_power_sum"] += parse_float(row.get("active_power", "0"))
+    p["reactive_power_sum"] += parse_float(row.get("reactive_power", "0"))
+    p["day_cap_sum"] += parse_float(row.get("day_cap", "0"))
+    p["mppt_power_sum"] += parse_float(row.get("mppt_power", "0"))
+    p["total_cap_sum"] += parse_float(row.get("total_cap", "0"))
+    p["mppt_total_cap_sum"] += parse_float(row.get("mppt_total_cap", "0"))
+    p["p_mean_sum"] += parse_float(row.get("p_mean", "0"))
+
+    # Solar/time fields are station-shared in this pipeline; keep first non-empty.
+    for k in (
+        "solar_zenith",
+        "solar_azimuth",
+        "local_solar_time",
+        "day_of_year",
+        "hour_of_day",
+        "p_cs",
+        "kt_mask",
+    ):
+        v = (row.get(k) or "").strip()
+        if v and (not p[k] or p[k] in ("0", "")):
+            p[k] = v
+
+
+def _station_partial_finalize(p: dict, collect_time: str) -> dict:
+    n = max(1, int(p["n"]))
+    lat = (p["lat_sum"] / p["lat_n"]) if p["lat_n"] else 0.0
+    lon = (p["lon_sum"] / p["lon_n"]) if p["lon_n"] else 0.0
+    p_cs = parse_float(p.get("p_cs", "0"))
+    p_mean = p["p_mean_sum"]
+    kt_mask = 1 if parse_float(p.get("kt_mask", "0")) > 0.5 else 0
+    kt = 0.0
+    if kt_mask:
+        kt = p["active_power_sum"] / (p_cs * p_mean + 1e-6)
+
+    return {
+        "stationCode": p["stationCode"],
+        "latitude_device": fmt_number(lat),
+        "longitude_device": fmt_number(lon),
+        "capacity": fmt_number(p["capacity_sum"]),
+        "collectTime": collect_time,
+        "devDn": "NE=total",
+        "inverter_state": fmt_number(p["inverter_state_sum"] / n, as_int=True),
+        "efficiency": fmt_number(p["efficiency_sum"] / n),
+        "temperature": fmt_number(p["temperature_sum"] / n),
+        "power_factor": fmt_number(p["power_factor_sum"] / n),
+        "elec_freq": fmt_number(p["elec_freq_sum"] / n),
+        "active_power": fmt_number(p["active_power_sum"]),
+        "reactive_power": fmt_number(p["reactive_power_sum"]),
+        "day_cap": fmt_number(p["day_cap_sum"]),
+        "mppt_power": fmt_number(p["mppt_power_sum"]),
+        "total_cap": fmt_number(p["total_cap_sum"]),
+        "mppt_total_cap": fmt_number(p["mppt_total_cap_sum"]),
+        "solar_zenith": p["solar_zenith"],
+        "solar_azimuth": p["solar_azimuth"],
+        "local_solar_time": p["local_solar_time"],
+        "day_of_year": p["day_of_year"],
+        "hour_of_day": p["hour_of_day"],
+        "p_cs": p["p_cs"],
+        "kt": f"{float(kt):.6f}",
+        "kt_mask": str(kt_mask),
+        "p_mean": f"{float(p_mean):.6f}",
+    }
+
+
+def write_station_total_csv(output_dir: Path) -> None:
+    """Build station-level summary CSV from existing per-devDn output CSVs."""
+    dev_paths = sorted(
+        p
+        for p in output_dir.glob("*.csv")
+        if p.name != STATION_TOTAL_FILENAME
+    )
+    if not dev_paths:
+        print(f"No per-devDn CSVs found in {output_dir}; skip {STATION_TOTAL_FILENAME}")
+        return
+
+    n_files = len(dev_paths)
+    print(
+        f"Building {STATION_TOTAL_FILENAME} from {n_files} device files "
+        "(streaming, one file at a time)..."
+    )
+    partials: dict = {}
+    for path in dev_paths:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                ct = (row.get("collectTime") or "").strip()
+                if not ct:
+                    continue
+                _station_partial_add(partials, ct, row)
+
+    keys = ordered_utc_collect_time_keys()
+    out_path = output_dir / STATION_TOTAL_FILENAME
+    with open(out_path, "w", encoding="utf-8", newline="") as out:
+        writer = csv.DictWriter(out, fieldnames=OUTPUT_HEADER)
+        writer.writeheader()
+        z = zero_like_output_row()
+        for utc_key in keys:
+            p = partials.get(utc_key)
+            n_have = 0 if p is None else int(p["n"])
+            need = n_files - n_have
+            if need < 0:
+                raise ValueError(
+                    f"{STATION_TOTAL_FILENAME}: more than {n_files} rows for {utc_key!r} "
+                    "(duplicate collectTime in one device file?)"
+                )
+            if p is None:
+                p = {"n": 0}
+                partials[utc_key] = p
+            if need > 0:
+                zr = z.copy()
+                zr["collectTime"] = utc_key
+                for _ in range(need):
+                    _station_partial_add(partials, utc_key, zr)
+                p = partials[utc_key]
+            writer.writerow(_station_partial_finalize(p, utc_key))
+    print(f"Wrote {out_path}")
+
+
 def load_active_power_series(staging_path: Path, utc_keys: list) -> np.ndarray:
     """Read one staging CSV into an ``active_power`` array aligned with ``utc_keys``."""
     time_to_row, _ = load_staging_to_time_to_row(staging_path)
@@ -375,78 +553,6 @@ def load_active_power_series(staging_path: Path, utc_keys: list) -> np.ndarray:
         ],
         dtype=np.float64,
     )
-
-
-def _slope_jump_std(segment: np.ndarray) -> float:
-    """Std of consecutive slope changes within a power segment (>=3 points)."""
-    if segment.size < 3:
-        return np.nan
-    slopes = np.diff(segment)
-    if slopes.size < 2:
-        return np.nan
-    return float(np.std(np.diff(slopes)))
-
-
-def compute_station_weather_score(
-    unique_devdns: list,
-    staging_dir: Path,
-    p_cs_arr: np.ndarray,
-    utc_keys: list,
-) -> np.ndarray:
-    """
-    Station-level PV slope-jitter in [0, 1], shared across all devDn.
-
-    For each timestep ``t`` on the 5-min grid, take station power in [t-1h, t+1h],
-    compute slopes between adjacent samples, then measure how much those slopes jump
-    from one interval to the next (std of slope differences). Smooth clear-sky ramps
-    change slope gradually → low score; cloud-driven up/down swings → high score.
-
-        station_power[t] = sum_i active_power_i(t)
-        slopes[k] = P[k+1] - P[k]   (within window)
-        jumps[k] = slopes[k+1] - slopes[k]
-        raw[t] = std(jumps) / (p_cs[t] * sum_i p_mean_i + eps)
-        weather_score[t] = clip(raw[t] / p95_daytime, 0, 1) * kt_mask[t]
-
-    Night timesteps (``p_cs <= P_CS_DAYTIME_THRESHOLD``) are set to 0.
-    """
-    n = len(utc_keys)
-    station_power = np.zeros(n, dtype=np.float64)
-    station_scale = 0.0  # sum_i p_mean_i
-
-    for devdn in unique_devdns:
-        active_power_arr = load_active_power_series(
-            staging_dir / safe_devdn_filename(devdn), utc_keys
-        )
-        station_power += active_power_arr
-        station_scale += float(active_power_arr.mean())
-
-    expected = p_cs_arr * station_scale
-    scale = np.maximum(expected, 1e-6)
-    hw = WEATHER_WINDOW_HALF_STEPS
-    raw = np.full(n, np.nan, dtype=np.float64)
-
-    for i in range(n):
-        lo = max(0, i - hw)
-        hi = min(n, i + hw + 1)
-        seg = station_power[lo:hi]
-        jump_std = _slope_jump_std(seg)
-        if np.isnan(jump_std):
-            continue
-        raw[i] = jump_std / scale[i]
-
-    kt_mask = (p_cs_arr > P_CS_DAYTIME_THRESHOLD).astype(np.float64)
-    daytime = kt_mask > 0
-    if not np.any(daytime):
-        return np.zeros(n, dtype=np.float64)
-
-    valid_day = daytime & np.isfinite(raw)
-    if not np.any(valid_day):
-        return np.zeros(n, dtype=np.float64)
-
-    p95 = float(np.percentile(raw[valid_day], WEATHER_NORM_PERCENTILE))
-    weather_score = np.clip(raw / (p95 + 1e-6), 0.0, 1.0)
-    weather_score = np.nan_to_num(weather_score, nan=0.0) * kt_mask
-    return weather_score
 
 
 def main(input_dir: Path, output_dir: Path, lat: float, lon: float):
@@ -497,12 +603,7 @@ def main(input_dir: Path, output_dir: Path, lat: float, lon: float):
         p_cs_arr = np.asarray(sun["p_cs"], dtype=np.float64)
         utc_keys = ordered_utc_collect_time_keys()
 
-        print("Pass 2a/2: computing station-level weather_score (shared across all devDn)...")
-        weather_score_arr = compute_station_weather_score(
-            unique_devdns, staging_dir, p_cs_arr, utc_keys
-        )
-
-        print("Pass 2b/2: fill 5-min grid from staging (one devDn at a time)...")
+        print("Pass 2/2: fill 5-min grid from staging (one devDn at a time)...")
         for idx, devdn in enumerate(unique_devdns):
             print(f"Processing devDn {idx + 1}/{len(unique_devdns)}: {devdn}")
 
@@ -543,13 +644,14 @@ def main(input_dir: Path, output_dir: Path, lat: float, lon: float):
                     row["kt"] = f"{float(kt[i]):.6f}"
                     row["kt_mask"] = str(int(kt_mask[i]))
                     row["p_mean"] = f"{p_mean:.6f}"
-                    row["weather_score"] = f"{float(weather_score_arr[i]):.6f}"
                     writer.writerow(row)
     finally:
         shutil.rmtree(staging_dir, ignore_errors=True)
 
+    write_station_total_csv(output_dir)
+
     print(f"Done. Output directory: {output_dir}")
-    print(f"Per-devDn files: {len(unique_devdns)}")
+    print(f"Per-devDn files: {len(unique_devdns)}, plus {STATION_TOTAL_FILENAME}")
 
 
 def parse_args():

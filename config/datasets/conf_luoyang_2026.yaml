@@ -1,0 +1,26 @@
+paths:
+  data_dir: "/mnt/nfs/slurm/home/yuan/datasets/luoyang_2026_SPMF"
+  pv_path: pv
+  sky_image_path: luoyangASI_skimg_zarr
+  sat_path: luoyang_sat_zarr
+  nwp_path: NWP
+
+sampling:
+  train_samples_per_csv: 20
+  csv_interval_min: 5
+  pv_input_interval_min: 5
+  pv_input_len: 576
+  pv_output_interval_min: 15
+  pv_output_len: 192
+  test_anchor_stride_min: 1200
+  val_anchor_stride_min: 1200
+  test_collect_time_match_tolerance_min: 0
+  skyimg_window_size: 30
+  skyimg_time_resolution_min: 1
+  satimg_window_size: 24
+  satimg_time_resolution_min: 10
+
+split_policy:
+  test_start_bj: "2026-05-11 00:00:00"
+  train_fraction: 0.85
+  val_fraction: 0.15

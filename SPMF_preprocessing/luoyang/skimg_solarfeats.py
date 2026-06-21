@@ -2,6 +2,7 @@
 Convert UTC-timestamped sky images into a zarr dataset with:
 1) `images`: RGB tensors with shape (time, 3, H, W)
 2) `solarfeats`: [solar_zenith, solar_azimuth, day_of_year, hour_of_day]
+   plus per-variable aliases: `zenith`, `azimuth`, `day_of_year`, `hour_of_day`
 3) `local_solar_time`: local apparent solar time in unix nanoseconds
 
 Input image filenames must follow `yyyymmddhhmmss` (UTC+0), e.g. `20250101000000.jpg`.
@@ -11,9 +12,9 @@ time are filled with all-zero RGB frames.
 
 Run examples:
   # Fill missing timestamps with zero frames (default behavior)
-  micromamba run -n SimVP python SPMF_preprocessing/luoyang/empty_skimg_solarfeats.py \
-    --input-dir /path/to/images \
-    --output-zarr /path/to/output.zarr \
+  python ./SPMF_preprocessing/luoyang/skimg_solarfeats.py \
+    --input-dir ~/datasets/hwcloud_luoyang_processed/skyimg/asi16/asi_16613 \
+    --output-zarr ~/datasets/luoyang_2026_SPMF/skimg_zarr \
     --lat 34.68 --lon 112.45 \
     --resize-size 224 224 \
     --fill-missing
@@ -120,7 +121,9 @@ def read_rgb(path: Path, image_h: int, image_w: int) -> np.ndarray:
     return np.transpose(rgb, (2, 0, 1))
 
 
-def compute_solarfeats(ts_chunk: pd.DatetimeIndex, lat: float, lon: float) -> tuple[np.ndarray, np.ndarray]:
+def compute_solarfeats(
+    ts_chunk: pd.DatetimeIndex, lat: float, lon: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     solpos = solarposition.get_solarposition(ts_chunk, latitude=lat, longitude=lon)
     zenith_arr = solpos["apparent_zenith"].to_numpy(dtype=np.float32)
     azimuth_arr = solpos["azimuth"].to_numpy(dtype=np.float32)
@@ -138,7 +141,14 @@ def compute_solarfeats(ts_chunk: pd.DatetimeIndex, lat: float, lon: float) -> tu
         [zenith_arr, azimuth_arr, day_of_year_arr, hour_of_day_arr],
         axis=1,
     ).astype(np.float32)
-    return solarfeats, local_solar_time_arr
+    return (
+        solarfeats,
+        local_solar_time_arr,
+        zenith_arr,
+        azimuth_arr,
+        day_of_year_arr,
+        hour_of_day_arr,
+    )
 
 
 def write_zarr(
@@ -169,13 +179,27 @@ def write_zarr(
             else:
                 images[i] = read_rgb(path, image_h=image_h, image_w=image_w)
 
-        solarfeats_arr, local_solar_time_arr = compute_solarfeats(ts_chunk, lat, lon)
+        (
+            solarfeats_arr,
+            local_solar_time_arr,
+            zenith_arr,
+            azimuth_arr,
+            day_of_year_arr,
+            hour_of_day_arr,
+        ) = compute_solarfeats(ts_chunk, lat, lon)
         ts_datetime_utc = ts_chunk.tz_convert("UTC").tz_localize(None).to_numpy(dtype="datetime64[ns]")
 
         ds_chunk = xr.Dataset(
             data_vars={
                 "images": (("time_utc", "channel", "H", "W"), images),
                 "solarfeats": (("time_utc", "solar_feature"), solarfeats_arr),
+                # Backward/forward compatibility:
+                # - luoyang_zarr.py reads these standalone variables.
+                # - existing paths can still consume "solarfeats".
+                "zenith": (("time_utc",), zenith_arr),
+                "azimuth": (("time_utc",), azimuth_arr),
+                "day_of_year": (("time_utc",), day_of_year_arr),
+                "hour_of_day": (("time_utc",), hour_of_day_arr),
                 "local_solar_time": (("time_utc",), local_solar_time_arr),
             },
             coords={

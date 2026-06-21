@@ -538,6 +538,18 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
     )
     parser.add_argument("--batch_size", type=int, default=int(h["batch_size"]))
     parser.add_argument("--checkpoint_dir", type=str, default=None)
+    parser.add_argument(
+        "--init-checkpoint",
+        type=str,
+        default=None,
+        help="Initialize model weights from checkpoint and start a fresh finetune run.",
+    )
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=str,
+        default=None,
+        help="Resume training from checkpoint (model + optimizer + scheduler + epoch).",
+    )
     parser.add_argument("--save_every", type=int, default=int(h["save_every"]))
     parser.add_argument(
         "--num_workers",
@@ -631,6 +643,8 @@ def main() -> None:
 
     parser = _build_parser(h, config_default=pre_args.config)
     args = parser.parse_args()
+    if args.init_checkpoint and args.resume_checkpoint:
+        raise ValueError("Use only one of --init-checkpoint or --resume-checkpoint, not both.")
 
     # =========================================================================
     # Dataset selection: change DATASET_CLS to a different Dataset class and
@@ -670,6 +684,32 @@ def main() -> None:
     ema: ModelEMA | None = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
     print(f"EMA: {'enabled' if args.use_ema else 'disabled'}"
           + (f" (decay={args.ema_decay}, warmup={args.ema_warmup_epochs} epoch)" if args.use_ema else ""))
+
+    start_epoch = 1
+    best_val_loss = float("inf")
+    if args.resume_checkpoint:
+        resume_path = Path(args.resume_checkpoint).expanduser().resolve()
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"resume checkpoint not found: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
+        best_val_loss = float(ckpt.get("val_loss", best_val_loss))
+        print(
+            f"Resumed training from {resume_path} "
+            f"(epoch={ckpt.get('epoch', '?')}, start_epoch={start_epoch}, best_val_loss={best_val_loss:.6f})"
+        )
+    elif args.init_checkpoint:
+        init_path = Path(args.init_checkpoint).expanduser().resolve()
+        if not init_path.is_file():
+            raise FileNotFoundError(f"init checkpoint not found: {init_path}")
+        ckpt = torch.load(init_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        print(f"Initialized model weights from {init_path}; starting finetune from epoch 1.")
 
     train_loader = DataLoader(
         train_dataset,
@@ -715,8 +755,12 @@ def main() -> None:
     # initial_test_loss, _, _ = evaluate(model, device, test_loader, criterion)
     # print(f"Initial test loss: {initial_test_loss:.6f}")
 
-    best_val_loss = float("inf")
-    for epoch in range(1, args.epochs + 1):
+    if start_epoch > args.epochs:
+        print(
+            f"start_epoch ({start_epoch}) > epochs ({args.epochs}); "
+            "skipping training loop and running best-checkpoint test evaluation only."
+        )
+    for epoch in range(start_epoch, args.epochs + 1):
         cur_lr = optimizer.param_groups[0]["lr"]
         ema_active = ema is not None and epoch > args.ema_warmup_epochs
         if ema is not None and not ema_active:

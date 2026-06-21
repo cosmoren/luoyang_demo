@@ -1,5 +1,5 @@
 training:
-  epochs: 20
+  epochs: 50
   lr: 1e-4
   batch_size: 64
   save_every: 5
