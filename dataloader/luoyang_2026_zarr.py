@@ -226,6 +226,7 @@ class PVDataset(Dataset):
         val_fraction: float = 0.15,
         test_start_bj: str = "2026-05-11 00:00:00",
         max_files: int | None = None,
+        sample_file_subset: list[Path | str] | None = None,
     ) -> None:
         if split not in ("train", "val", "test"):
             raise ValueError("split must be train|val|test")
@@ -327,7 +328,16 @@ class PVDataset(Dataset):
         self._dev_idx_map = {d: i for i, d in enumerate(self.devDn_list)}
 
         self.sample_files = all_files
-        if max_files is not None and int(max_files) > 0:
+        if sample_file_subset is not None:
+            path_by_resolved = {p.resolve(): p for p in all_files}
+            subset: list[Path] = []
+            for raw in sample_file_subset:
+                key = Path(raw).resolve()
+                if key not in path_by_resolved:
+                    raise FileNotFoundError(f"sample_file_subset path not under pv_dir: {raw}")
+                subset.append(path_by_resolved[key])
+            self.sample_files = subset
+        elif max_files is not None and int(max_files) > 0:
             self.sample_files = self.sample_files[: int(max_files)]
         if not self.sample_files:
             raise FileNotFoundError(f"No CSV files found in {self._pv_dir}")
@@ -339,6 +349,19 @@ class PVDataset(Dataset):
         self._init_anchor_tables(ref_df)
         self._build_split_masks(ref_df)
         self._prefilter_files()
+        self._skipped_sample_template: dict | None = None
+        if self.split in ("val", "test"):
+            self._window_skip_warned_files: set[str] = set()
+            ref_key = self.sample_files[0].resolve().as_posix()
+            ref_df_keep = self._csv_cache[ref_key]
+            r0 = int(
+                self._test_r_indices[0] if self.split == "test" else self._val_r_indices[0]
+            )
+            tpl = self._build_sample(ref_df_keep, torch.tensor(0, dtype=torch.long), r0)
+            tpl["sample_valid"] = torch.tensor(0.0, dtype=torch.float32)
+            tpl["target_mask"] = torch.zeros_like(tpl["target_mask"])
+            tpl["pv_mask"] = torch.zeros_like(tpl["pv_mask"])
+            self._skipped_sample_template = tpl
 
     def _init_anchor_tables(self, ref_df: pd.DataFrame) -> None:
         n = len(ref_df)
@@ -448,7 +471,6 @@ class PVDataset(Dataset):
         self.sample_files = keep_files
         self._csv_cache = keep_cache
         self._valid_anchor_rows = valid_anchor_rows
-        self._time_match_warned_files: set[str] = set()
         if not self.sample_files:
             raise RuntimeError(f"No CSV files left after prefilter for split={self.split}")
 
@@ -495,6 +517,43 @@ class PVDataset(Dataset):
         if best_d > self._test_collect_tolerance_ns:
             raise ValueError(f"{csv_name}: no timestamp within tolerance for target {target_ts}")
         return int(best)
+
+    def _anchor_row_in_bounds(self, n_rows: int, j: int) -> bool:
+        """True when row j can host the full PV input/output window in a CSV of length n_rows."""
+        j = int(j)
+        n_rows = int(n_rows)
+        min_x = j + int(self._x_tail_1d[0])
+        max_y = j + int(self._y_off_1d[-1])
+        return min_x >= 0 and max_y < n_rows
+
+    def _try_build_sample_for_split_window(
+        self,
+        df: pd.DataFrame,
+        dev_idx: torch.Tensor,
+        r_fixed: int,
+        t_ref: pd.Timestamp,
+        csv_name: str,
+    ) -> dict | None:
+        try:
+            j = self._row_index_for_collect_time_match(df["collectTime"], t_ref, csv_name)
+        except ValueError:
+            return None
+        if not self._anchor_row_in_bounds(len(df), j):
+            return None
+        try:
+            return self._build_sample(df, dev_idx, r_fixed, anchor_last_row=j)
+        except IndexError:
+            return None
+
+    def _skipped_sample(self, dev_idx: torch.Tensor) -> dict:
+        assert self._skipped_sample_template is not None
+        out = {
+            k: (v.clone() if isinstance(v, torch.Tensor) else v)
+            for k, v in self._skipped_sample_template.items()
+        }
+        out["dev_idx"] = dev_idx
+        out["sample_valid"] = torch.tensor(0.0, dtype=torch.float32)
+        return out
 
     def _build_sample(self, df: pd.DataFrame, dev_idx: torch.Tensor, r: int, *, anchor_last_row: int | None = None) -> dict:
         if anchor_last_row is None:
@@ -711,6 +770,7 @@ class PVDataset(Dataset):
             "target_p_cs": target_p_cs,
             "target_weather_ghi": target_weather_ghi,
             "target_theory_ghi": target_theory_ghi,
+            "sample_valid": torch.tensor(1.0, dtype=torch.float32),
         }
 
     def __getitem__(self, idx: int) -> dict:
@@ -739,43 +799,34 @@ class PVDataset(Dataset):
         assert r_fixed is not None
         if self.split == "val":
             assert self._val_last_x_time_ref is not None
-            t_ref = self._val_last_x_time_ref[idx % self._num_val_windows]
             nw = self._num_val_windows
+            t_ref = self._val_last_x_time_ref[idx % nw]
         else:
             assert self._test_last_x_time_ref is not None
-            t_ref = self._test_last_x_time_ref[idx % self._num_test_windows]
             nw = self._num_test_windows
+            t_ref = self._test_last_x_time_ref[idx % nw]
 
-        # Guard for files that do not cover the reference timestamp (e.g., start after 2025-01-01).
-        # Instead of crashing the whole DataLoader worker, try next files for the same window.
-        file_start = idx // nw
-        n_files = len(self.sample_files)
-        last_err: Exception | None = None
-        for off in range(n_files):
-            file_idx = (file_start + off) % n_files
-            p = self.sample_files[file_idx]
-            k = p.resolve().as_posix()
-            dfi = self._csv_cache[k]
-            dev_dn_i = p.stem.replace("_", "=")
-            dev_idx_i = torch.tensor(self._dev_idx_map[dev_dn_i], dtype=torch.long)
-            try:
-                j = self._row_index_for_collect_time_match(dfi["collectTime"], t_ref, p.name)
-                return self._build_sample(dfi, dev_idx_i, r_fixed, anchor_last_row=j)
-            except ValueError as e:
-                last_err = e
-                if p.name not in self._time_match_warned_files:
-                    self._time_match_warned_files.add(p.name)
-                    print(
-                        f"[PVDataset2026] WARNING: skip file {p.name} for split={self.split} "
-                        f"because reference time {t_ref} is unmatched ({e})",
-                        flush=True,
-                    )
-                continue
+        file_idx = idx // nw
+        p = self.sample_files[file_idx]
+        k = p.resolve().as_posix()
+        dfi = self._csv_cache[k]
+        dev_dn_i = p.stem.replace("_", "=")
+        dev_idx_i = torch.tensor(self._dev_idx_map[dev_dn_i], dtype=torch.long)
 
-        raise RuntimeError(
-            f"All files failed time matching for split={self.split}, idx={idx}, t_ref={t_ref}. "
-            f"Last error: {last_err}"
+        sample = self._try_build_sample_for_split_window(
+            dfi, dev_idx_i, r_fixed, t_ref, p.name
         )
+        if sample is not None:
+            return sample
+
+        if p.name not in self._window_skip_warned_files:
+            self._window_skip_warned_files.add(p.name)
+            print(
+                f"[PVDataset2026] WARNING: {p.name} has windows skipped for split={self.split} "
+                f"(time mismatch or CSV too short for full input/output window)",
+                flush=True,
+            )
+        return self._skipped_sample(dev_idx_i)
 
 
 def collate_batched(batch: list[dict]) -> dict:
@@ -829,6 +880,8 @@ def collate_batched(batch: list[dict]) -> dict:
         "target_weather_ghi": _stack("target_weather_ghi"),
         "target_theory_ghi": _stack("target_theory_ghi"),
     }
+    if "sample_valid" in batch[0]:
+        out["sample_valid"] = _stack("sample_valid")
     sat_tensor, sat_timefeats, sat_valid_mask = _collate_img_modality(
         "sat_tensor",
         "sat_timefeats",

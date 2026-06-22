@@ -1,5 +1,5 @@
 paths:
-  data_dir: "/mnt/nfs/slurm/home/yuan/datasets/luoyang_2026_SPMF"
+  data_dir: "/work/datasets/luoyang_2026_SPMF"
   pv_path: pv
   sky_image_path: luoyangASI_skimg_zarr
   sat_path: luoyang_sat_zarr
