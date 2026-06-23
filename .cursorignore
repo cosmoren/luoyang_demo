@@ -1,2 +1,7 @@
 runs/
 checkpoints/
+checkpoints_*/
+checkpoint_*/
+runs_*/
+inference_results/
+runs/

@@ -6,6 +6,8 @@ For each inverter and each test anchor window, run the trained model and save:
   * station-total CSV: same times with summed pred/truth across inverters
   * prints station-level total-power RMSE at the end
 
+Window-major inference (zarr / cache) appends CSV rows after each window completes.
+
 By default ``--stride_min 5`` rolls one anchor every 5 minutes (dense coverage).
 Use ``--stride_min 1200`` to match the sparse test stride in conf_luoyang_2026.yaml.
 
@@ -13,15 +15,24 @@ Multi-GPU: shard inverters across GPUs (one process per GPU). Each GPU loads onl
 its CSV subset and writes inverter CSVs; rank 0 merges station totals.
 
 Quick run examples:
-  python inference/inference_luoyang2026.py --task 15m --checkpoint checkpoint_2026_fixedhuber/pv_forecast_vit_best_task_15m_gpu0.pt
-  CUDA_VISIBLE_DEVICES=0,1,2,3 python inference/inference_luoyang2026.py --task 15m --checkpoint ... --num_gpus 4
-  python inference/inference_luoyang2026.py --task 4h --checkpoint checkpoint_2026_fixedhuber/pv_forecast_vit_best_task_4h_gpu6.pt
+python inference/inference_luoyang2026.py \
+  --task 15m \
+  --checkpoint checkpoint_2026_fixedhuber/pv_forecast_vit_best_task_15m_gpu0.pt \
+  --dataset-config conf_luoyang_2026.yaml \
+  --stride_min 5 \
+  --batch_size 256 \
+  --cache_dir inference_cache/luoyang2026_test_cache \
+  --profile_every 100 \
+  --output_dir inference_results/luoyang2026_15m_fullcache
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import contextlib
+import hashlib
+import json
 import shutil
 import sys
 import time
@@ -38,7 +49,12 @@ from torch.utils.data import DataLoader
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from dataloader.luoyang_2026_zarr import PVDataset, collate_batched, list_csv_files  # noqa: E402
+from dataloader.luoyang_2026_zarr import (  # noqa: E402
+    PVDataset,
+    collate_batched,
+    collate_with_shared_sat_sky,
+    list_csv_files,
+)
 from models.models import pv_forecasting_model_vit_imgs  # noqa: E402
 from training.train_vit_luoyang2026 import (  # noqa: E402
     TASK_TO_INDEX,
@@ -66,6 +82,9 @@ class InferWorkerConfig:
     max_inverters: int | None
     limit_batches: int | None
     horizon_idx: int
+    cache_dir: str | None
+    cache_full: bool
+    profile_every: int
 
 
 def _dataset_kwargs_for_infer(
@@ -80,6 +99,7 @@ def _dataset_kwargs_for_infer(
     kwargs["test_anchor_stride_min"] = int(test_stride_min_override)
     if sample_file_subset is not None:
         kwargs["sample_file_subset"] = sample_file_subset
+    kwargs["enable_sat_sky_cache"] = True
     return kwargs
 
 
@@ -111,6 +131,184 @@ def _forecast_times_for_windows(
         utc_strs.append(forecast_utc.isoformat())
         bj_strs.append(forecast_bj.isoformat())
     return utc_strs, bj_strs
+
+
+def _to_utc_iso(ts: pd.Timestamp) -> str:
+    t = pd.Timestamp(ts)
+    if t.tzinfo is None:
+        t = t.tz_localize("UTC")
+    else:
+        t = t.tz_convert("UTC")
+    return t.isoformat()
+
+
+def _cfg_sha256(cfg_path: Path) -> str:
+    text = cfg_path.read_text(encoding="utf-8")
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _load_cache_manifest(cache_dir: Path) -> dict:
+    manifest_path = cache_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"cache manifest not found: {manifest_path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"invalid cache manifest json: {manifest_path} ({e})") from e
+    if not isinstance(manifest, dict):
+        raise TypeError(f"cache manifest must be JSON object: {manifest_path}")
+    return manifest
+
+
+def _load_sat_sky_cache_window(
+    cache_dir: Path,
+    win_idx: int,
+    *,
+    expected_time_utc: str | None = None,
+) -> dict[str, torch.Tensor | None]:
+    pt_path = cache_dir / "windows" / f"win_{int(win_idx):05d}.pt"
+    if not pt_path.is_file():
+        raise FileNotFoundError(f"cache window file not found: {pt_path}")
+    try:
+        rec = torch.load(pt_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        rec = torch.load(pt_path, map_location="cpu")
+    if not isinstance(rec, dict):
+        raise TypeError(f"invalid cache window content (expect dict): {pt_path}")
+    required = (
+        "sat_tensor",
+        "sat_timefeats",
+        "sat_valid_mask",
+        "skimg_tensor",
+        "skimg_timefeats",
+        "skimg_valid_mask",
+    )
+    missing = [k for k in required if k not in rec]
+    if missing:
+        raise KeyError(f"{pt_path} missing required keys: {missing}")
+    time_utc = rec.get("time_utc")
+    if expected_time_utc is not None and time_utc is not None and str(time_utc) != str(expected_time_utc):
+        raise ValueError(
+            f"cache window time mismatch at win={win_idx}: cache={time_utc} expected={expected_time_utc}"
+        )
+    sat_valid_mask = rec["sat_valid_mask"]
+    skimg_valid_mask = rec["skimg_valid_mask"]
+    if not isinstance(sat_valid_mask, torch.Tensor) or sat_valid_mask.numel() == 0:
+        raise ValueError(f"invalid sat_valid_mask in {pt_path}")
+    if not isinstance(skimg_valid_mask, torch.Tensor) or skimg_valid_mask.numel() == 0:
+        raise ValueError(f"invalid skimg_valid_mask in {pt_path}")
+    return {
+        "sat_tensor": rec["sat_tensor"],
+        "sat_timefeats": rec["sat_timefeats"],
+        "sat_valid": torch.tensor(float(sat_valid_mask.reshape(-1)[0].item()), dtype=torch.float32),
+        "skimg_tensor": rec["skimg_tensor"],
+        "skimg_timefeats": rec["skimg_timefeats"],
+        "skimg_valid": torch.tensor(float(skimg_valid_mask.reshape(-1)[0].item()), dtype=torch.float32),
+    }
+
+
+def _load_pv_batch_cache(
+    cache_dir: Path,
+    *,
+    win_idx: int,
+    batch_idx: int,
+    file_start: int,
+    file_end: int,
+) -> dict:
+    pt_path = cache_dir / "pv_batches" / f"win_{int(win_idx):05d}" / f"batch_{int(batch_idx):03d}.pt"
+    if not pt_path.is_file():
+        raise FileNotFoundError(f"PV cache batch file not found: {pt_path}")
+    try:
+        rec = torch.load(pt_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        rec = torch.load(pt_path, map_location="cpu")
+    if not isinstance(rec, dict):
+        raise TypeError(f"invalid PV cache content (expect dict): {pt_path}")
+    required = (
+        "win_idx",
+        "file_start",
+        "file_end",
+        "dev_idx",
+        "kt",
+        "kt_mask",
+        "pv_timefeats",
+        "forecast_timefeats",
+        "target_pv",
+        "target_p_cs",
+        "p_mean",
+        "sample_valid",
+    )
+    missing = [k for k in required if k not in rec]
+    if missing:
+        raise KeyError(f"{pt_path} missing required keys: {missing}")
+    if int(rec["win_idx"]) != int(win_idx):
+        raise ValueError(f"{pt_path} win_idx mismatch: cache={rec['win_idx']} expected={win_idx}")
+    if int(rec["file_start"]) != int(file_start) or int(rec["file_end"]) != int(file_end):
+        raise ValueError(
+            f"{pt_path} file range mismatch: cache=[{rec['file_start']},{rec['file_end']}) "
+            f"expected=[{file_start},{file_end})"
+        )
+    return rec
+
+
+def _merge_cached_pv_with_sat_sky(
+    pv_batch: dict,
+    sat_sky_bundle: dict[str, torch.Tensor | None],
+) -> dict:
+    bsz = int(pv_batch["dev_idx"].shape[0])
+    out = {
+        "dev_idx": pv_batch["dev_idx"],
+        "kt": pv_batch["kt"],
+        "kt_mask": pv_batch["kt_mask"],
+        "pv_timefeats": pv_batch["pv_timefeats"],
+        "forecast_timefeats": pv_batch["forecast_timefeats"],
+        "target_pv": pv_batch["target_pv"],
+        "target_p_cs": pv_batch["target_p_cs"],
+        "p_mean": pv_batch["p_mean"],
+        "sample_valid": pv_batch["sample_valid"],
+        "nwp_tensor": pv_batch.get("nwp_tensor"),
+    }
+
+    def _expand_img(
+        tensor: torch.Tensor | None,
+        timefeats: torch.Tensor | None,
+        valid: torch.Tensor | None,
+        *,
+        default_tensor_shape: tuple[int, ...],
+        default_time_shape: tuple[int, ...],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if tensor is None:
+            tensor = torch.zeros(*default_tensor_shape, dtype=torch.float32)
+        if timefeats is None:
+            timefeats = torch.zeros(*default_time_shape, dtype=torch.float32)
+        valid_scalar = float(valid.item()) if valid is not None else 0.0
+        t_b = tensor.unsqueeze(0).expand(bsz, *tensor.shape).contiguous()
+        tf_b = timefeats.unsqueeze(0).expand(bsz, *timefeats.shape).contiguous()
+        valid_b = torch.full((bsz,), valid_scalar, dtype=torch.float32)
+        return t_b, tf_b, valid_b
+
+    sat_tensor, sat_timefeats, sat_valid_mask = _expand_img(
+        sat_sky_bundle.get("sat_tensor"),
+        sat_sky_bundle.get("sat_timefeats"),
+        sat_sky_bundle.get("sat_valid"),
+        default_tensor_shape=(24, 3, 100, 100),
+        default_time_shape=(24, 9),
+    )
+    out["sat_tensor"] = sat_tensor
+    out["sat_timefeats"] = sat_timefeats
+    out["sat_valid_mask"] = sat_valid_mask
+
+    skimg_tensor, skimg_timefeats, skimg_valid_mask = _expand_img(
+        sat_sky_bundle.get("skimg_tensor"),
+        sat_sky_bundle.get("skimg_timefeats"),
+        sat_sky_bundle.get("skimg_valid"),
+        default_tensor_shape=(30, 3, 224, 224),
+        default_time_shape=(30, 9),
+    )
+    out["skimg_tensor"] = skimg_tensor
+    out["skimg_timefeats"] = skimg_timefeats
+    out["skimg_valid_mask"] = skimg_valid_mask
+    return out
 
 
 def predict_pv_kW(model: nn.Module, d: dict) -> torch.Tensor:
@@ -317,6 +515,112 @@ def _write_station_csv(
     return station_path, rmse, n_valid
 
 
+_INVERTER_CSV_FIELDS = ("time_utc", "time_bj", "pv_pred_kW", "pv_true_kW")
+_STATION_CSV_FIELDS = ("time_utc", "time_bj", "pv_pred_kW_total", "pv_true_kW_total")
+
+
+class _IncrementalResultWriter:
+    """Append per-inverter and (optionally) station CSV rows as windows complete."""
+
+    def __init__(
+        self,
+        *,
+        out_inv_dir: Path,
+        out_dir: Path,
+        task: str,
+        inverter_names: list[str],
+        time_utc: list[str],
+        time_bj: list[str],
+        write_station: bool,
+    ) -> None:
+        self._out_inv_dir = out_inv_dir
+        self._out_dir = out_dir
+        self._task = task
+        self._inverter_names = inverter_names
+        self._time_utc = time_utc
+        self._time_bj = time_bj
+        self._write_station = write_station
+        self._inv_handles: dict[int, tuple[object, csv.DictWriter]] = {}
+        self._inv_paths_written: set[int] = set()
+        self._station_path: Path | None = None
+        self._station_handle = None
+        self._station_writer: csv.DictWriter | None = None
+        self._station_sse = 0.0
+        self._station_n = 0
+        out_inv_dir.mkdir(parents=True, exist_ok=True)
+
+    def _inverter_csv_path(self, file_idx: int) -> Path:
+        safe_name = self._inverter_names[file_idx].replace("=", "_").replace("/", "_")
+        return self._out_inv_dir / f"{safe_name}.csv"
+
+    def _get_inverter_writer(self, file_idx: int) -> csv.DictWriter:
+        if file_idx not in self._inv_handles:
+            path = self._inverter_csv_path(file_idx)
+            handle = path.open("w", newline="", encoding="utf-8")
+            writer = csv.DictWriter(handle, fieldnames=_INVERTER_CSV_FIELDS)
+            writer.writeheader()
+            self._inv_handles[file_idx] = (handle, writer)
+        return self._inv_handles[file_idx][1]
+
+    def _ensure_station_writer(self) -> csv.DictWriter:
+        if self._station_writer is None:
+            self._station_path = self._out_dir / f"station_total_{self._task}.csv"
+            self._station_handle = self._station_path.open("w", newline="", encoding="utf-8")
+            self._station_writer = csv.DictWriter(self._station_handle, fieldnames=_STATION_CSV_FIELDS)
+            self._station_writer.writeheader()
+        return self._station_writer
+
+    def flush_window(self, win_idx: int, window_preds: dict[int, tuple[float, float]]) -> None:
+        if not window_preds:
+            return
+        for file_idx, (pred, true) in window_preds.items():
+            writer = self._get_inverter_writer(file_idx)
+            writer.writerow(
+                {
+                    "time_utc": self._time_utc[win_idx],
+                    "time_bj": self._time_bj[win_idx],
+                    "pv_pred_kW": float(pred),
+                    "pv_true_kW": float(true),
+                }
+            )
+            self._inv_paths_written.add(file_idx)
+
+        for handle, _ in self._inv_handles.values():
+            handle.flush()
+
+        if self._write_station:
+            pred_sum = float(sum(p for p, _ in window_preds.values()))
+            true_sum = float(sum(t for _, t in window_preds.values()))
+            station_writer = self._ensure_station_writer()
+            station_writer.writerow(
+                {
+                    "time_utc": self._time_utc[win_idx],
+                    "time_bj": self._time_bj[win_idx],
+                    "pv_pred_kW_total": pred_sum,
+                    "pv_true_kW_total": true_sum,
+                }
+            )
+            assert self._station_handle is not None
+            self._station_handle.flush()
+            diff = pred_sum - true_sum
+            self._station_sse += diff * diff
+            self._station_n += 1
+
+    def finish(self) -> tuple[int, float, int, Path | None]:
+        for handle, _ in self._inv_handles.values():
+            handle.close()
+        self._inv_handles.clear()
+        if self._station_handle is not None:
+            self._station_handle.close()
+            self._station_handle = None
+        rmse = (
+            float(np.sqrt(self._station_sse / self._station_n))
+            if self._station_n > 0
+            else float("nan")
+        )
+        return len(self._inv_paths_written), rmse, self._station_n, self._station_path
+
+
 def _merge_station_shards(
     shard_dir: Path,
     *,
@@ -409,144 +713,365 @@ def _run_inference_shard(
     dev_dn_list = test_dataset.devDn_list
     model = _load_model(ckpt_path, device, dev_dn_list)
 
-    if worker_cfg.num_workers > 0:
-        print(
-            f"{tag} WARNING: num_workers>0 can hang on first batch (zarr + fork). "
-            f"Prefer --num_workers 0.",
-            flush=True,
+    cache_dir = Path(worker_cfg.cache_dir).expanduser().resolve() if worker_cfg.cache_dir else None
+    full_cache_mode = bool(cache_dir is not None and worker_cfg.cache_full)
+    use_shared_sat_sky = world_size == 1 or cache_dir is not None
+
+    result_writer: _IncrementalResultWriter | None = None
+    shard_pred_total: np.ndarray | None = None
+    shard_true_total: np.ndarray | None = None
+    shard_counts: np.ndarray | None = None
+    if use_shared_sat_sky:
+        result_writer = _IncrementalResultWriter(
+            out_inv_dir=out_inv_dir,
+            out_dir=out_inv_dir.parent,
+            task=worker_cfg.task,
+            inverter_names=inverter_names,
+            time_utc=time_utc,
+            time_bj=time_bj,
+            write_station=(world_size == 1 and shard_dir is None),
         )
-
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=worker_cfg.batch_size,
-        shuffle=False,
-        collate_fn=collate_batched,
-        num_workers=worker_cfg.num_workers,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=(worker_cfg.num_workers > 0),
-    )
-
-    pred_buf = {i: np.full(nw, np.nan, dtype=np.float32) for i in range(n_files)}
-    true_buf = {i: np.full(nw, np.nan, dtype=np.float32) for i in range(n_files)}
-    filled = {i: np.zeros(nw, dtype=bool) for i in range(n_files)}
+        if world_size > 1:
+            shard_pred_total = np.zeros(nw, dtype=np.float64)
+            shard_true_total = np.zeros(nw, dtype=np.float64)
+            shard_counts = np.zeros(nw, dtype=np.int32)
+        pred_buf = None
+        true_buf = None
+        filled = None
+    else:
+        pred_buf = {i: np.full(nw, np.nan, dtype=np.float32) for i in range(n_files)}
+        true_buf = {i: np.full(nw, np.nan, dtype=np.float32) for i in range(n_files)}
+        filled = {i: np.zeros(nw, dtype=bool) for i in range(n_files)}
 
     if device.type == "cuda":
         autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.float16)
     else:
         autocast_ctx = contextlib.nullcontext()
 
-    n_batches = (n_total + worker_cfg.batch_size - 1) // worker_cfg.batch_size
-    global_idx = 0
+    n_batches_per_window = (n_files + worker_cfg.batch_size - 1) // worker_cfg.batch_size
+    n_batches_total = nw * n_batches_per_window
+    n_batches_loader = (n_total + worker_cfg.batch_size - 1) // worker_cfg.batch_size
+    batch_idx_global = 0
     n_skipped = 0
-    print(f"{tag} Running inference...", flush=True)
-    batch_iter = iter(test_loader)
-    with torch.no_grad():
-        for batch_idx in range(n_batches):
-            if worker_cfg.limit_batches is not None and batch_idx >= worker_cfg.limit_batches:
-                break
-            t_batch0 = time.perf_counter()
-            batch = next(batch_iter)
-            t_data = time.perf_counter()
-            if batch_idx == 0:
-                print(
-                    f"{tag} first batch ready in {t_data - t_batch0:.1f}s "
-                    f"(data loading; GPU forward follows)",
-                    flush=True,
-                )
-            d = _batch_to_device(batch, device)
-            sample_valid = batch.get("sample_valid")
-            with autocast_ctx:
-                pv_pred = predict_pv_kW(model, d)
-            pv_pred = pv_pred.float()
-            t_gpu = time.perf_counter()
-            if batch_idx == 0:
-                print(f"{tag} first batch GPU forward in {t_gpu - t_data:.3f}s", flush=True)
+    prof = {
+        "modality_load_s": 0.0,
+        "sample_build_s": 0.0,
+        "collate_s": 0.0,
+        "h2d_s": 0.0,
+        "gpu_s": 0.0,
+        "post_s": 0.0,
+        "batch_total_s": 0.0,
+        "windows": 0,
+    }
 
-            pred_np = pv_pred[:, worker_cfg.horizon_idx].detach().cpu().numpy()
-            true_np = d["target_pv"][:, worker_cfg.horizon_idx].detach().cpu().numpy()
-            bsz = pred_np.shape[0]
-            for i in range(bsz):
-                idx = global_idx + i
-                if sample_valid is not None and float(sample_valid[i].item()) <= 0.0:
-                    n_skipped += 1
-                    continue
-                file_idx = idx // nw
-                win_idx = idx % nw
-                if file_idx >= n_files:
-                    raise RuntimeError(f"file_idx {file_idx} out of range {n_files}")
-                pred_buf[file_idx][win_idx] = pred_np[i]
-                true_buf[file_idx][win_idx] = true_np[i]
-                filled[file_idx][win_idx] = True
-
-            global_idx += bsz
-            if (batch_idx + 1) % 10 == 0 or batch_idx == 0:
-                t_now = time.perf_counter()
-                print(
-                    f"{tag} batch {batch_idx + 1}/{n_batches} "
-                    f"processed_samples={global_idx} batch_time={t_now - t_batch0:.1f}s",
-                    flush=True,
-                )
-
-    print(
-        f"{tag} inference done; processed={global_idx} skipped_windows={n_skipped}",
-        flush=True,
-    )
-
-    n_inv_written = _write_per_inverter_csvs(
-        out_inv_dir,
-        inverter_names=inverter_names,
-        n_files=n_files,
-        nw=nw,
-        pred_buf=pred_buf,
-        true_buf=true_buf,
-        filled=filled,
-        time_utc=time_utc,
-        time_bj=time_bj,
-    )
-    print(f"{tag} wrote {n_inv_written} inverter CSVs", flush=True)
-
-    if world_size > 1:
-        assert shard_dir is not None
-        pred_total, true_total, counts = _partial_station_arrays(
-            n_files=n_files,
-            nw=nw,
-            pred_buf=pred_buf,
-            true_buf=true_buf,
-            filled=filled,
-        )
-        shard_path = shard_dir / f"shard_{rank:03d}.npz"
-        np.savez(
-            shard_path,
-            pred_total=pred_total,
-            true_total=true_total,
-            counts=counts,
-        )
-        print(f"{tag} wrote shard {shard_path.name}", flush=True)
-    elif shard_dir is None:
-        pred_total, true_total, counts = _partial_station_arrays(
-            n_files=n_files,
-            nw=nw,
-            pred_buf=pred_buf,
-            true_buf=true_buf,
-            filled=filled,
-        )
-        station_path, station_rmse, n_station_points = _write_station_csv(
-            out_inv_dir.parent,
-            task=worker_cfg.task,
-            nw=nw,
-            pred_total=pred_total,
-            true_total=true_total,
-            counts=counts,
-            time_utc=time_utc,
-            time_bj=time_bj,
-        )
+    if full_cache_mode:
+        if world_size > 1:
+            raise ValueError("Full cache mode currently supports single-GPU inference only.")
         print(
-            f"{tag} station_total RMSE={station_rmse:.6f} kW "
-            f"(task={worker_cfg.task}, n_points={n_station_points}) -> {station_path}",
+            f"{tag} full-cache mode: windows={nw} batches_per_window={n_batches_per_window}",
             flush=True,
         )
 
-    return global_idx, n_skipped
+    if use_shared_sat_sky:
+        if full_cache_mode:
+            mode = "full-cache"
+        else:
+            mode = "sat-sky-cache" if cache_dir is not None else "zarr"
+        runtime = "single-GPU" if world_size == 1 else "multi-GPU"
+        print(
+            f"{tag} Running inference ({runtime} window-major: "
+            f"1 {mode} load per window, {n_files} inverters)...",
+            flush=True,
+        )
+    else:
+        if worker_cfg.num_workers > 0:
+            print(
+                f"{tag} WARNING: num_workers>0 can hang on first batch (zarr + fork). "
+                f"Prefer --num_workers 0.",
+                flush=True,
+            )
+        print(f"{tag} Running inference (dataloader mode)...", flush=True)
+
+    if not use_shared_sat_sky:
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=worker_cfg.batch_size,
+            shuffle=False,
+            collate_fn=collate_batched,
+            num_workers=worker_cfg.num_workers,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=(worker_cfg.num_workers > 0),
+        )
+        batch_iter = iter(test_loader)
+
+    with torch.no_grad():
+        if use_shared_sat_sky:
+            for win_idx in range(nw):
+                t_win0 = time.perf_counter()
+                window_preds: dict[int, tuple[float, float]] = {}
+                window_finished = False
+                if cache_dir is not None:
+                    sat_sky = _load_sat_sky_cache_window(
+                        cache_dir,
+                        win_idx,
+                        expected_time_utc=_to_utc_iso(t0_refs[win_idx]),
+                    )
+                else:
+                    sat_sky = test_dataset.load_sat_sky_for_window(win_idx)
+                t_mod = time.perf_counter()
+                prof["modality_load_s"] += float(t_mod - t_win0)
+                prof["windows"] += 1
+
+                for file_start in range(0, n_files, worker_cfg.batch_size):
+                    if worker_cfg.limit_batches is not None and batch_idx_global >= worker_cfg.limit_batches:
+                        break
+                    t_batch0 = time.perf_counter()
+                    file_end = min(file_start + worker_cfg.batch_size, n_files)
+                    if full_cache_mode:
+                        assert cache_dir is not None
+                        t_sample0 = time.perf_counter()
+                        batch_idx_local = file_start // worker_cfg.batch_size
+                        pv_batch = _load_pv_batch_cache(
+                            cache_dir,
+                            win_idx=win_idx,
+                            batch_idx=batch_idx_local,
+                            file_start=file_start,
+                            file_end=file_end,
+                        )
+                        t_sample1 = time.perf_counter()
+                        prof["sample_build_s"] += float(t_sample1 - t_sample0)
+                        batch = _merge_cached_pv_with_sat_sky(pv_batch, sat_sky)
+                        t_data = time.perf_counter()
+                        prof["collate_s"] += float(t_data - t_sample1)
+                    else:
+                        t_sample0 = time.perf_counter()
+                        pv_samples = [
+                            test_dataset.build_pv_sample_for_window(file_idx, win_idx)
+                            for file_idx in range(file_start, file_end)
+                        ]
+                        t_sample1 = time.perf_counter()
+                        prof["sample_build_s"] += float(t_sample1 - t_sample0)
+                        batch = collate_with_shared_sat_sky(pv_samples, sat_sky)
+                        t_data = time.perf_counter()
+                        prof["collate_s"] += float(t_data - t_sample1)
+
+                    if batch_idx_global == 0:
+                        pv_label = "pv_cache_load+merge" if full_cache_mode else "pv_collate"
+                        print(
+                            f"{tag} first window modality_load={t_mod - t_win0:.2f}s "
+                            f"{pv_label}={t_data - t_batch0:.2f}s "
+                            f"(window {win_idx}, inverters {file_start}-{file_end - 1})",
+                            flush=True,
+                        )
+
+                    t_h2d0 = time.perf_counter()
+                    d = _batch_to_device(batch, device)
+                    t_h2d = time.perf_counter()
+                    prof["h2d_s"] += float(t_h2d - t_h2d0)
+
+                    sample_valid = batch.get("sample_valid")
+                    with autocast_ctx:
+                        pv_pred = predict_pv_kW(model, d)
+                    pv_pred = pv_pred.float()
+                    t_gpu = time.perf_counter()
+                    prof["gpu_s"] += float(t_gpu - t_h2d)
+                    if batch_idx_global == 0:
+                        print(f"{tag} first batch GPU forward in {t_gpu - t_data:.3f}s", flush=True)
+
+                    t_post0 = time.perf_counter()
+                    pred_np = pv_pred[:, worker_cfg.horizon_idx].detach().cpu().numpy()
+                    true_np = d["target_pv"][:, worker_cfg.horizon_idx].detach().cpu().numpy()
+                    bsz = pred_np.shape[0]
+                    for i in range(bsz):
+                        file_idx = file_start + i
+                        if sample_valid is not None and float(sample_valid[i].item()) <= 0.0:
+                            n_skipped += 1
+                            continue
+                        window_preds[file_idx] = (float(pred_np[i]), float(true_np[i]))
+                    if file_end >= n_files:
+                        window_finished = True
+                    t_post = time.perf_counter()
+                    prof["post_s"] += float(t_post - t_post0)
+
+                    batch_idx_global += 1
+                    t_now = time.perf_counter()
+                    prof["batch_total_s"] += float(t_now - t_batch0)
+                    if (batch_idx_global % 10 == 0) or batch_idx_global == 1:
+                        print(
+                            f"{tag} batch {batch_idx_global}/{n_batches_total} "
+                            f"window={win_idx + 1}/{nw} batch_time={t_now - t_batch0:.1f}s",
+                            flush=True,
+                        )
+                    if worker_cfg.profile_every > 0 and (
+                        batch_idx_global % worker_cfg.profile_every == 0 or batch_idx_global == 1
+                    ):
+                        bt = max(float(prof["batch_total_s"]), 1e-9)
+                        bcnt = max(int(batch_idx_global), 1)
+                        wcnt = max(int(prof["windows"]), 1)
+                        print(
+                            f"{tag} profile@batch={batch_idx_global}: "
+                            f"avg_batch={bt/bcnt:.3f}s, "
+                            f"sample_build={prof['sample_build_s']/bt*100:.1f}%, "
+                            f"collate={prof['collate_s']/bt*100:.1f}%, "
+                            f"h2d={prof['h2d_s']/bt*100:.1f}%, "
+                            f"gpu={prof['gpu_s']/bt*100:.1f}%, "
+                            f"post={prof['post_s']/bt*100:.1f}%, "
+                            f"modality_per_window={prof['modality_load_s']/wcnt:.3f}s",
+                            flush=True,
+                        )
+                    if worker_cfg.limit_batches is not None and batch_idx_global >= worker_cfg.limit_batches:
+                        break
+
+                if window_finished and result_writer is not None:
+                    result_writer.flush_window(win_idx, window_preds)
+                    if shard_pred_total is not None and shard_true_total is not None and shard_counts is not None:
+                        pred_sum = float(sum(p for p, _ in window_preds.values()))
+                        true_sum = float(sum(t for _, t in window_preds.values()))
+                        shard_pred_total[win_idx] = pred_sum
+                        shard_true_total[win_idx] = true_sum
+                        shard_counts[win_idx] = len(window_preds)
+                if worker_cfg.limit_batches is not None and batch_idx_global >= worker_cfg.limit_batches:
+                    break
+        else:
+            for batch_idx in range(n_batches_loader):
+                if worker_cfg.limit_batches is not None and batch_idx >= worker_cfg.limit_batches:
+                    break
+                t_batch0 = time.perf_counter()
+                batch = next(batch_iter)
+                t_data = time.perf_counter()
+                prof["sample_build_s"] += float(t_data - t_batch0)
+                d = _batch_to_device(batch, device)
+                t_h2d = time.perf_counter()
+                prof["h2d_s"] += float(t_h2d - t_data)
+                sample_valid = batch.get("sample_valid")
+                with autocast_ctx:
+                    pv_pred = predict_pv_kW(model, d)
+                pv_pred = pv_pred.float()
+                t_gpu = time.perf_counter()
+                prof["gpu_s"] += float(t_gpu - t_h2d)
+
+                pred_np = pv_pred[:, worker_cfg.horizon_idx].detach().cpu().numpy()
+                true_np = d["target_pv"][:, worker_cfg.horizon_idx].detach().cpu().numpy()
+                bsz = pred_np.shape[0]
+                global_base = batch_idx * worker_cfg.batch_size
+                for i in range(bsz):
+                    idx = global_base + i
+                    if sample_valid is not None and float(sample_valid[i].item()) <= 0.0:
+                        n_skipped += 1
+                        continue
+                    file_idx = idx // nw
+                    win_idx = idx % nw
+                    if file_idx >= n_files:
+                        continue
+                    pred_buf[file_idx][win_idx] = pred_np[i]
+                    true_buf[file_idx][win_idx] = true_np[i]
+                    filled[file_idx][win_idx] = True
+                batch_idx_global += 1
+                t_now = time.perf_counter()
+                prof["batch_total_s"] += float(t_now - t_batch0)
+                if (batch_idx_global % 10 == 0) or batch_idx_global == 1:
+                    print(
+                        f"{tag} batch {batch_idx_global}/{n_batches_loader} "
+                        f"batch_time={t_now - t_batch0:.1f}s",
+                        flush=True,
+                    )
+
+    print(
+        f"{tag} inference done; batches={batch_idx_global} skipped_windows={n_skipped}",
+        flush=True,
+    )
+    if batch_idx_global > 0:
+        bt = max(float(prof["batch_total_s"]), 1e-9)
+        wcnt = max(int(prof["windows"]), 1)
+        print(
+            f"{tag} profile-final: avg_batch={bt/batch_idx_global:.3f}s "
+            f"sample_build={prof['sample_build_s']/bt*100:.1f}% "
+            f"collate={prof['collate_s']/bt*100:.1f}% "
+            f"h2d={prof['h2d_s']/bt*100:.1f}% "
+            f"gpu={prof['gpu_s']/bt*100:.1f}% "
+            f"post={prof['post_s']/bt*100:.1f}% "
+            f"modality_per_window={prof['modality_load_s']/wcnt:.3f}s",
+            flush=True,
+        )
+
+    if use_shared_sat_sky:
+        assert result_writer is not None
+        n_inv_written, station_rmse, n_station_points, station_path = result_writer.finish()
+        print(f"{tag} wrote {n_inv_written} inverter CSVs (incremental)", flush=True)
+        if world_size > 1:
+            assert shard_dir is not None
+            assert shard_pred_total is not None and shard_true_total is not None and shard_counts is not None
+            shard_path = shard_dir / f"shard_{rank:03d}.npz"
+            np.savez(
+                shard_path,
+                pred_total=shard_pred_total,
+                true_total=shard_true_total,
+                counts=shard_counts,
+            )
+            print(f"{tag} wrote shard {shard_path.name}", flush=True)
+        elif station_path is not None:
+            print(
+                f"{tag} station_total RMSE={station_rmse:.6f} kW "
+                f"(task={worker_cfg.task}, n_points={n_station_points}) -> {station_path}",
+                flush=True,
+            )
+    else:
+        assert pred_buf is not None and true_buf is not None and filled is not None
+        n_inv_written = _write_per_inverter_csvs(
+            out_inv_dir,
+            inverter_names=inverter_names,
+            n_files=n_files,
+            nw=nw,
+            pred_buf=pred_buf,
+            true_buf=true_buf,
+            filled=filled,
+            time_utc=time_utc,
+            time_bj=time_bj,
+        )
+        print(f"{tag} wrote {n_inv_written} inverter CSVs", flush=True)
+
+        if world_size > 1:
+            assert shard_dir is not None
+            pred_total, true_total, counts = _partial_station_arrays(
+                n_files=n_files,
+                nw=nw,
+                pred_buf=pred_buf,
+                true_buf=true_buf,
+                filled=filled,
+            )
+            shard_path = shard_dir / f"shard_{rank:03d}.npz"
+            np.savez(
+                shard_path,
+                pred_total=pred_total,
+                true_total=true_total,
+                counts=counts,
+            )
+            print(f"{tag} wrote shard {shard_path.name}", flush=True)
+        elif shard_dir is None:
+            pred_total, true_total, counts = _partial_station_arrays(
+                n_files=n_files,
+                nw=nw,
+                pred_buf=pred_buf,
+                true_buf=true_buf,
+                filled=filled,
+            )
+            station_path, station_rmse, n_station_points = _write_station_csv(
+                out_inv_dir.parent,
+                task=worker_cfg.task,
+                nw=nw,
+                pred_total=pred_total,
+                true_total=true_total,
+                counts=counts,
+                time_utc=time_utc,
+                time_bj=time_bj,
+            )
+            print(
+                f"{tag} station_total RMSE={station_rmse:.6f} kW "
+                f"(task={worker_cfg.task}, n_points={n_station_points}) -> {station_path}",
+                flush=True,
+            )
+
+    return batch_idx_global, n_skipped
 
 
 def _worker_entry(
@@ -650,6 +1175,22 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional: stop after N batches per GPU shard (debug only).",
     )
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional cache directory built by preprocess_luoyang2026test.py. "
+            "If only windows/ exists, use sat/sky cache. If pv_batches/ also exists, "
+            "use full-cache mode and bypass runtime PV sample building."
+        ),
+    )
+    parser.add_argument(
+        "--profile_every",
+        type=int,
+        default=100,
+        help="Print averaged pipeline time breakdown every N batches (<=0 disables).",
+    )
     return parser.parse_args()
 
 
@@ -659,6 +1200,16 @@ def main() -> None:
         raise NotImplementedError("48h inference is not implemented yet.")
     if args.stride_min <= 0:
         raise ValueError(f"--stride_min must be positive (got {args.stride_min})")
+    cache_dir: Path | None = None
+    cache_manifest: dict | None = None
+    cache_full = False
+    if args.cache_dir is not None:
+        cache_dir = Path(args.cache_dir).expanduser().resolve()
+        windows_dir = cache_dir / "windows"
+        if not windows_dir.is_dir():
+            raise FileNotFoundError(f"cache windows dir not found: {windows_dir}")
+        cache_manifest = _load_cache_manifest(cache_dir)
+        cache_full = (cache_dir / "pv_batches").is_dir()
 
     horizon_idx = _horizon_idx(args.task)
     gpu_ids = _parse_gpu_ids(args.num_gpus, args.gpu_ids)
@@ -677,6 +1228,30 @@ def main() -> None:
     all_files = _list_infer_sample_files(args.dataset_config, max_inverters=args.max_inverters)
     if not all_files:
         raise RuntimeError("No inverter CSV files found for inference")
+    if cache_dir is not None:
+        cfg_path = _resolve_named_config(_DATASETS_CONFIG_DIR, args.dataset_config, "dataset-config")
+        cfg_sha = _cfg_sha256(cfg_path)
+        assert cache_manifest is not None
+        man_sha = str((cache_manifest.get("dataset_config") or {}).get("sha256", ""))
+        if man_sha and man_sha != cfg_sha:
+            raise ValueError(
+                f"cache dataset-config hash mismatch: cache={man_sha[:12]} expected={cfg_sha[:12]} "
+                f"(config={cfg_path})"
+            )
+        man_stride = cache_manifest.get("stride_min")
+        if man_stride is not None and int(man_stride) != int(args.stride_min):
+            raise ValueError(f"cache stride mismatch: cache={man_stride} expected={args.stride_min}")
+        man_bs = cache_manifest.get("batch_size")
+        if man_bs is not None and int(man_bs) != int(args.batch_size):
+            raise ValueError(f"cache batch_size mismatch: cache={man_bs} expected={args.batch_size}")
+        man_num_inv = cache_manifest.get("num_inverters")
+        if man_num_inv is not None and int(man_num_inv) != int(len(all_files)):
+            raise ValueError(
+                f"cache num_inverters mismatch: cache={man_num_inv} expected={len(all_files)} "
+                "(check --max_inverters and preprocessing args)"
+            )
+        if cache_full and world_size > 1:
+            raise ValueError("Full cache mode currently supports single-GPU inference only.")
 
     worker_cfg = InferWorkerConfig(
         task=args.task,
@@ -689,12 +1264,16 @@ def main() -> None:
         max_inverters=args.max_inverters,
         limit_batches=args.limit_batches,
         horizon_idx=horizon_idx,
+        cache_dir=None if cache_dir is None else str(cache_dir),
+        cache_full=bool(cache_full),
+        profile_every=int(args.profile_every),
     )
 
     print(
         f"[inference_luoyang2026] task={args.task} checkpoint={ckpt_path} "
         f"output_dir={out_dir} inverters={len(all_files)} num_gpus={world_size} "
-        f"gpu_ids={gpu_ids} stride_min={args.stride_min} batch_size={args.batch_size}",
+        f"gpu_ids={gpu_ids} stride_min={args.stride_min} batch_size={args.batch_size} "
+        f"cache_dir={cache_dir} cache_full={cache_full}",
         flush=True,
     )
     if args.stride_min == _DEFAULT_STRIDE_MIN and args.limit_batches is None:

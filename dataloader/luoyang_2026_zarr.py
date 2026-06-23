@@ -227,6 +227,7 @@ class PVDataset(Dataset):
         test_start_bj: str = "2026-05-11 00:00:00",
         max_files: int | None = None,
         sample_file_subset: list[Path | str] | None = None,
+        enable_sat_sky_cache: bool = False,
     ) -> None:
         if split not in ("train", "val", "test"):
             raise ValueError("split must be train|val|test")
@@ -278,6 +279,11 @@ class PVDataset(Dataset):
         self._pv_dir = Path(pv_dir).resolve()
         self._skyimg_dir = Path(skyimg_dir).resolve()
         self._satimg_dir = Path(satimg_dir).resolve()
+        self.enable_sat_sky_cache = bool(enable_sat_sky_cache)
+        self._sat_sky_cache_win_idx: int | None = None
+        self._sat_sky_cache_bundle: dict[str, torch.Tensor | None] | None = None
+        self._sat_sky_cache_loads = 0
+        self._sat_sky_cache_hits = 0
 
         self.satimg_ds = None
         self.skyimg_ds = None
@@ -526,6 +532,151 @@ class PVDataset(Dataset):
         max_y = j + int(self._y_off_1d[-1])
         return min_x >= 0 and max_y < n_rows
 
+    def _time0_for_window(self, win_idx: int) -> pd.Timestamp:
+        if self.split == "test":
+            assert self._test_last_x_time_ref is not None
+            t_ref = self._test_last_x_time_ref[int(win_idx)]
+        elif self.split == "val":
+            assert self._val_last_x_time_ref is not None
+            t_ref = self._val_last_x_time_ref[int(win_idx)]
+        else:
+            raise ValueError("_time0_for_window requires split test|val")
+        t0 = pd.Timestamp(t_ref)
+        if t0.tzinfo is None:
+            return t0.tz_localize("UTC")
+        return t0.tz_convert("UTC")
+
+    @staticmethod
+    def _clone_sat_sky_bundle(
+        bundle: dict[str, torch.Tensor | None],
+    ) -> dict[str, torch.Tensor | None]:
+        out: dict[str, torch.Tensor | None] = {}
+        for key, val in bundle.items():
+            out[key] = val.clone() if isinstance(val, torch.Tensor) else val
+        return out
+
+    def _load_sat_sky_modality(self, time0_utc: pd.Timestamp) -> dict[str, torch.Tensor | None]:
+        sat_tensor = None
+        sat_timefeats = None
+        sat_valid = torch.tensor(0.0, dtype=torch.float32)
+        if self.satimg_ds is not None:
+            sat_t0 = pd.Timestamp(time0_utc - timedelta(minutes=(245 + 30))).tz_convert("UTC").tz_localize(None)
+            sat_t1 = pd.Timestamp(time0_utc - timedelta(minutes=30)).tz_convert("UTC").tz_localize(None)
+            sat_data = self.satimg_ds.sel(time_utc=slice(sat_t0, sat_t1))
+            if int(sat_data.sizes.get("time_utc", 0)) > 0:
+                sat_solar_features = {
+                    "azimuth": sat_data["azimuth"].values,
+                    "zenith": sat_data["zenith"].values,
+                    "day_of_year": sat_data["day_of_year"].values,
+                    "hour_of_day": sat_data["hour_of_day"].values,
+                }
+                sat_timefeats = solar_features_encoder(sat_solar_features)
+                sat_dtime = delta_time_encoder(sat_data["time_utc"].values, time0_utc)
+                sat_timefeats = torch.cat([sat_timefeats, sat_dtime.unsqueeze(1)], dim=1)
+                sat_tensor = torch.from_numpy(np.asarray(sat_data["images"].values, dtype=np.float32))
+                exp_t = self.satimg_window_size
+                if sat_tensor.shape[0] > exp_t:
+                    sat_tensor = sat_tensor[-exp_t:, ...]
+                    sat_timefeats = sat_timefeats[-exp_t:, :]
+                elif sat_tensor.shape[0] < exp_t:
+                    pad_t = exp_t - sat_tensor.shape[0]
+                    sat_tensor = torch.cat(
+                        [torch.zeros(pad_t, *sat_tensor.shape[1:], dtype=sat_tensor.dtype), sat_tensor],
+                        dim=0,
+                    )
+                    sat_timefeats = torch.cat(
+                        [
+                            torch.zeros(pad_t, sat_timefeats.shape[1], dtype=sat_timefeats.dtype),
+                            sat_timefeats,
+                        ],
+                        dim=0,
+                    )
+                sat_valid = torch.tensor(1.0, dtype=torch.float32)
+
+        sky_tensor = None
+        sky_timefeats = None
+        skimg_valid = torch.tensor(0.0, dtype=torch.float32)
+        if self.skyimg_ds is not None:
+            sky_t0 = pd.Timestamp(time0_utc - timedelta(minutes=30)).tz_convert("UTC").tz_localize(None)
+            sky_t1 = pd.Timestamp(time0_utc).tz_convert("UTC").tz_localize(None)
+            sky_data = self.skyimg_ds.sel(time_utc=slice(sky_t0, sky_t1))
+            if int(sky_data.sizes.get("time_utc", 0)) > 0:
+                sky_solar_features = {
+                    "azimuth": sky_data["azimuth"].values,
+                    "zenith": sky_data["zenith"].values,
+                    "day_of_year": sky_data["day_of_year"].values,
+                    "hour_of_day": sky_data["hour_of_day"].values,
+                }
+                sky_timefeats = solar_features_encoder(sky_solar_features)
+                sky_dtime = delta_time_encoder(sky_data["time_utc"].values, time0_utc)
+                sky_timefeats = torch.cat([sky_timefeats, sky_dtime.unsqueeze(1)], dim=1)
+                sky_tensor = torch.from_numpy(np.asarray(sky_data["images"].values, dtype=np.float32))
+                exp_t = self.skyimg_window_size
+                if sky_tensor.shape[0] > exp_t:
+                    sky_tensor = sky_tensor[-exp_t:, ...]
+                    sky_timefeats = sky_timefeats[-exp_t:, :]
+                elif sky_tensor.shape[0] < exp_t:
+                    pad_t = exp_t - sky_tensor.shape[0]
+                    sky_tensor = torch.cat(
+                        [torch.zeros(pad_t, *sky_tensor.shape[1:], dtype=sky_tensor.dtype), sky_tensor],
+                        dim=0,
+                    )
+                    sky_timefeats = torch.cat(
+                        [
+                            torch.zeros(pad_t, sky_timefeats.shape[1], dtype=sky_timefeats.dtype),
+                            sky_timefeats,
+                        ],
+                        dim=0,
+                    )
+                skimg_valid = torch.tensor(1.0, dtype=torch.float32)
+
+        return {
+            "sat_tensor": sat_tensor,
+            "sat_timefeats": sat_timefeats,
+            "sat_valid": sat_valid,
+            "skimg_tensor": sky_tensor,
+            "skimg_timefeats": sky_timefeats,
+            "skimg_valid": skimg_valid,
+        }
+
+    def load_sat_sky_for_window(self, win_idx: int) -> dict[str, torch.Tensor | None]:
+        """Load sat/sky zarr once for a test/val window; reuse across all inverters."""
+        if self.split not in ("test", "val"):
+            raise ValueError("load_sat_sky_for_window requires split test|val")
+        win_idx = int(win_idx)
+        if self._sat_sky_cache_win_idx == win_idx and self._sat_sky_cache_bundle is not None:
+            return self._sat_sky_cache_bundle
+        time0_utc = self._time0_for_window(win_idx)
+        self._sat_sky_cache_bundle = self._load_sat_sky_modality(time0_utc)
+        self._sat_sky_cache_win_idx = win_idx
+        self._sat_sky_cache_loads += 1
+        return self._sat_sky_cache_bundle
+
+    def prepare_sat_sky_window(self, win_idx: int) -> None:
+        """Load sat/sky once for a test/val window (shared across inverters)."""
+        if not self.enable_sat_sky_cache or self.split not in ("test", "val"):
+            return
+        self.load_sat_sky_for_window(win_idx)
+
+    def sat_sky_cache_stats(self) -> tuple[int, int]:
+        return self._sat_sky_cache_loads, self._sat_sky_cache_hits
+
+    def _sat_sky_for_sample(
+        self,
+        time0_utc: pd.Timestamp,
+        *,
+        win_idx: int | None,
+    ) -> dict[str, torch.Tensor | None]:
+        if (
+            self.enable_sat_sky_cache
+            and win_idx is not None
+            and self._sat_sky_cache_win_idx == int(win_idx)
+            and self._sat_sky_cache_bundle is not None
+        ):
+            self._sat_sky_cache_hits += 1
+            return self._clone_sat_sky_bundle(self._sat_sky_cache_bundle)
+        return self._load_sat_sky_modality(time0_utc)
+
     def _try_build_sample_for_split_window(
         self,
         df: pd.DataFrame,
@@ -533,6 +684,9 @@ class PVDataset(Dataset):
         r_fixed: int,
         t_ref: pd.Timestamp,
         csv_name: str,
+        *,
+        win_idx: int | None = None,
+        include_sat_sky: bool = True,
     ) -> dict | None:
         try:
             j = self._row_index_for_collect_time_match(df["collectTime"], t_ref, csv_name)
@@ -541,9 +695,83 @@ class PVDataset(Dataset):
         if not self._anchor_row_in_bounds(len(df), j):
             return None
         try:
-            return self._build_sample(df, dev_idx, r_fixed, anchor_last_row=j)
+            return self._build_sample(
+                df,
+                dev_idx,
+                r_fixed,
+                anchor_last_row=j,
+                win_idx=win_idx,
+                include_sat_sky=include_sat_sky,
+            )
         except IndexError:
             return None
+
+    def build_pv_sample_for_window(self, file_idx: int, win_idx: int) -> dict:
+        """Build PV/NWP/forecast fields only (no sat/sky zarr) for one inverter window."""
+        if self.split == "test":
+            nw = self._num_test_windows
+            assert self._test_last_x_time_ref is not None
+            t_ref = self._test_last_x_time_ref[int(win_idx)]
+            r_fixed = int(self._test_r_indices[int(win_idx)])
+        elif self.split == "val":
+            nw = self._num_val_windows
+            assert self._val_last_x_time_ref is not None
+            t_ref = self._val_last_x_time_ref[int(win_idx)]
+            r_fixed = int(self._val_r_indices[int(win_idx)])
+        else:
+            raise ValueError("build_pv_sample_for_window requires split test|val")
+
+        file_idx = int(file_idx)
+        win_idx = int(win_idx)
+        p = self.sample_files[file_idx]
+        k = p.resolve().as_posix()
+        dfi = self._csv_cache[k]
+        dev_dn_i = p.stem.replace("_", "=")
+        dev_idx_i = torch.tensor(self._dev_idx_map[dev_dn_i], dtype=torch.long)
+
+        sample = self._try_build_sample_for_split_window(
+            dfi,
+            dev_idx_i,
+            r_fixed,
+            t_ref,
+            p.name,
+            win_idx=win_idx,
+            include_sat_sky=False,
+        )
+        if sample is not None:
+            return sample
+        return self._skipped_pv_sample(dev_idx_i)
+
+    def _skipped_pv_sample(self, dev_idx: torch.Tensor) -> dict:
+        assert self._skipped_sample_template is not None
+        pv_keys = (
+            "dev_idx",
+            "pv",
+            "pv_mask",
+            "pv_timefeats",
+            "kt",
+            "kt_mask",
+            "p_cs",
+            "weather_ghi",
+            "theory_ghi",
+            "p_mean",
+            "forecast_timefeats",
+            "nwp_tensor",
+            "target_pv",
+            "target_mask",
+            "target_p_cs",
+            "target_weather_ghi",
+            "target_theory_ghi",
+            "sample_valid",
+        )
+        tpl = self._skipped_sample_template
+        out: dict = {}
+        for key in pv_keys:
+            val = tpl[key]
+            out[key] = val.clone() if isinstance(val, torch.Tensor) else val
+        out["dev_idx"] = dev_idx
+        out["sample_valid"] = torch.tensor(0.0, dtype=torch.float32)
+        return out
 
     def _skipped_sample(self, dev_idx: torch.Tensor) -> dict:
         assert self._skipped_sample_template is not None
@@ -555,7 +783,16 @@ class PVDataset(Dataset):
         out["sample_valid"] = torch.tensor(0.0, dtype=torch.float32)
         return out
 
-    def _build_sample(self, df: pd.DataFrame, dev_idx: torch.Tensor, r: int, *, anchor_last_row: int | None = None) -> dict:
+    def _build_sample(
+        self,
+        df: pd.DataFrame,
+        dev_idx: torch.Tensor,
+        r: int,
+        *,
+        anchor_last_row: int | None = None,
+        win_idx: int | None = None,
+        include_sat_sky: bool = True,
+    ) -> dict:
         if anchor_last_row is None:
             x_idx = self._x_idx_per_anchor[r]
             y_idx = self._y_idx_per_anchor[r]
@@ -690,63 +927,7 @@ class PVDataset(Dataset):
             target_theory_ghi_np = np.zeros(len(sub_y), dtype=np.float32)
         target_theory_ghi = torch.from_numpy(target_theory_ghi_np)
 
-        sat_tensor = None
-        sat_timefeats = None
-        sat_valid = torch.tensor(0.0, dtype=torch.float32)
-        if self.satimg_ds is not None:
-            sat_t0 = pd.Timestamp(time0_utc - timedelta(minutes=(245 + 30))).tz_convert("UTC").tz_localize(None)
-            sat_t1 = pd.Timestamp(time0_utc - timedelta(minutes=30)).tz_convert("UTC").tz_localize(None)
-            sat_data = self.satimg_ds.sel(time_utc=slice(sat_t0, sat_t1))
-            if int(sat_data.sizes.get("time_utc", 0)) > 0:
-                sat_solar_features = {
-                    "azimuth": sat_data["azimuth"].values,
-                    "zenith": sat_data["zenith"].values,
-                    "day_of_year": sat_data["day_of_year"].values,
-                    "hour_of_day": sat_data["hour_of_day"].values,
-                }
-                sat_timefeats = solar_features_encoder(sat_solar_features)
-                sat_dtime = delta_time_encoder(sat_data["time_utc"].values, time0_utc)
-                sat_timefeats = torch.cat([sat_timefeats, sat_dtime.unsqueeze(1)], dim=1)
-                sat_tensor = torch.from_numpy(np.asarray(sat_data["images"].values, dtype=np.float32))
-                exp_t = self.satimg_window_size
-                if sat_tensor.shape[0] > exp_t:
-                    sat_tensor = sat_tensor[-exp_t:, ...]
-                    sat_timefeats = sat_timefeats[-exp_t:, :]
-                elif sat_tensor.shape[0] < exp_t:
-                    pad_t = exp_t - sat_tensor.shape[0]
-                    sat_tensor = torch.cat([torch.zeros(pad_t, *sat_tensor.shape[1:], dtype=sat_tensor.dtype), sat_tensor], dim=0)
-                    sat_timefeats = torch.cat([torch.zeros(pad_t, sat_timefeats.shape[1], dtype=sat_timefeats.dtype), sat_timefeats], dim=0)
-                sat_valid = torch.tensor(1.0, dtype=torch.float32)
-
-        sky_tensor = None
-        sky_timefeats = None
-        skimg_valid = torch.tensor(0.0, dtype=torch.float32)
-        if self.skyimg_ds is not None:
-            sky_t0 = pd.Timestamp(time0_utc - timedelta(minutes=30)).tz_convert("UTC").tz_localize(None)
-            sky_t1 = pd.Timestamp(time0_utc).tz_convert("UTC").tz_localize(None)
-            sky_data = self.skyimg_ds.sel(time_utc=slice(sky_t0, sky_t1))
-            if int(sky_data.sizes.get("time_utc", 0)) > 0:
-                sky_solar_features = {
-                    "azimuth": sky_data["azimuth"].values,
-                    "zenith": sky_data["zenith"].values,
-                    "day_of_year": sky_data["day_of_year"].values,
-                    "hour_of_day": sky_data["hour_of_day"].values,
-                }
-                sky_timefeats = solar_features_encoder(sky_solar_features)
-                sky_dtime = delta_time_encoder(sky_data["time_utc"].values, time0_utc)
-                sky_timefeats = torch.cat([sky_timefeats, sky_dtime.unsqueeze(1)], dim=1)
-                sky_tensor = torch.from_numpy(np.asarray(sky_data["images"].values, dtype=np.float32))
-                exp_t = self.skyimg_window_size
-                if sky_tensor.shape[0] > exp_t:
-                    sky_tensor = sky_tensor[-exp_t:, ...]
-                    sky_timefeats = sky_timefeats[-exp_t:, :]
-                elif sky_tensor.shape[0] < exp_t:
-                    pad_t = exp_t - sky_tensor.shape[0]
-                    sky_tensor = torch.cat([torch.zeros(pad_t, *sky_tensor.shape[1:], dtype=sky_tensor.dtype), sky_tensor], dim=0)
-                    sky_timefeats = torch.cat([torch.zeros(pad_t, sky_timefeats.shape[1], dtype=sky_timefeats.dtype), sky_timefeats], dim=0)
-                skimg_valid = torch.tensor(1.0, dtype=torch.float32)
-
-        return {
+        out: dict = {
             "dev_idx": dev_idx,
             "pv": pv,
             "pv_mask": pv_mask,
@@ -758,12 +939,6 @@ class PVDataset(Dataset):
             "theory_ghi": theory_ghi,
             "p_mean": p_mean,
             "forecast_timefeats": forecast_timefeats,
-            "sat_tensor": sat_tensor,
-            "sat_timefeats": sat_timefeats,
-            "sat_valid": sat_valid,
-            "skimg_tensor": sky_tensor,
-            "skimg_timefeats": sky_timefeats,
-            "skimg_valid": skimg_valid,
             "nwp_tensor": nwp_tensor,
             "target_pv": target_pv,
             "target_mask": target_mask,
@@ -772,6 +947,17 @@ class PVDataset(Dataset):
             "target_theory_ghi": target_theory_ghi,
             "sample_valid": torch.tensor(1.0, dtype=torch.float32),
         }
+        if not include_sat_sky:
+            return out
+
+        sat_sky = self._sat_sky_for_sample(time0_utc, win_idx=win_idx)
+        out["sat_tensor"] = sat_sky["sat_tensor"]
+        out["sat_timefeats"] = sat_sky["sat_timefeats"]
+        out["sat_valid"] = sat_sky["sat_valid"]
+        out["skimg_tensor"] = sat_sky["skimg_tensor"]
+        out["skimg_timefeats"] = sat_sky["skimg_timefeats"]
+        out["skimg_valid"] = sat_sky["skimg_valid"]
+        return out
 
     def __getitem__(self, idx: int) -> dict:
         if self.split == "train":
@@ -797,14 +983,13 @@ class PVDataset(Dataset):
             return self._build_sample(df, dev_idx, 0, anchor_last_row=j)
 
         assert r_fixed is not None
+        win_idx = idx % nw
         if self.split == "val":
             assert self._val_last_x_time_ref is not None
-            nw = self._num_val_windows
-            t_ref = self._val_last_x_time_ref[idx % nw]
+            t_ref = self._val_last_x_time_ref[win_idx]
         else:
             assert self._test_last_x_time_ref is not None
-            nw = self._num_test_windows
-            t_ref = self._test_last_x_time_ref[idx % nw]
+            t_ref = self._test_last_x_time_ref[win_idx]
 
         file_idx = idx // nw
         p = self.sample_files[file_idx]
@@ -814,7 +999,7 @@ class PVDataset(Dataset):
         dev_idx_i = torch.tensor(self._dev_idx_map[dev_dn_i], dtype=torch.long)
 
         sample = self._try_build_sample_for_split_window(
-            dfi, dev_idx_i, r_fixed, t_ref, p.name
+            dfi, dev_idx_i, r_fixed, t_ref, p.name, win_idx=win_idx
         )
         if sample is not None:
             return sample
@@ -906,6 +1091,84 @@ def collate_batched(batch: list[dict]) -> dict:
 
     vals = [s["nwp_tensor"] for s in batch]
     out["nwp_tensor"] = None if any(v is None for v in vals) else torch.stack(vals)
+    return out
+
+
+def collate_with_shared_sat_sky(
+    pv_samples: list[dict],
+    sat_sky_bundle: dict[str, torch.Tensor | None],
+) -> dict:
+    """Stack PV-only samples and broadcast shared sat/sky imagery to batch dim."""
+    if not pv_samples:
+        raise ValueError("empty batch")
+
+    def _stack(key: str) -> torch.Tensor:
+        return torch.stack([s[key] for s in pv_samples])
+
+    bsz = len(pv_samples)
+    out: dict = {
+        "dev_idx": _stack("dev_idx"),
+        "pv": _stack("pv"),
+        "pv_mask": _stack("pv_mask"),
+        "pv_timefeats": _stack("pv_timefeats"),
+        "kt": _stack("kt"),
+        "kt_mask": _stack("kt_mask"),
+        "p_cs": _stack("p_cs"),
+        "weather_ghi": _stack("weather_ghi"),
+        "theory_ghi": _stack("theory_ghi"),
+        "p_mean": _stack("p_mean"),
+        "forecast_timefeats": _stack("forecast_timefeats"),
+        "target_pv": _stack("target_pv"),
+        "target_mask": _stack("target_mask"),
+        "target_p_cs": _stack("target_p_cs"),
+        "target_weather_ghi": _stack("target_weather_ghi"),
+        "target_theory_ghi": _stack("target_theory_ghi"),
+    }
+    if "sample_valid" in pv_samples[0]:
+        out["sample_valid"] = _stack("sample_valid")
+
+    vals = [s["nwp_tensor"] for s in pv_samples]
+    out["nwp_tensor"] = None if any(v is None for v in vals) else torch.stack(vals)
+
+    def _expand_img(
+        tensor: torch.Tensor | None,
+        timefeats: torch.Tensor | None,
+        valid: torch.Tensor | None,
+        *,
+        default_tensor_shape: tuple[int, ...],
+        default_time_shape: tuple[int, ...],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if tensor is None:
+            tensor = torch.zeros(*default_tensor_shape, dtype=torch.float32)
+        if timefeats is None:
+            timefeats = torch.zeros(*default_time_shape, dtype=torch.float32)
+        valid_scalar = float(valid.item()) if valid is not None else 0.0
+        sat_b = tensor.unsqueeze(0).expand(bsz, *tensor.shape).contiguous()
+        tf_b = timefeats.unsqueeze(0).expand(bsz, *timefeats.shape).contiguous()
+        valid_b = torch.full((bsz,), valid_scalar, dtype=torch.float32)
+        return sat_b, tf_b, valid_b
+
+    sat_tensor, sat_timefeats, sat_valid_mask = _expand_img(
+        sat_sky_bundle.get("sat_tensor"),
+        sat_sky_bundle.get("sat_timefeats"),
+        sat_sky_bundle.get("sat_valid"),
+        default_tensor_shape=(24, 3, 100, 100),
+        default_time_shape=(24, 9),
+    )
+    out["sat_tensor"] = sat_tensor
+    out["sat_timefeats"] = sat_timefeats
+    out["sat_valid_mask"] = sat_valid_mask
+
+    skimg_tensor, skimg_timefeats, skimg_valid_mask = _expand_img(
+        sat_sky_bundle.get("skimg_tensor"),
+        sat_sky_bundle.get("skimg_timefeats"),
+        sat_sky_bundle.get("skimg_valid"),
+        default_tensor_shape=(30, 3, 224, 224),
+        default_time_shape=(30, 9),
+    )
+    out["skimg_tensor"] = skimg_tensor
+    out["skimg_timefeats"] = skimg_timefeats
+    out["skimg_valid_mask"] = skimg_valid_mask
     return out
 
 
