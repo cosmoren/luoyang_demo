@@ -31,6 +31,30 @@ VALID_STATE = 512
 INVERTER_STATE_COL = "inverter_state"
 _NS_PER_HOUR = 3_600_000_000_000
 _NS_PER_DAY = 86_400_000_000_000
+_NWP_DEFAULT_TZ = "Asia/Shanghai"
+
+
+def _nwp_to_utc_datetime(values: pd.Series) -> pd.Series:
+    """
+    Parse NWP timestamps to UTC.
+
+    Rule:
+    - timezone-aware values: respect their own timezone and convert to UTC.
+    - naive values (no timezone info): interpret as Asia/Shanghai, then convert to UTC.
+    """
+    idx = values.index
+    out: list[pd.Timestamp] = []
+    for v in values.tolist():
+        t = pd.to_datetime(v, errors="coerce")
+        if pd.isna(t):
+            out.append(pd.NaT)
+            continue
+        ts = pd.Timestamp(t)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(_NWP_DEFAULT_TZ, ambiguous="NaT", nonexistent="shift_forward")
+        ts = ts.tz_convert("UTC")
+        out.append(ts)
+    return pd.Series(pd.DatetimeIndex(out), index=idx)
 
 
 def load_csv(csv_path: Path | str) -> pd.DataFrame:
@@ -65,8 +89,8 @@ def _precompute_nwp_blocks(
         return None
     if "start_time" not in df.columns or "forecast_time" not in df.columns:
         return {}
-    start_ns_all = pd.to_datetime(df["start_time"], utc=True).astype("int64").to_numpy()
-    ft_ns_all = pd.to_datetime(df["forecast_time"], utc=True).astype("int64").to_numpy()
+    start_ns_all = _nwp_to_utc_datetime(df["start_time"]).astype("int64").to_numpy()
+    ft_ns_all = _nwp_to_utc_datetime(df["forecast_time"]).astype("int64").to_numpy()
     n_total = start_ns_all.shape[0]
     if n_total == 0:
         return {}
@@ -121,11 +145,12 @@ def _normalize_nwp_frame(df: pd.DataFrame, *, kind: str) -> pd.DataFrame:
     if "forecast_time" not in out.columns and "dtime" in out.columns and "start_time" in out.columns:
         dt_raw = out["dtime"]
         dt_num = pd.to_numeric(dt_raw, errors="coerce")
+        start_utc = _nwp_to_utc_datetime(out["start_time"])
         if dt_num.notna().any():
-            out["forecast_time"] = pd.to_datetime(out["start_time"], errors="coerce", utc=True) + pd.to_timedelta(dt_num, unit="h")
+            out["forecast_time"] = start_utc + pd.to_timedelta(dt_num, unit="h")
         else:
             dt_td = pd.to_timedelta(dt_raw, errors="coerce")
-            out["forecast_time"] = pd.to_datetime(out["start_time"], errors="coerce", utc=True) + dt_td
+            out["forecast_time"] = start_utc + dt_td
 
     if kind == "solar":
         if "ssrd" not in out.columns and "GHI_mean" in out.columns:
@@ -285,21 +310,15 @@ class PVDataset(Dataset):
         self._sat_sky_cache_loads = 0
         self._sat_sky_cache_hits = 0
 
+        # Lazy-open zarr in the worker/current process (never in __init__).
+        # Eager open_zarr here + DataLoader fork(num_workers>0) deadlocks on NFS zarr.
         self.satimg_ds = None
         self.skyimg_ds = None
-        if self._satimg_dir.exists():
-            try:
-                self.satimg_ds = xr.open_zarr(self._satimg_dir)
-            except Exception as e:
-                print(f"[PVDataset2026] WARNING: open sat zarr failed: {e}")
-        else:
+        self._satimg_zarr_failed = False
+        self._skyimg_zarr_failed = False
+        if not self._satimg_dir.exists():
             print(f"[PVDataset2026] WARNING: sat zarr dir not found: {self._satimg_dir}")
-        if self._skyimg_dir.exists():
-            try:
-                self.skyimg_ds = xr.open_zarr(self._skyimg_dir)
-            except Exception as e:
-                print(f"[PVDataset2026] WARNING: open sky zarr failed: {e}")
-        else:
+        if not self._skyimg_dir.exists():
             print(f"[PVDataset2026] WARNING: sky zarr dir not found: {self._skyimg_dir}")
 
         cfg = {}
@@ -555,7 +574,23 @@ class PVDataset(Dataset):
             out[key] = val.clone() if isinstance(val, torch.Tensor) else val
         return out
 
+    def _ensure_zarr_open(self) -> None:
+        """Open sat/sky zarr stores in the current process on first use."""
+        if self.satimg_ds is None and not self._satimg_zarr_failed and self._satimg_dir.exists():
+            try:
+                self.satimg_ds = xr.open_zarr(self._satimg_dir)
+            except Exception as e:
+                self._satimg_zarr_failed = True
+                print(f"[PVDataset2026] WARNING: open sat zarr failed: {e}", flush=True)
+        if self.skyimg_ds is None and not self._skyimg_zarr_failed and self._skyimg_dir.exists():
+            try:
+                self.skyimg_ds = xr.open_zarr(self._skyimg_dir)
+            except Exception as e:
+                self._skyimg_zarr_failed = True
+                print(f"[PVDataset2026] WARNING: open sky zarr failed: {e}", flush=True)
+
     def _load_sat_sky_modality(self, time0_utc: pd.Timestamp) -> dict[str, torch.Tensor | None]:
+        self._ensure_zarr_open()
         sat_tensor = None
         sat_timefeats = None
         sat_valid = torch.tensor(0.0, dtype=torch.float32)

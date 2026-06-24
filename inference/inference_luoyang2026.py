@@ -24,6 +24,13 @@ python inference/inference_luoyang2026.py \
   --cache_dir inference_cache/luoyang2026_test_cache \
   --profile_every 100 \
   --output_dir inference_results/luoyang2026_15m_fullcache
+
+python inference/inference_luoyang2026.py \
+  --task 48h \
+  --checkpoint checkpoint_2026_fixedhuber/pv_forecast_vit_best_task_48h_gpu7.pt \
+  --dataset-config conf_luoyang_2026.yaml \
+  --device cuda:0 \
+  --output_dir inference_results/luoyang2026_48h_daily
 """
 
 from __future__ import annotations
@@ -50,12 +57,20 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from dataloader.luoyang_2026_zarr import (  # noqa: E402
+    INVERTER_STATE_COL,
     PVDataset,
+    VALID_STATE,
     collate_batched,
     collate_with_shared_sat_sky,
+    interpolate_nwp_features,
     list_csv_files,
 )
 from models.models import pv_forecasting_model_vit_imgs  # noqa: E402
+from modules.solar_encoder import (  # noqa: E402
+    compute_solar_features,
+    delta_time_encoder,
+    solar_features_encoder,
+)
 from training.train_vit_luoyang2026 import (  # noqa: E402
     TASK_TO_INDEX,
     _batch_to_device,
@@ -68,6 +83,8 @@ from training.train_vit_luoyang2026 import (  # noqa: E402
 _DEFAULT_DATASET_CONFIG = "conf_luoyang_2026.yaml"
 _DEFAULT_STRIDE_MIN = 5
 _DATASETS_CONFIG_DIR = _PROJECT_ROOT / "config" / "datasets"
+_TEST_RANGE_START_BJ = pd.Timestamp("2026-05-11", tz="Asia/Shanghai").date()
+_TEST_RANGE_END_BJ = pd.Timestamp("2026-06-11", tz="Asia/Shanghai").date()
 
 
 @dataclass(frozen=True)
@@ -1097,6 +1114,297 @@ def _worker_entry(
     )
 
 
+def _build_48h_daily_batch(
+    ds: PVDataset,
+    df: pd.DataFrame,
+    *,
+    row_idx: int,
+    dev_idx: torch.Tensor,
+    query_utc: list[pd.Timestamp],
+) -> dict:
+    j = int(row_idx)
+    x_idx = j + ds._x_tail_1d
+    if int(x_idx.min()) < 0 or int(x_idx.max()) >= len(df):
+        raise ValueError(f"history out of bounds at row_idx={row_idx}")
+
+    sub_x = df.iloc[x_idx]
+    hist_ts_utc = ds._to_utc_timestamps(list(sub_x["collectTime"]))
+    time0_utc = hist_ts_utc[-1]
+
+    pow_x = pd.to_numeric(sub_x["final_power"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+    if "kt" in sub_x.columns:
+        kt_np = pd.to_numeric(sub_x["kt"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+    else:
+        kt_np = np.zeros_like(pow_x, dtype=np.float32)
+
+    if "kt_mask" in sub_x.columns:
+        kt_mask_np = pd.to_numeric(sub_x["kt_mask"], errors="coerce").fillna(1.0).to_numpy(dtype=np.float32)
+    elif INVERTER_STATE_COL in sub_x.columns:
+        inv_x = pd.to_numeric(sub_x[INVERTER_STATE_COL], errors="coerce").fillna(0).to_numpy(dtype=np.int32)
+        kt_mask_np = (inv_x == VALID_STATE).astype(np.float32)
+    else:
+        kt_mask_np = np.ones_like(pow_x, dtype=np.float32)
+
+    mean_pow_x = float(np.mean(pow_x)) if len(pow_x) else 0.0
+    if "p_mean" in sub_x.columns:
+        p_mean_np = pd.to_numeric(sub_x["p_mean"], errors="coerce").fillna(mean_pow_x).to_numpy(dtype=np.float32)
+        p_mean = float(p_mean_np[-1]) if len(p_mean_np) else max(mean_pow_x, 1e-6)
+    else:
+        p_mean = max(mean_pow_x, 1e-6)
+
+    pv_solar = compute_solar_features(hist_ts_utc, latitude=34.69984, longitude=112.28440)
+    pv_timefeats = solar_features_encoder(pv_solar)
+    pv_dtime = delta_time_encoder(hist_ts_utc, time0_utc)
+    pv_timefeats = torch.cat([pv_timefeats, pv_dtime.unsqueeze(1)], dim=1).unsqueeze(0)
+
+    query_solar = compute_solar_features(query_utc, latitude=34.69984, longitude=112.28440)
+    forecast_timefeats = solar_features_encoder(query_solar)
+    forecast_dtime = delta_time_encoder(query_utc, time0_utc)
+    forecast_timefeats = torch.cat([forecast_timefeats, forecast_dtime.unsqueeze(1)], dim=1).unsqueeze(0)
+
+    nwp_out = interpolate_nwp_features(ds._nwp_solar_blocks, ds._nwp_wind_blocks, query_utc)
+    nwp_tensor = None if nwp_out is None else torch.from_numpy(np.asarray(nwp_out, dtype=np.float32)).unsqueeze(0)
+
+    q_utc_index = pd.DatetimeIndex(query_utc)
+    truth_series = df.set_index("collectTime_utc")["final_power"].reindex(q_utc_index)
+    if truth_series.isna().any():
+        raise ValueError("missing truth final_power for next-day 288 points")
+    target_pv = torch.from_numpy(pd.to_numeric(truth_series, errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)).unsqueeze(0)
+
+    if "p_cs" in df.columns:
+        pcs_series = df.set_index("collectTime_utc")["p_cs"].reindex(q_utc_index)
+        if pcs_series.isna().any():
+            target_p_cs = torch.ones(1, len(query_utc), dtype=torch.float32)
+        else:
+            target_p_cs = torch.from_numpy(pd.to_numeric(pcs_series, errors="coerce").fillna(1.0).to_numpy(dtype=np.float32)).unsqueeze(0)
+    else:
+        target_p_cs = torch.ones(1, len(query_utc), dtype=torch.float32)
+
+    sat_bundle = ds._load_sat_sky_modality(time0_utc)
+    sat_tensor_raw = sat_bundle.get("sat_tensor")
+    sat_timefeats_raw = sat_bundle.get("sat_timefeats")
+    sat_valid_raw = sat_bundle.get("sat_valid")
+    skimg_tensor_raw = sat_bundle.get("skimg_tensor")
+    skimg_timefeats_raw = sat_bundle.get("skimg_timefeats")
+    skimg_valid_raw = sat_bundle.get("skimg_valid")
+
+    sat_tensor = None if sat_tensor_raw is None else sat_tensor_raw.unsqueeze(0)
+    sat_timefeats = None if sat_timefeats_raw is None else sat_timefeats_raw.unsqueeze(0)
+    sat_valid_mask = (
+        None
+        if sat_valid_raw is None
+        else torch.tensor([float(sat_valid_raw.item())], dtype=torch.float32)
+    )
+    skimg_tensor = None if skimg_tensor_raw is None else skimg_tensor_raw.unsqueeze(0)
+    skimg_timefeats = None if skimg_timefeats_raw is None else skimg_timefeats_raw.unsqueeze(0)
+    skimg_valid_mask = (
+        None
+        if skimg_valid_raw is None
+        else torch.tensor([float(skimg_valid_raw.item())], dtype=torch.float32)
+    )
+
+    return {
+        "dev_idx": dev_idx.unsqueeze(0),
+        "kt": torch.from_numpy(kt_np).unsqueeze(0).unsqueeze(0),
+        "kt_mask": torch.from_numpy(kt_mask_np).unsqueeze(0).unsqueeze(0),
+        "pv_timefeats": pv_timefeats,
+        "forecast_timefeats": forecast_timefeats,
+        "target_pv": target_pv,
+        "target_p_cs": target_p_cs,
+        "p_mean": torch.tensor([p_mean], dtype=torch.float32),
+        "sat_tensor": sat_tensor,
+        "sat_timefeats": sat_timefeats,
+        "sat_valid_mask": sat_valid_mask,
+        "skimg_tensor": skimg_tensor,
+        "skimg_timefeats": skimg_timefeats,
+        "skimg_valid_mask": skimg_valid_mask,
+        "nwp_tensor": nwp_tensor,
+    }
+
+
+def _run_inference_48h_daily(
+    *,
+    checkpoint: Path,
+    dataset_config: str,
+    out_dir: Path,
+    device: torch.device,
+    max_inverters: int | None,
+) -> None:
+    ds = PVDataset(**_dataset_kwargs_for_infer(dataset_config, "test", test_stride_min_override=_DEFAULT_STRIDE_MIN))
+    all_files = list(ds.sample_files)
+    if max_inverters is not None:
+        all_files = all_files[: int(max_inverters)]
+    if not all_files:
+        raise RuntimeError("No inverter CSV files found for 48h daily inference")
+
+    model = _load_model(checkpoint, device, ds.devDn_list)
+    out_daily_dir = out_dir / "daily_48h" / "inverters"
+    out_daily_dir.mkdir(parents=True, exist_ok=True)
+    station_out_path = out_dir / "daily_48h" / "station_total_48h.csv"
+    station_daily_sum: dict[str, dict[str, object]] = {}
+    station_mismatch_days = 0
+
+    tag = "[inference_luoyang2026 48h]"
+    print(
+        f"{tag} device={device} inverters={len(all_files)} "
+        f"target_day_bj=[{_TEST_RANGE_START_BJ}..{_TEST_RANGE_END_BJ}]",
+        flush=True,
+    )
+    done_files = 0
+    total_days = 0
+    total_skipped = 0
+
+    with torch.no_grad():
+        for file_idx, p in enumerate(all_files, start=1):
+            k = p.resolve().as_posix()
+            if k in ds._csv_cache:
+                df = ds._csv_cache[k].copy()
+            else:
+                df = pd.read_csv(p)
+            if "collectTime" not in df.columns:
+                print(f"{tag} skip {p.name}: missing collectTime", flush=True)
+                continue
+            df["collectTime_utc"] = pd.to_datetime(df["collectTime"], errors="coerce", utc=True)
+            df = df.dropna(subset=["collectTime_utc"]).sort_values("collectTime_utc").reset_index(drop=True)
+            if df.empty:
+                print(f"{tag} skip {p.name}: no valid timestamps", flush=True)
+                continue
+
+            ts_bj = df["collectTime_utc"].dt.tz_convert("Asia/Shanghai")
+            anchor_mask = (ts_bj.dt.hour == 9) & (ts_bj.dt.minute == 0) & (ts_bj.dt.second == 0)
+            anchor_rows = np.flatnonzero(anchor_mask.to_numpy(dtype=bool))
+            if anchor_rows.size == 0:
+                print(f"{tag} {p.name}: no 09:00 BJ anchors", flush=True)
+                continue
+
+            dev_dn = p.stem.replace("_", "=")
+            dev_idx = torch.tensor(ds._dev_idx_map[dev_dn], dtype=torch.long)
+            safe_inv = dev_dn.replace("=", "_").replace("/", "_")
+            out_path = out_daily_dir / f"{safe_inv}.csv"
+            day_to_anchor: dict[str, int] = {}
+            for r in anchor_rows.tolist():
+                day_key = str(ts_bj.iloc[int(r)].date())
+                if day_key not in day_to_anchor:
+                    day_to_anchor[day_key] = int(r)
+
+            success_days = 0
+            skipped_days = 0
+            in_range_days = 0
+            with open(out_path, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh)
+                for anchor_day, r in sorted(day_to_anchor.items()):
+                    t_anchor_bj = ts_bj.iloc[int(r)]
+                    target_day_start_bj = t_anchor_bj.normalize() + pd.Timedelta(days=1)
+                    target_day_date = pd.Timestamp(target_day_start_bj).date()
+                    if not (_TEST_RANGE_START_BJ <= target_day_date <= _TEST_RANGE_END_BJ):
+                        continue
+                    in_range_days += 1
+                    query_bj = pd.date_range(start=target_day_start_bj, periods=288, freq="5min", tz="Asia/Shanghai")
+                    query_utc_index = query_bj.tz_convert("UTC")
+                    query_utc = [pd.Timestamp(t) for t in query_utc_index]
+
+                    try:
+                        batch = _build_48h_daily_batch(
+                            ds,
+                            df,
+                            row_idx=int(r),
+                            dev_idx=dev_idx,
+                            query_utc=query_utc,
+                        )
+                    except Exception as e:
+                        skipped_days += 1
+                        print(f"{tag} {p.name} day={anchor_day} skipped: {e}", flush=True)
+                        continue
+
+                    d = _batch_to_device(batch, device)
+                    pred_kW = predict_pv_kW(model, d).float()
+                    pred_row = pred_kW[0].detach().cpu().numpy()
+                    true_row = batch["target_pv"][0].detach().cpu().numpy()
+                    if pred_row.shape[0] != 288 or true_row.shape[0] != 288:
+                        skipped_days += 1
+                        print(
+                            f"{tag} {p.name} day={anchor_day} skipped: invalid lengths "
+                            f"pred={pred_row.shape[0]} true={true_row.shape[0]}",
+                            flush=True,
+                        )
+                        continue
+
+                    utc_list = [pd.Timestamp(t).isoformat() for t in query_utc_index]
+                    bj_list = [pd.Timestamp(t).isoformat() for t in query_bj]
+                    time_pairs = [f"{u}|{b}" for u, b in zip(utc_list, bj_list)]
+                    target_day = str(target_day_start_bj.date())
+
+                    writer.writerow([f"time_utc_bj|{target_day}"] + time_pairs)
+                    writer.writerow([f"pv_pred_kW|{target_day}"] + [f"{float(v):.6f}" for v in pred_row.tolist()])
+                    writer.writerow([f"pv_true_kW|{target_day}"] + [f"{float(v):.6f}" for v in true_row.tolist()])
+
+                    pred_np = pred_row.astype(np.float64, copy=False)
+                    true_np = true_row.astype(np.float64, copy=False)
+                    agg = station_daily_sum.get(target_day)
+                    if agg is None:
+                        station_daily_sum[target_day] = {
+                            "time_pairs": list(time_pairs),
+                            "pred_sum": pred_np.copy(),
+                            "true_sum": true_np.copy(),
+                            "count": 1,
+                        }
+                    else:
+                        agg_time_pairs = agg["time_pairs"]
+                        agg_pred = agg["pred_sum"]
+                        agg_true = agg["true_sum"]
+                        if (
+                            not isinstance(agg_time_pairs, list)
+                            or not isinstance(agg_pred, np.ndarray)
+                            or not isinstance(agg_true, np.ndarray)
+                            or len(agg_time_pairs) != len(time_pairs)
+                        ):
+                            station_mismatch_days += 1
+                            print(
+                                f"{tag} station aggregate mismatch day={target_day} file={p.name}: "
+                                "inconsistent schema, skip this inverter/day for station sum",
+                                flush=True,
+                            )
+                        else:
+                            agg_pred += pred_np
+                            agg_true += true_np
+                            agg["count"] = int(agg.get("count", 0)) + 1
+
+                    success_days += 1
+
+            total_days += int(in_range_days)
+            total_skipped += int(skipped_days)
+            done_files += 1
+            print(
+                f"{tag} {file_idx}/{len(all_files)} {p.name}: anchors_all={len(day_to_anchor)} "
+                f"in_range={in_range_days} "
+                f"success={success_days} skipped={skipped_days}",
+                flush=True,
+            )
+
+    station_days_written = 0
+    with open(station_out_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        for target_day in sorted(station_daily_sum.keys()):
+            rec = station_daily_sum[target_day]
+            time_pairs = rec["time_pairs"]
+            pred_sum = rec["pred_sum"]
+            true_sum = rec["true_sum"]
+            if not isinstance(time_pairs, list) or not isinstance(pred_sum, np.ndarray) or not isinstance(true_sum, np.ndarray):
+                continue
+            writer.writerow([f"time_utc_bj|{target_day}"] + list(time_pairs))
+            writer.writerow([f"pv_pred_kW|{target_day}"] + [f"{float(v):.6f}" for v in pred_sum.tolist()])
+            writer.writerow([f"pv_true_kW|{target_day}"] + [f"{float(v):.6f}" for v in true_sum.tolist()])
+            station_days_written += 1
+
+    print(
+        f"{tag} done: inverters={done_files}/{len(all_files)} total_anchor_days={total_days} "
+        f"skipped_days={total_skipped} station_days={station_days_written} "
+        f"station_mismatch_days={station_mismatch_days} output_dir={out_daily_dir} "
+        f"station_file={station_out_path}",
+        flush=True,
+    )
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Luoyang 2026 test-set inference (15m / 4h single horizon)."
@@ -1106,7 +1414,10 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         required=True,
         choices=("15m", "4h", "48h"),
-        help="Forecast horizon: 15m (index 0), 4h (index 15), 48h (not implemented).",
+        help=(
+            "Forecast mode: 15m(index 0), 4h(index 15), "
+            "48h(daily mode: BJ 09:00 anchor -> next-day 288x5min output)."
+        ),
     )
     parser.add_argument(
         "--checkpoint",
@@ -1196,8 +1507,6 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    if args.task == "48h":
-        raise NotImplementedError("48h inference is not implemented yet.")
     if args.stride_min <= 0:
         raise ValueError(f"--stride_min must be positive (got {args.stride_min})")
     cache_dir: Path | None = None
@@ -1211,10 +1520,6 @@ def main() -> None:
         cache_manifest = _load_cache_manifest(cache_dir)
         cache_full = (cache_dir / "pv_batches").is_dir()
 
-    horizon_idx = _horizon_idx(args.task)
-    gpu_ids = _parse_gpu_ids(args.num_gpus, args.gpu_ids)
-    world_size = len(gpu_ids)
-
     ckpt_path = Path(args.checkpoint).expanduser().resolve()
     if not ckpt_path.is_file():
         raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
@@ -1224,6 +1529,40 @@ def main() -> None:
     shard_dir = out_dir / "shards"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_inv_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.task == "48h":
+        gpu_ids = _parse_gpu_ids(args.num_gpus, args.gpu_ids)
+        if len(gpu_ids) != 1:
+            raise ValueError("48h daily mode currently supports single-GPU only (--num_gpus 1).")
+        if args.cache_dir is not None:
+            print(
+                "[inference_luoyang2026] WARNING: --cache_dir is ignored in 48h daily mode.",
+                flush=True,
+            )
+        device_override = args.device
+        if device_override is None and torch.cuda.is_available():
+            device = torch.device(f"cuda:{gpu_ids[0]}")
+        elif device_override is not None:
+            device = torch.device(device_override)
+        else:
+            device = torch.device("cpu")
+        print(
+            f"[inference_luoyang2026] task=48h checkpoint={ckpt_path} output_dir={out_dir} "
+            f"device={device} max_inverters={args.max_inverters}",
+            flush=True,
+        )
+        _run_inference_48h_daily(
+            checkpoint=ckpt_path,
+            dataset_config=args.dataset_config,
+            out_dir=out_dir,
+            device=device,
+            max_inverters=args.max_inverters,
+        )
+        return
+
+    horizon_idx = _horizon_idx(args.task)
+    gpu_ids = _parse_gpu_ids(args.num_gpus, args.gpu_ids)
+    world_size = len(gpu_ids)
 
     all_files = _list_infer_sample_files(args.dataset_config, max_inverters=args.max_inverters)
     if not all_files:
