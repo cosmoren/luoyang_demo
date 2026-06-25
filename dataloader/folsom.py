@@ -82,12 +82,26 @@ from dataloader.luoyang_mem import list_csv_files
 from modules.solar_encoder import compute_solar_features, delta_time_encoder, solar_features_encoder
 from SPMF_preprocessing.fisheye_calib import fisheye_sunmask
 from SPMF_preprocessing.fisheye_calib.fisheye_raymap import compute_ray_map
+from SPMF_preprocessing.fisheye_calib.sky_rgb_mask import (
+    apply_sky_rgb_mask,
+    normalize_sky_rgb_mask_mode,
+)
 
 # Sky-branch channel-selection abstraction (Folsom only, for now). The dataset YAML
 # may set ``sampling.sky_channels`` to a list of feature names; the resulting
 # ``skimg_tensor`` concatenates each feature along the channel dim in list order.
 # Default (key absent or ``["rgb"]``) is byte-identical to the historical 3-channel
-# behavior. Sun-mask is reserved for a follow-up commit and currently raises.
+# behavior.
+#
+# Fisheye geometry conventions (training + inference share the same rules):
+#   * Training RGB: raw, unflipped Folsom JPGs resized to ``skyimg_spatial_size`` (224).
+#   * Calibration: (cx, cy, f, alpha0) fitted at native 1536 in horizontally flipped-u
+#     space; see ``SPMF_preprocessing/fisheye_calib/`` and ``folsom_fisheye_fit.csv``.
+#   * ray_map: ``fisheye_raymap.compute_ray_map`` — image-axis unit vectors; cx mirrored
+#     to raw (``cx_raw = (native-1) - cx_fit``), ``(N-1)/(native-1)`` scaling; alpha0
+#     does not enter.
+#   * sun_mask: ``fisheye_sunmask.compute_sun_mask`` — project in flip space, mirror u to
+#     raw via ``u_raw = (native-1) - u_flip``, Euclidean disc ``R = f_s * deg2rad(radius)``.
 _SKY_CHANNEL_RGB = "rgb"
 _SKY_CHANNEL_RAY_MAP = "ray_map"
 _SKY_CHANNEL_SUN_MASK = "sun_mask"
@@ -98,15 +112,15 @@ _SKY_CHANNEL_WIDTHS: dict[str, int] = {
 }
 _DEFAULT_SKY_CHANNELS: tuple[str, ...] = (_SKY_CHANNEL_RGB,)
 
-# Default angular radius (degrees) for the ``sun_mask`` channel; overridable via
-# ``sampling.sun_mask_radius_deg`` in the dataset YAML. The sun's apparent radius
-# is ~0.27°, but the bright glare halo on the Folsom fisheye saturates pixels
-# out to ~18-19° from the sun center on overhead-noon clear-sky frames
-# (empirically measured in playground/2026-06-15_sunmask-bigger/measure_halo_v2.py
-# on 2014-05-11: r_max = 18.70° at 20:00Z noon, much smaller at low-sun hours).
+# Default mask radius (degrees, converted to pixels as ``R = f_s * deg2rad(radius)``)
+# for the ``sun_mask`` channel; overridable via ``sampling.sun_mask_radius_deg``
+# in the dataset YAML. The sun's apparent radius is ~0.27°, but the bright glare
+# halo on the Folsom fisheye saturates pixels out to ~18-19° from the sun center
+# on overhead-noon clear-sky frames (empirically measured in
+# playground/2026-06-15_sunmask-bigger/measure_halo_v2.py on 2014-05-11:
+# r_max = 18.70° at 20:00Z noon, much smaller at low-sun hours).
 # 30° gives ~60% safety margin so the mask reliably covers sun+halo at all sun
-# positions including frames where the lens-projection FoV correction below
-# isn't perfectly fitted; at 224x224 this is ~37 px linear radius.
+# positions; at 224x224 this is ~37 px Euclidean radius in image space.
 # See ``_compute_sun_mask_for_frames``.
 _DEFAULT_SUN_MASK_RADIUS_DEG: float = 30.0
 
@@ -598,6 +612,8 @@ class FolsomIrradianceDataset(Dataset):
         use_satellite: bool = False,
         sky_channels: list[str] | tuple[str, ...] | None = None,
         sun_mask_radius_deg: float | None = None,
+        sky_rgb_mask_mode: str | None = None,
+        sky_rgb_mask_radius_px: float | None = None,
     ):
         self._config_path = Path(config_path).resolve()
         if not self._config_path.is_file():
@@ -667,6 +683,17 @@ class FolsomIrradianceDataset(Dataset):
                 "a half-sky disc is almost certainly a config mistake"
             )
         self.sun_mask_radius_deg: float = radius
+
+        self.sky_rgb_mask_mode: str = normalize_sky_rgb_mask_mode(sky_rgb_mask_mode)
+        if sky_rgb_mask_radius_px is not None:
+            r_px = float(sky_rgb_mask_radius_px)
+            if not (r_px > 0.0):
+                raise ValueError(
+                    f"sky_rgb_mask_radius_px must be > 0 (got {sky_rgb_mask_radius_px!r})"
+                )
+            self.sky_rgb_mask_radius_px: float | None = r_px
+        else:
+            self.sky_rgb_mask_radius_px = None
 
         # Sat config: when ``use_satellite=True`` the loader reads per-frame .npy shards
         # under ``satimg_dir/YYYY/MM/goes15_YYYYMMDD_HHMM.npy`` (GOES-15 GridSat-CONUS,
@@ -757,17 +784,23 @@ class FolsomIrradianceDataset(Dataset):
         # (paired with ``dev_idx=700`` returned by ``_build_tensors``).
         self.devDn_list = [0]
 
-        # CSV: glob ``pv_dir`` for *.csv (PVDataset convention); Folsom expects exactly one.
-        self.sample_files = list_csv_files(data_dir=pv_dir)
-        if not self.sample_files:
-            raise FileNotFoundError(f"No CSV files in {pv_dir!r}")
-        if len(self.sample_files) != 1:
-            names = ", ".join(p.name for p in self.sample_files)
-            raise RuntimeError(
-                f"Folsom dataset expects exactly one irradiance CSV under {pv_dir!r}, "
-                f"found {len(self.sample_files)}: {names}"
-            )
-        self._csv_path = self.sample_files[0].resolve()
+        # Irradiance CSV: explicit ``paths.folsom_irradiance_csv`` (preferred when multiple
+        # CSVs share ``pv_path``), else glob ``pv_dir`` for exactly one *.csv.
+        irr_rel = paths_cfg.get("folsom_irradiance_csv")
+        if irr_rel is not None and str(irr_rel).strip() != "":
+            self._csv_path = _resolve_folsom_csv_path(conf)
+            self.sample_files = [self._csv_path]
+        else:
+            self.sample_files = list_csv_files(data_dir=pv_dir)
+            if not self.sample_files:
+                raise FileNotFoundError(f"No CSV files in {pv_dir!r}")
+            if len(self.sample_files) != 1:
+                names = ", ".join(p.name for p in self.sample_files)
+                raise RuntimeError(
+                    f"Folsom dataset expects exactly one irradiance CSV under {pv_dir!r}, "
+                    f"found {len(self.sample_files)}: {names}"
+                )
+            self._csv_path = self.sample_files[0].resolve()
         _folsom_progress(f"dataset split={split!r}: preparing {self._csv_path.name} ...")
 
         # Sky: JPEG directory index, or Zarr store (``paths.sky_format``).
@@ -1100,7 +1133,7 @@ class FolsomIrradianceDataset(Dataset):
         return torch.stack(frames, dim=0)
 
     def _load_sky_tensor(self, path: Path) -> torch.Tensor:
-        """Return ``[3, s, s]`` float32 in ``[0, 1]`` (matches PVDataset)."""
+        """Return ``[3, s, s]`` float32 in ``[0, 1]`` from a raw (unflipped) Folsom JPG."""
         try:
             if path.is_file():
                 try:
@@ -1195,7 +1228,7 @@ class FolsomIrradianceDataset(Dataset):
         self._sky_valid_cache = torch.from_numpy(np.ascontiguousarray(valid, dtype=np.float32))
 
     def _get_ray_map(self) -> torch.Tensor:
-        """Lazy ``[3, H, W]`` float32 fisheye ray vectors at the sky spatial size."""
+        """Lazy ``[3, H, W]`` float32 image-axis ray map (``fisheye_raymap.compute_ray_map``)."""
         if self._ray_map_cache is None:
             self._build_ray_and_valid_cache()
         return self._ray_map_cache  # type: ignore[return-value]
@@ -1210,13 +1243,13 @@ class FolsomIrradianceDataset(Dataset):
         self,
         frame_timestamps_utc: list[pd.Timestamp],
     ) -> torch.Tensor:
-        """Per-frame ``[T, 1, H, W]`` float32 sun mask in calibrated fisheye coords.
+        """Per-frame ``[T, 1, H, W]`` float32 sun mask on the raw-image pixel grid.
 
         Thin wrapper around
         :func:`SPMF_preprocessing.fisheye_calib.fisheye_sunmask.compute_sun_mask`,
-        which owns the lens math (calibrated ``cx``, ``cy``, ``f``, ``alpha0``
-        from ``folsom_fisheye_fit.csv`` + the same horizontal flip the
-        calibration assumed). This method only:
+        which owns the lens math (fit at native 1536 in flipped-u space; project in
+        flip space, mirror ``u`` to raw, Euclidean disc ``R = f_s * deg2rad(radius)``).
+        This method only:
 
         1. Calls :func:`compute_solar_features` for the per-frame
            ``(azimuth, zenith)`` (meteorological convention: 0°=N, 90°=E,
@@ -1250,6 +1283,24 @@ class FolsomIrradianceDataset(Dataset):
         )
         mask_t = torch.from_numpy(np.ascontiguousarray(mask_np, dtype=np.float32))
         return mask_t.unsqueeze(1).contiguous()  # [T, 1, H, W]
+
+    def _apply_sky_rgb_gate(
+        self,
+        rgb_frames: torch.Tensor,
+        frame_timestamps: list[pd.Timestamp],
+    ) -> torch.Tensor:
+        """Zero RGB outside the configured sky disc; ``none`` is a no-op."""
+        if self.sky_rgb_mask_mode == "none":
+            return rgb_frames
+        return apply_sky_rgb_mask(
+            rgb_frames,
+            self.sky_rgb_mask_mode,
+            fit=self._get_fisheye_fit(),
+            frame_timestamps=frame_timestamps,
+            latitude=self.latitude,
+            longitude=self.longitude,
+            radius_px_override=self.sky_rgb_mask_radius_px,
+        )
 
     def _build_sky_channels(
         self,
@@ -1542,6 +1593,7 @@ class FolsomIrradianceDataset(Dataset):
         if self._sky_format == "zarr":
             nominal = self._nominal_sky_frame_times(t_x_end)
             rgb_frames = self._stack_sky_from_zarr(t_x_end)
+            rgb_frames = self._apply_sky_rgb_gate(rgb_frames, nominal)
             skimg_tensor = self._build_sky_channels(rgb_frames, nominal)
             skimg_solar_features = compute_solar_features(nominal, self.latitude, self.longitude)
             skimg_tf = solar_features_encoder(skimg_solar_features)
@@ -1557,6 +1609,7 @@ class FolsomIrradianceDataset(Dataset):
             skimg_dtf = delta_time_encoder(skimg_timestamps, time0)
             skimg_timefeats = torch.cat([skimg_tf, skimg_dtf.unsqueeze(1)], dim=1)
             rgb_frames = self._stack_sky_frames(skimg_paths)
+            rgb_frames = self._apply_sky_rgb_gate(rgb_frames, skimg_timestamps)
             skimg_tensor = self._build_sky_channels(rgb_frames, skimg_timestamps)
             skimg_timestamps = [
                 (None if p is None else pd.Timestamp(t).strftime("%Y%m%d%H%M%S"))
@@ -1733,6 +1786,8 @@ def build_folsom_irradiance_datasets_from_conf(
         use_satellite=bool(sampling_cfg.get("use_satellite", False)),
         sky_channels=sampling_cfg.get("sky_channels"),
         sun_mask_radius_deg=sampling_cfg.get("sun_mask_radius_deg"),
+        sky_rgb_mask_mode=sampling_cfg.get("sky_rgb_mask_mode"),
+        sky_rgb_mask_radius_px=sampling_cfg.get("sky_rgb_mask_radius_px"),
     )
     train_ds = FolsomIrradianceDataset(split="train", **kwargs)
     test_ds = FolsomIrradianceDataset(split="test", **kwargs)

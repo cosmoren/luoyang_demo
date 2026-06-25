@@ -12,21 +12,29 @@ The ray field lives in the **image-axis frame**:
 * ``ray[2]`` is the out-of-image (towards the lens entrance) component.
 
 This frame is intentionally world-agnostic: the calibration's ``alpha0`` yaw
-offset and the horizontal-flip convention used to build the sun mask do *not*
-enter here -- they describe how to align the *world* (East/North/Up) frame
-with the image, which is irrelevant when all you want is "what direction does
-each pixel look in, in image-axis coordinates". The image-axis ray field is
+offset does *not* enter here -- it describes how to align the *world*
+(East/North/Up) frame with the image, which is irrelevant when all you want is
+"what direction does each pixel look in, in image-axis coordinates". The
+horizontal flip *does* enter via mirroring ``cx`` from flipped calibration
+space to raw image coords (see Conventions below). The image-axis ray field is
 fully determined by the optical center ``(cx, cy)`` and focal length ``f``.
 
 Conventions
 -----------
+* Runtime training images are **raw, unflipped** Folsom JPGs resized to ``(H, W)``
+  (typically 224×224); geometry below maps those pixels back through the fit.
 * Equidistant fisheye: pixel distance ``r`` from the optical center maps to
   zenith angle ``theta = r / f`` (radians).
 * The fisheye image circle is the locus ``r <= f * pi/2`` (90° from optical
   axis); pixels outside it are flagged invalid and their rays are zeroed.
 * ``fit`` carries ``cx``, ``cy``, ``f`` measured at ``fit['native_size']``
-  (typically 1536 for Folsom); they are scaled by ``min(H, W) / native_size``
-  to the runtime grid.
+  (typically 1536 for Folsom) in the **horizontally flipped** calibration
+  space (same convention as :mod:`fisheye_sunmask`). Runtime images are
+  **raw** (unflipped), so ``cx`` is mirrored before scaling:
+  ``cx_raw = (native_size - 1) - cx_fit``; ``cy`` is unchanged.
+* Scaling to the runtime grid uses ``(min(H, W) - 1) / (native_size - 1)``,
+  matching :func:`fisheye_sunmask.project_sun_to_pixel` and a uniformly
+  resized JPG (the ``(W-1) - u`` flip does not commute with ``W / N`` scaling).
 """
 
 from __future__ import annotations
@@ -48,11 +56,13 @@ def compute_ray_map(
       valid: [1, H, W] float32 in {0, 1}, 1 inside the calibrated fisheye
              circle (pixel distance from (cx, cy) <= f * pi/2).
 
-    Uses fit['cx'], fit['cy'], fit['f'] (all stored at fit['native_size']),
-    scaled to (H, W). NOTE: fit['alpha0'] and the calibration's horizontal
-    flip do NOT enter here -- those are world-frame -> image-frame corrections
-    relevant for sun_mask only. The image-axis ray field is determined
-    solely by the optical center and focal length.
+    Uses fit['cx'], fit['cy'], fit['f'] (all stored at fit['native_size'] in
+    flipped calibration space). For raw-image coords, ``cx`` is mirrored
+    (``cx_raw = (native - 1) - cx_fit``); ``cy`` is unchanged. All three are
+    scaled with ``(min(H, W) - 1) / (native - 1)`` to match
+    :func:`fisheye_sunmask.project_sun_to_pixel`. ``fit['alpha0']`` and the
+    world-frame yaw do NOT enter here -- only the optical center and focal
+    length define the image-axis ray field.
     """
     if H <= 0 or W <= 0:
         raise ValueError(f"compute_ray_map: H, W must be > 0 (got {H}, {W})")
@@ -64,8 +74,10 @@ def compute_ray_map(
     if native <= 0:
         raise ValueError(f"compute_ray_map: native_size must be > 0 (got {native})")
 
-    scale = float(min(int(H), int(W))) / float(native)
-    cx_s = float(fit["cx"]) * scale
+    s = min(int(H), int(W))
+    scale = (float(s) - 1.0) / (float(native) - 1.0)
+    cx_raw = (float(native) - 1.0) - float(fit["cx"])
+    cx_s = cx_raw * scale
     cy_s = float(fit["cy"]) * scale
     f_s = float(fit["f"]) * scale
     if not (f_s > 0.0):

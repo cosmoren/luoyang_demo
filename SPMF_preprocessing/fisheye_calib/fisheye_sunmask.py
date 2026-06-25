@@ -4,12 +4,13 @@ Pure-numpy utilities that consume the (cx, cy, f, alpha0) parameters fitted by
 :mod:`SPMF_preprocessing.fisheye_calib.fisheye_model` and produce a binary sun
 mask in the runtime sky-tensor pixel grid.
 
-The fit is performed in the *horizontally flipped* image space (Folsom's raw
-JPGs have image-right = West, but the calibration tooling first applies an
-``u_flipped = (W-1) - u_raw`` flip so that image-right = East before fitting).
-Code consuming these params therefore has to undo the same flip when emitting
-raw-image pixel coordinates -- both for the sun-pixel projection and for the
-per-pixel ray-direction map built underneath :func:`compute_sun_mask`.
+The fit is performed in the *horizontally flipped* image space at native
+resolution (1536 for Folsom). Folsom's raw JPGs have image-right = West, but the
+calibration tooling first applies ``u_flipped = (W-1) - u_raw`` so that
+image-right = East before fitting. Runtime training images stay **raw and
+unflipped** (resized to e.g. 224×224); code consuming these params projects in
+flip space then mirrors ``u`` back via ``u_raw = (native-1) - u_flipped`` for
+both the sun-pixel location and the per-pixel Euclidean sun-mask disc.
 
 Conventions
 -----------
@@ -21,19 +22,17 @@ Conventions
   sign convention used by :func:`fisheye_model.predict_simple`.
 * ``f`` -- equidistant focal length in pixels-per-radian at the fit's native
   image size (typically the camera's native JPG width, e.g. 1536 for Folsom).
-* ``image_size`` -- runtime square sky-tensor size (e.g. 224); the fit
-  parameters are scaled by ``image_size / fit["native_size"]``.
+* ``image_size`` -- runtime square sky-tensor size (e.g. 224); fit params and
+  projected coords are remapped with ``(image_size - 1) / (native_size - 1)`` so
+  they align with a uniformly resized JPG (the ``(W-1) - u`` flip does not
+  commute with ``image_size / native_size`` scaling).
 
 Masking method
 --------------
-:func:`compute_sun_mask` thresholds the **angular** (great-circle) distance
-between the sun direction and each pixel's calibrated ray direction. This
-matches the playground calibration reference strip exactly (and the previous
-dataloader behavior up to the calibration upgrade). The Euclidean
-sun-pixel-distance approximation diverges from it at high zenith because
-equidistant pixel distance only equals ``f * angular_distance`` along the
-radial axis; it underestimates the angular disk along the azimuthal axis when
-the sun is far from the optical axis.
+:func:`compute_sun_mask` projects the sun onto the image via
+:func:`project_sun_to_pixel`, then marks pixels inside a **Euclidean pixel
+circle** of radius ``R = f_s * beta`` where ``beta = deg2rad(radius_deg)``.
+Frames with the sun below the horizon are all-zero.
 """
 
 from __future__ import annotations
@@ -80,13 +79,17 @@ def load_fisheye_fit(camera_name: str, native_size: int = 1536) -> dict:
 
 
 def _scale_fit_to_image(fit: dict, image_size: int) -> tuple[float, float, float, float]:
-    """Scale ``(cx, cy, f)`` from ``fit['native_size']`` to ``image_size``; alpha0 unchanged."""
+    """Scale ``(cx, cy, f)`` from ``fit['native_size']`` to ``image_size``; alpha0 unchanged.
+
+    Uses ``(image_size - 1) / (native_size - 1)`` so pixel coords stay consistent with
+    resizing a native JPG via uniform scale (same convention as ``(W-1) - u`` flip).
+    """
     native = int(fit["native_size"])
     if native <= 0:
         raise ValueError(f"fisheye_sunmask: native_size must be > 0 (got {native})")
     if image_size <= 0:
         raise ValueError(f"fisheye_sunmask: image_size must be > 0 (got {image_size})")
-    scale = float(image_size) / float(native)
+    scale = (float(image_size) - 1.0) / (float(native) - 1.0)
     return (
         float(fit["cx"]) * scale,
         float(fit["cy"]) * scale,
@@ -130,48 +133,28 @@ def project_sun_to_pixel(
     az_r = np.deg2rad(az)
     zen_r = np.deg2rad(zen)
 
-    r_pix = f_s * zen_r
-    u_flipped = cx_s + r_pix * np.sin(az_r - alpha0)
-    v_raw = cy_s - r_pix * np.cos(az_r - alpha0)
-    u_raw = (float(image_size) - 1.0) - u_flipped
+    # Project in native fit space, then remap with (W-1)/(N-1) so coords match a
+    # uniformly resized JPG (the (W-1) flip does not commute with W/N scaling).
+    native = int(fit["native_size"])
+    cx_n = float(fit["cx"])
+    cy_n = float(fit["cy"])
+    f_n = float(fit["f"])
+    r_pix_n = f_n * zen_r
+    u_flipped = cx_n + r_pix_n * np.sin(az_r - alpha0)
+    v_native = cy_n - r_pix_n * np.cos(az_r - alpha0)
+    u_native = (float(native) - 1.0) - u_flipped
+
+    if image_size == native:
+        u_raw = u_native
+        v_raw = v_native
+    else:
+        scale = (float(image_size) - 1.0) / (float(native) - 1.0)
+        u_raw = u_native * scale
+        v_raw = v_native * scale
 
     u_raw = np.where(above, u_raw, np.nan)
     v_raw = np.where(above, v_raw, np.nan)
     return u_raw, v_raw, above, (cx_s, cy_s, f_s)
-
-
-def _build_pixel_directions(
-    image_size: int, cx_s: float, cy_s: float, f_s: float, alpha0: float
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Per-pixel calibrated ray directions for a square raw-image grid.
-
-    Returns ``(rx, ry, rz, valid)``, each shape ``[image_size, image_size]``
-    ``float64`` (``valid`` is ``bool``). ``(rx, ry, rz)`` are unit-length
-    vectors in the ``(East, North, Up)`` frame; ``valid`` flags pixels whose
-    implied zenith is ``<= 90 deg`` (i.e. inside the fisheye image circle).
-
-    Mirrors the calibration reference (``playground/2026-06-16_folsom-lens-calib
-    /render_strip.py::build_pixel_directions``) so the runtime mask is
-    geometrically identical to the calibration tooling.
-    """
-    s = int(image_size)
-    ys, xs = np.meshgrid(np.arange(s), np.arange(s), indexing="ij")
-
-    u_flip = (s - 1) - xs.astype(np.float64)
-    dx = u_flip - float(cx_s)
-    dy = ys.astype(np.float64) - float(cy_s)
-
-    r = np.sqrt(dx * dx + dy * dy)
-    zen = r / float(f_s)
-    az = np.arctan2(dx, -dy) + float(alpha0)
-
-    sin_z = np.sin(zen)
-    rx = sin_z * np.sin(az)
-    ry = sin_z * np.cos(az)
-    rz = np.cos(zen)
-
-    valid = zen <= (np.pi / 2.0)
-    return rx, ry, rz, valid
 
 
 def compute_sun_mask(
@@ -183,12 +166,13 @@ def compute_sun_mask(
 ) -> np.ndarray:
     """Per-frame ``[T, image_size, image_size]`` ``float32`` binary sun mask.
 
-    For each frame, the sun's unit direction (from ``az_deg, zen_deg``) is
-    compared to every pixel's calibrated ray direction; pixels whose
-    great-circle angle to the sun is within ``radius_deg`` are marked ``1``.
-    Pixels outside the fisheye image circle and frames with the sun below the
-    horizon are forced to ``0``.
+    For each frame above the horizon:
 
+    1. Project the sun to ``(u_sun, v_sun)`` via :func:`project_sun_to_pixel`.
+    2. Set ``R = f_s * deg2rad(radius_deg)``.
+    3. Mark ``mask[v, u] = 1`` when ``(u - u_sun)^2 + (v - v_sun)^2 <= R^2``.
+
+    Frames with the sun below the horizon (``zen_deg >= 90``) are all-zero.
     The lens math (``cx, cy, f, alpha0`` + the calibration's horizontal flip)
     comes from ``fit`` (see :func:`load_fisheye_fit`); the runtime grid is
     ``image_size`` square and the fit is scaled from ``fit['native_size']``.
@@ -218,24 +202,24 @@ def compute_sun_mask(
 
     t = int(az.shape[0])
     s = int(image_size)
-    cx_s, cy_s, f_s, alpha0 = _scale_fit_to_image(fit, image_size)
 
-    rx, ry, rz, valid = _build_pixel_directions(s, cx_s, cy_s, f_s, alpha0)
+    u_sun, v_sun, above, (_cx_s, _cy_s, f_s) = project_sun_to_pixel(
+        az, zen, s, fit
+    )
+    radius_px = float(f_s) * float(np.deg2rad(radius_deg))
+    radius_px_sq = radius_px * radius_px
 
-    above = np.isfinite(az) & np.isfinite(zen) & (zen < 90.0)
-    az_r = np.deg2rad(az)
-    zen_r = np.deg2rad(zen)
-    sin_z = np.sin(zen_r)
-    sun_x = sin_z * np.sin(az_r)
-    sun_y = sin_z * np.cos(az_r)
-    sun_z = np.cos(zen_r)
-
-    cos_threshold = float(np.cos(np.deg2rad(radius_deg)))
+    u_grid, v_grid = np.meshgrid(
+        np.arange(s, dtype=np.float64),
+        np.arange(s, dtype=np.float64),
+        indexing="xy",
+    )
 
     out = np.zeros((t, s, s), dtype=np.float32)
     for i in range(t):
         if not bool(above[i]):
             continue
-        cos_a = rx * sun_x[i] + ry * sun_y[i] + rz * sun_z[i]
-        out[i] = ((cos_a >= cos_threshold) & valid).astype(np.float32)
+        du = u_grid - float(u_sun[i])
+        dv = v_grid - float(v_sun[i])
+        out[i] = (du * du + dv * dv <= radius_px_sq).astype(np.float32)
     return out

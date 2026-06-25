@@ -729,6 +729,29 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--sky-rgb-mask",
+        type=str,
+        default=None,
+        choices=["none", "valid_disc", "tight_disc", "sun_halo", "sun_only"],
+        metavar="MODE",
+        help=(
+            "RGB gating mode: keep pixels inside a Euclidean disc, zero RGB outside. "
+            "Precedence: this flag > sampling.sky_rgb_mask_mode in the dataset YAML > "
+            "'none' (no gating). Does not affect ray_map or sun_mask channels."
+        ),
+    )
+    parser.add_argument(
+        "--sky-rgb-mask-radius-px",
+        type=float,
+        default=None,
+        metavar="PX",
+        help=(
+            "Override the disc radius in pixels at 224×224 for the active --sky-rgb-mask "
+            "mode. Precedence: this flag > sampling.sky_rgb_mask_radius_px in YAML > "
+            "mode-specific default."
+        ),
+    )
+    parser.add_argument(
         "--tb-log-dir",
         type=str,
         default=None,
@@ -749,6 +772,8 @@ def _dataset_kwargs(
     use_satellite_override: bool | None = None,
     sky_channels_override: tuple[str, ...] | None = None,
     sun_mask_radius_deg_override: float | None = None,
+    sky_rgb_mask_mode_override: str | None = None,
+    sky_rgb_mask_radius_px_override: float | None = None,
 ) -> dict:
     base_cfg_path = _resolve_named_config(_DATASETS_CONFIG_DIR, dataset_config_name, "dataset-config")
     cfg_path = _folsom_pv_dataset_config_path(base_cfg_path)
@@ -818,6 +843,16 @@ def _dataset_kwargs(
             if sun_mask_radius_deg_override is not None
             else sampling_cfg.get("sun_mask_radius_deg")
         ),
+        sky_rgb_mask_mode=(
+            sky_rgb_mask_mode_override
+            if sky_rgb_mask_mode_override is not None
+            else sampling_cfg.get("sky_rgb_mask_mode")
+        ),
+        sky_rgb_mask_radius_px=(
+            sky_rgb_mask_radius_px_override
+            if sky_rgb_mask_radius_px_override is not None
+            else sampling_cfg.get("sky_rgb_mask_radius_px")
+        ),
     )
 
 
@@ -853,6 +888,38 @@ def _resolve_sun_mask_radius_deg(
     cfg_path = _folsom_pv_dataset_config_path(base_cfg_path)
     cfg = _load_yaml(cfg_path)
     yaml_value = (cfg.get("sampling", {}) or {}).get("sun_mask_radius_deg")
+    if yaml_value is None:
+        return None
+    return float(yaml_value)
+
+
+def _resolve_sky_rgb_mask_mode(
+    dataset_config_name: str,
+    cli_value: str | None,
+) -> str | None:
+    """Resolve ``sky_rgb_mask_mode``: CLI flag > YAML > ``None`` (loader default ``none``)."""
+    if cli_value is not None:
+        return str(cli_value)
+    base_cfg_path = _resolve_named_config(_DATASETS_CONFIG_DIR, dataset_config_name, "dataset-config")
+    cfg_path = _folsom_pv_dataset_config_path(base_cfg_path)
+    cfg = _load_yaml(cfg_path)
+    yaml_value = (cfg.get("sampling", {}) or {}).get("sky_rgb_mask_mode")
+    if yaml_value is None:
+        return None
+    return str(yaml_value)
+
+
+def _resolve_sky_rgb_mask_radius_px(
+    dataset_config_name: str,
+    cli_value: float | None,
+) -> float | None:
+    """Resolve ``sky_rgb_mask_radius_px``: CLI flag > YAML > ``None`` (mode default)."""
+    if cli_value is not None:
+        return float(cli_value)
+    base_cfg_path = _resolve_named_config(_DATASETS_CONFIG_DIR, dataset_config_name, "dataset-config")
+    cfg_path = _folsom_pv_dataset_config_path(base_cfg_path)
+    cfg = _load_yaml(cfg_path)
+    yaml_value = (cfg.get("sampling", {}) or {}).get("sky_rgb_mask_radius_px")
     if yaml_value is None:
         return None
     return float(yaml_value)
@@ -933,10 +1000,18 @@ def main() -> None:
     sun_mask_radius_deg_override = _resolve_sun_mask_radius_deg(
         dataset_cfg, args.sun_mask_radius_deg
     )
+    sky_rgb_mask_mode_override = _resolve_sky_rgb_mask_mode(
+        dataset_cfg, args.sky_rgb_mask
+    )
+    sky_rgb_mask_radius_px_override = _resolve_sky_rgb_mask_radius_px(
+        dataset_cfg, args.sky_rgb_mask_radius_px
+    )
     _ds_kw = dict(
         use_satellite_override=use_satellite,
         sky_channels_override=sky_channels_override,
         sun_mask_radius_deg_override=sun_mask_radius_deg_override,
+        sky_rgb_mask_mode_override=sky_rgb_mask_mode_override,
+        sky_rgb_mask_radius_px_override=sky_rgb_mask_radius_px_override,
     )
     train_dataset = FolsomIrradianceDataset(
         **_dataset_kwargs(dataset_cfg, "train", **_ds_kw)
@@ -989,6 +1064,37 @@ def main() -> None:
         print(
             f"sun_mask_radius_deg: {train_dataset.sun_mask_radius_deg} "
             f"(source: {_radius_src})"
+        )
+    if args.sky_rgb_mask is not None:
+        _rgb_mask_src = "CLI flag"
+    else:
+        _yaml_rgb_mask = (dataset_cfg_raw.get("sampling") or {}).get("sky_rgb_mask_mode")
+        _rgb_mask_src = (
+            f"YAML ({dataset_cfg})" if _yaml_rgb_mask is not None else "dataloader default"
+        )
+    print(
+        f"sky_rgb_mask_mode: {train_dataset.sky_rgb_mask_mode} "
+        f"(source: {_rgb_mask_src})"
+    )
+    if train_dataset.sky_rgb_mask_mode != "none":
+        if args.sky_rgb_mask_radius_px is not None:
+            _rgb_radius_src = "CLI flag"
+        else:
+            _yaml_rgb_radius = (dataset_cfg_raw.get("sampling") or {}).get(
+                "sky_rgb_mask_radius_px"
+            )
+            _rgb_radius_src = (
+                f"YAML ({dataset_cfg})"
+                if _yaml_rgb_radius is not None
+                else "mode default at 224²"
+            )
+        _radius_disp = (
+            train_dataset.sky_rgb_mask_radius_px
+            if train_dataset.sky_rgb_mask_radius_px is not None
+            else "mode default"
+        )
+        print(
+            f"sky_rgb_mask_radius_px: {_radius_disp} (source: {_rgb_radius_src})"
         )
     model = pv_forecasting_model_vit_imgs(
         dev_dn_list=dev_dn_list,
