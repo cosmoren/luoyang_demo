@@ -58,7 +58,7 @@ sampling:
   pv_input_len: 576             # 576 * 5min = 48 h history
   pv_output_interval_min: 15    # multiple of csv_interval_min
   pv_output_len: 16             # 16 * 15min = 4 h forecast
-  # Time-based split: 60% train / 10% val / 30% test (fixed in the dataset class; this fraction
+  # Time-based split: 66% train / 18% val / 18% test (fixed in the dataset class; this fraction
   # is required by the schema but only `pv_train_time_fraction` is read for legacy parity).
   pv_train_time_fraction: 0.7
   test_anchor_stride_min: 1500
@@ -92,15 +92,18 @@ sampling:
   # Folsom fisheye (~18-19° glare at overhead noon; 30° adds safety). At 224x224
   # this is ~37 px Euclidean radius in image space.
   # sun_mask_radius_deg: 30.0
-  # RGB gating (zeros RGB outside a Euclidean disc; ray_map / sun_mask unaffected):
+  # Sky-disc gating (zeros RGB outside a Euclidean disc; ray_map / sun_mask unaffected).
+  # See ``SPMF_preprocessing/fisheye_calib/sky_disc_mask.py``:
   #   1. none        — full image (default; byte-identical to legacy)
   #   2. valid_disc  — disc at mirrored optical center, radius 110 px @ 224²
   #   3. tight_disc  — disc at optical center, radius 80 px @ 224²
   #   4. sun_halo    — disc at projected sun per frame, radius 50 px @ 224²
-  #   5. sun_only    — disc at projected sun per frame, radius 30 px @ 224²
-  # Override radius for the active mode (px at 224²): sky_rgb_mask_radius_px
-  # CLI: --sky-rgb-mask {none,valid_disc,tight_disc,sun_halo,sun_only}
-  # sky_rgb_mask_mode: none
+  #   5. sun_only      — disc at projected sun per frame, radius 30 px @ 224²
+  #   6. manual_loose  — keep region inside hand-drawn loose red ring (224² mask)
+  #   7. manual_tight  — keep region inside hand-drawn tight red ring (224² mask)
+  # Override radius for the active mode (px at 224²): sky_disc_mask_radius_px
+  # CLI: --sky-disc-mask {none,valid_disc,tight_disc,sun_halo,sun_only,manual_loose,manual_tight}
+  # sky_disc_mask_mode: none
   # Enable Folsom GOES-15 satellite branch. When true, the loader resolves per-frame
   # NPY shards from <data_dir>/<paths.sat_path>/YYYY/MM/goes15_YYYYMMDD_HHMM.npy and
   # emits sat_tensor [T_sat, 3, 100, 100] + sat_timefeats [T_sat, 9]. When false,

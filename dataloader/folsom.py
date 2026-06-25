@@ -82,9 +82,9 @@ from dataloader.luoyang_mem import list_csv_files
 from modules.solar_encoder import compute_solar_features, delta_time_encoder, solar_features_encoder
 from SPMF_preprocessing.fisheye_calib import fisheye_sunmask
 from SPMF_preprocessing.fisheye_calib.fisheye_raymap import compute_ray_map
-from SPMF_preprocessing.fisheye_calib.sky_rgb_mask import (
-    apply_sky_rgb_mask,
-    normalize_sky_rgb_mask_mode,
+from SPMF_preprocessing.fisheye_calib.sky_disc_mask import (
+    apply_sky_disc_mask,
+    normalize_sky_disc_mask_mode,
 )
 
 # Sky-branch channel-selection abstraction (Folsom only, for now). The dataset YAML
@@ -102,6 +102,8 @@ from SPMF_preprocessing.fisheye_calib.sky_rgb_mask import (
 #     does not enter.
 #   * sun_mask: ``fisheye_sunmask.compute_sun_mask`` — project in flip space, mirror u to
 #     raw via ``u_raw = (native-1) - u_flip``, Euclidean disc ``R = f_s * deg2rad(radius)``.
+#   * sky_disc_mask: ``sky_disc_mask.apply_sky_disc_mask`` — zeros RGB outside a Euclidean
+#     disc (optical center or sun-centered modes); ray_map / sun_mask channels unaffected.
 _SKY_CHANNEL_RGB = "rgb"
 _SKY_CHANNEL_RAY_MAP = "ray_map"
 _SKY_CHANNEL_SUN_MASK = "sun_mask"
@@ -574,8 +576,8 @@ class FolsomIrradianceDataset(Dataset):
     from ``<paths.data_dir>/info.yaml`` (``site.latitude`` / ``site.longitude``), matching
     :class:`dataloader.luoyang_mem.PVDataset`.
 
-    Splits: rows are partitioned in fixed proportions ``60% train / 10% val / 30% test`` (same as
-    PVDataset). ``pv_train_time_fraction`` is kept for call-site parity but **not** used. Train
+    Splits: rows are partitioned in fixed proportions ``66% train / 18% val / 18% test``.
+    ``pv_train_time_fraction`` is kept for call-site parity but **not** used. Train
     samples a random valid anchor per ``__getitem__`` (epoch length defaults to
     ``_DEFAULT_FOLSOM_TRAIN_EPOCH_LEN``; settable via ``self._train_epoch_len``); val/test use the
     respective ``*_anchor_stride_min`` strides over their bands.
@@ -612,8 +614,8 @@ class FolsomIrradianceDataset(Dataset):
         use_satellite: bool = False,
         sky_channels: list[str] | tuple[str, ...] | None = None,
         sun_mask_radius_deg: float | None = None,
-        sky_rgb_mask_mode: str | None = None,
-        sky_rgb_mask_radius_px: float | None = None,
+        sky_disc_mask_mode: str | None = None,
+        sky_disc_mask_radius_px: float | None = None,
     ):
         self._config_path = Path(config_path).resolve()
         if not self._config_path.is_file():
@@ -684,16 +686,16 @@ class FolsomIrradianceDataset(Dataset):
             )
         self.sun_mask_radius_deg: float = radius
 
-        self.sky_rgb_mask_mode: str = normalize_sky_rgb_mask_mode(sky_rgb_mask_mode)
-        if sky_rgb_mask_radius_px is not None:
-            r_px = float(sky_rgb_mask_radius_px)
+        self.sky_disc_mask_mode: str = normalize_sky_disc_mask_mode(sky_disc_mask_mode)
+        if sky_disc_mask_radius_px is not None:
+            r_px = float(sky_disc_mask_radius_px)
             if not (r_px > 0.0):
                 raise ValueError(
-                    f"sky_rgb_mask_radius_px must be > 0 (got {sky_rgb_mask_radius_px!r})"
+                    f"sky_disc_mask_radius_px must be > 0 (got {sky_disc_mask_radius_px!r})"
                 )
-            self.sky_rgb_mask_radius_px: float | None = r_px
+            self.sky_disc_mask_radius_px: float | None = r_px
         else:
-            self.sky_rgb_mask_radius_px = None
+            self.sky_disc_mask_radius_px = None
 
         # Sat config: when ``use_satellite=True`` the loader reads per-frame .npy shards
         # under ``satimg_dir/YYYY/MM/goes15_YYYYMMDD_HHMM.npy`` (GOES-15 GridSat-CONUS,
@@ -885,12 +887,12 @@ class FolsomIrradianceDataset(Dataset):
         self._x_tail_1d = (-(lx - 1) * sx + np.arange(lx, dtype=np.intp) * sx).astype(np.intp, copy=False)
         self._y_off_1d = (sy + np.arange(ly, dtype=np.intp) * sy).astype(np.intp, copy=False)
 
-        # Fixed 60% / 10% / 30% train/val/test split (matches PVDataset).
-        split_train_end = int(n * 0.6)
-        split_val_end = int(n * 0.7)
+        # Fixed 66% / 18% / 18% train/val/test split.
+        split_train_end = int(n * 0.66)
+        split_val_end = int(n * 0.84)
         if not (0 < split_train_end < split_val_end < n):
             raise ValueError(
-                f"fixed 60%/10%/30% row split invalid for n={n}: "
+                f"fixed 66%/18%/18% row split invalid for n={n}: "
                 f"split_train_end={split_train_end}, split_val_end={split_val_end}"
             )
         min_row = self._anchors - (lx - 1) * sx
@@ -900,17 +902,17 @@ class FolsomIrradianceDataset(Dataset):
         self._test_anchor_mask = min_row >= split_val_end
         if self.split == "train" and not bool(self._train_anchor_mask.any()):
             raise RuntimeError(
-                f"split=train: no anchor fits entirely in the first {split_train_end} rows (60% of n={n}); "
+                f"split=train: no anchor fits entirely in the first {split_train_end} rows (66% of n={n}); "
                 "shorten windows or check data length"
             )
         if self.split == "val" and not bool(self._val_anchor_mask.any()):
             raise RuntimeError(
                 f"split=val: no anchor fits entirely in rows [{split_train_end}, {split_val_end}) "
-                f"(10% val band); adjust window lengths or stride"
+                f"(18% val band); adjust window lengths or stride"
             )
         if self.split == "test" and not bool(self._test_anchor_mask.any()):
             raise RuntimeError(
-                f"split=test: no anchor fits entirely from row {split_val_end} onward (last 30%); "
+                f"split=test: no anchor fits entirely from row {split_val_end} onward (last 18%); "
                 "adjust window lengths"
             )
 
@@ -1284,22 +1286,22 @@ class FolsomIrradianceDataset(Dataset):
         mask_t = torch.from_numpy(np.ascontiguousarray(mask_np, dtype=np.float32))
         return mask_t.unsqueeze(1).contiguous()  # [T, 1, H, W]
 
-    def _apply_sky_rgb_gate(
+    def _apply_sky_disc_mask(
         self,
         rgb_frames: torch.Tensor,
         frame_timestamps: list[pd.Timestamp],
     ) -> torch.Tensor:
         """Zero RGB outside the configured sky disc; ``none`` is a no-op."""
-        if self.sky_rgb_mask_mode == "none":
+        if self.sky_disc_mask_mode == "none":
             return rgb_frames
-        return apply_sky_rgb_mask(
+        return apply_sky_disc_mask(
             rgb_frames,
-            self.sky_rgb_mask_mode,
+            self.sky_disc_mask_mode,
             fit=self._get_fisheye_fit(),
             frame_timestamps=frame_timestamps,
             latitude=self.latitude,
             longitude=self.longitude,
-            radius_px_override=self.sky_rgb_mask_radius_px,
+            radius_px_override=self.sky_disc_mask_radius_px,
         )
 
     def _build_sky_channels(
@@ -1593,7 +1595,7 @@ class FolsomIrradianceDataset(Dataset):
         if self._sky_format == "zarr":
             nominal = self._nominal_sky_frame_times(t_x_end)
             rgb_frames = self._stack_sky_from_zarr(t_x_end)
-            rgb_frames = self._apply_sky_rgb_gate(rgb_frames, nominal)
+            rgb_frames = self._apply_sky_disc_mask(rgb_frames, nominal)
             skimg_tensor = self._build_sky_channels(rgb_frames, nominal)
             skimg_solar_features = compute_solar_features(nominal, self.latitude, self.longitude)
             skimg_tf = solar_features_encoder(skimg_solar_features)
@@ -1609,7 +1611,7 @@ class FolsomIrradianceDataset(Dataset):
             skimg_dtf = delta_time_encoder(skimg_timestamps, time0)
             skimg_timefeats = torch.cat([skimg_tf, skimg_dtf.unsqueeze(1)], dim=1)
             rgb_frames = self._stack_sky_frames(skimg_paths)
-            rgb_frames = self._apply_sky_rgb_gate(rgb_frames, skimg_timestamps)
+            rgb_frames = self._apply_sky_disc_mask(rgb_frames, skimg_timestamps)
             skimg_tensor = self._build_sky_channels(rgb_frames, skimg_timestamps)
             skimg_timestamps = [
                 (None if p is None else pd.Timestamp(t).strftime("%Y%m%d%H%M%S"))
@@ -1786,8 +1788,8 @@ def build_folsom_irradiance_datasets_from_conf(
         use_satellite=bool(sampling_cfg.get("use_satellite", False)),
         sky_channels=sampling_cfg.get("sky_channels"),
         sun_mask_radius_deg=sampling_cfg.get("sun_mask_radius_deg"),
-        sky_rgb_mask_mode=sampling_cfg.get("sky_rgb_mask_mode"),
-        sky_rgb_mask_radius_px=sampling_cfg.get("sky_rgb_mask_radius_px"),
+        sky_disc_mask_mode=sampling_cfg.get("sky_disc_mask_mode"),
+        sky_disc_mask_radius_px=sampling_cfg.get("sky_disc_mask_radius_px"),
     )
     train_ds = FolsomIrradianceDataset(split="train", **kwargs)
     test_ds = FolsomIrradianceDataset(split="test", **kwargs)
@@ -1891,7 +1893,7 @@ def _validate_smoke_anchor_train(ds: FolsomIrradianceDataset, anchor: int) -> No
     r = anchor - amin
     if not bool(ds._train_anchor_mask[r]):
         raise ValueError(
-            f"anchor_row={anchor} falls outside the train time band (fixed 60% train / 10% val / 30% test). "
+            f"anchor_row={anchor} falls outside the train time band (fixed 66% train / 18% val / 18% test). "
             "Smoke uses the train dataset only: pick an earlier calendar time."
         )
 

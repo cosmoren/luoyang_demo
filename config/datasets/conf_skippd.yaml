@@ -55,7 +55,7 @@ sampling:
   pv_output_interval_min: 15    # multiple of csv_interval_min
   pv_output_len: 192            # 192 * 15min = 48 h forecast
   # Required by the dataset constructor signature; the dataset uses a fixed
-  # 60/10/30 row split (same as Folsom) and ignores this value at runtime.
+  # 60/10/30 row split (SkipPP'd; Folsom uses 66/18/18) and ignores this value at runtime.
   pv_train_time_fraction: 0.7
   test_anchor_stride_min: 1500
   val_anchor_stride_min: 7000
