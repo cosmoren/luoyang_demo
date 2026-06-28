@@ -2,7 +2,7 @@ paths:
   data_dir: "/work/datasets/luoyang_2026_SPMF"
   pv_path: pv
   pv_total_path: pv_total.csv
-  sky_image_path: luoyangASI_skimg_zarr1
+  sky_image_path: luoyangASI_skimg_zarr
   sat_path: luoyang_sat_zarr1
   nwp_path: NWP
 
@@ -12,7 +12,7 @@ sampling:
   pv_input_interval_min: 5
   pv_input_len: 576
   pv_output_interval_min: 15
-  pv_output_len: 192
+  pv_output_len: 1
   test_anchor_stride_min: 5
   val_anchor_stride_min: 5
   test_collect_time_match_tolerance_min: 0

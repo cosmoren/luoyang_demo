@@ -6,6 +6,7 @@ import argparse
 from datetime import timedelta
 from pathlib import Path
 import sys
+import time
 
 import numpy as np
 import pandas as pd
@@ -32,27 +33,46 @@ _NS_PER_DAY = 86_400_000_000_000
 _NWP_DEFAULT_TZ = "Asia/Shanghai"
 
 
+def _dtime_bj_to_utc_datetime(values: pd.Series) -> pd.Series:
+    """
+    Parse dtime as Beijing wall-clock time and convert to UTC.
+
+    This enforces the project convention for Luoyang NWP/NWP_history ``dtime``:
+    it should be interpreted as local Beijing time before interpolation.
+    """
+    dt = pd.to_datetime(values, errors="coerce")
+    if dt.dt.tz is None:
+        dt_bj = dt.dt.tz_localize(
+            _NWP_DEFAULT_TZ,
+            ambiguous="NaT",
+            nonexistent="shift_forward",
+        )
+    else:
+        # Even if timezone information exists in raw dtime strings,
+        # treat them as Beijing wall-clock by dropping tz and relocalizing.
+        dt_bj = dt.dt.tz_localize(None).dt.tz_localize(
+            _NWP_DEFAULT_TZ,
+            ambiguous="NaT",
+            nonexistent="shift_forward",
+        )
+    return dt_bj.dt.tz_convert("UTC")
+
+
 def _nwp_to_utc_datetime(values: pd.Series) -> pd.Series:
     """
-    Parse NWP timestamps to UTC.
-
-    Rule:
-    - timezone-aware values: respect their own timezone and convert to UTC.
-    - naive values (no timezone info): interpret as Asia/Shanghai, then convert to UTC.
+    Vectorized parse: interpret all input timestamps as Beijing time (Asia/Shanghai),
+    then convert to UTC.
     """
-    idx = values.index
-    out: list[pd.Timestamp] = []
-    for v in values.tolist():
-        t = pd.to_datetime(v, errors="coerce")
-        if pd.isna(t):
-            out.append(pd.NaT)
-            continue
-        ts = pd.Timestamp(t)
-        if ts.tzinfo is None:
-            ts = ts.tz_localize(_NWP_DEFAULT_TZ, ambiguous="NaT", nonexistent="shift_forward")
-        ts = ts.tz_convert("UTC")
-        out.append(ts)
-    return pd.Series(pd.DatetimeIndex(out), index=idx)
+    dt = pd.to_datetime(values, errors="coerce")
+    if dt.dt.tz is None:
+        dt_bj = dt.dt.tz_localize(
+            _NWP_DEFAULT_TZ,
+            ambiguous="NaT",
+            nonexistent="shift_forward",
+        )
+    else:
+        dt_bj = dt.dt.tz_convert(_NWP_DEFAULT_TZ)
+    return dt_bj.dt.tz_convert("UTC")
 
 
 def load_csv(csv_path: Path | str) -> pd.DataFrame:
@@ -80,56 +100,46 @@ def _sanitize_nwp_interp(nwp_interp: np.ndarray) -> tuple[np.ndarray, np.ndarray
     return x_clean, row_bad
 
 
-def _precompute_nwp_blocks(
+def _precompute_nwp_series(
     df: pd.DataFrame | None, value_cols: tuple[str, ...]
-) -> dict[int, dict[str, tuple[np.ndarray, np.ndarray]]] | None:
+) -> dict[str, tuple[np.ndarray, np.ndarray]] | None:
+    """
+    Build a single merged per-column series on the UTC forecast_time axis.
+
+    forecast_time is already UTC (produced by _normalize_nwp_frame), so all runs
+    are pooled into one time series and interpolated directly on UTC. Duplicate
+    forecast_time values (same timestamp coming from multiple runs) are collapsed
+    by averaging, yielding a strictly increasing axis suitable for np.interp.
+    """
     if df is None:
         return None
-    if "start_time" not in df.columns or "forecast_time" not in df.columns:
+    if "forecast_time" not in df.columns:
         return {}
-    start_ns_all = _nwp_to_utc_datetime(df["start_time"]).astype("int64").to_numpy()
     ft_ns_all = _nwp_to_utc_datetime(df["forecast_time"]).astype("int64").to_numpy()
-    n_total = start_ns_all.shape[0]
+    n_total = ft_ns_all.shape[0]
     if n_total == 0:
         return {}
-    cols_all: dict[str, np.ndarray] = {}
+
+    series: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     for col in value_cols:
-        if col in df.columns:
-            cols_all[col] = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=np.float64)
-
-    order = np.argsort(start_ns_all, kind="stable")
-    s_sorted = start_ns_all[order]
-    unique_start, idx_first = np.unique(s_sorted, return_index=True)
-    bounds = np.append(idx_first, n_total)
-
-    blocks: dict[int, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
-    for i, st in enumerate(unique_start):
-        rows = order[bounds[i] : bounds[i + 1]]
-        ft_grp = ft_ns_all[rows]
-        col_dict: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-        for col, arr in cols_all.items():
-            y = arr[rows]
-            valid = ~np.isnan(y)
-            if not valid.any():
-                col_dict[col] = (
-                    np.empty(0, dtype=np.float64),
-                    np.empty(0, dtype=np.float64),
-                )
-                continue
-            ft_v = ft_grp[valid]
-            y_v = y[valid]
-            sort_idx = np.argsort(ft_v, kind="stable")
-            ft_s = ft_v[sort_idx]
-            y_s = y_v[sort_idx]
-            keep = np.empty_like(ft_s, dtype=bool)
-            keep[:-1] = ft_s[1:] != ft_s[:-1]
-            keep[-1] = True
-            col_dict[col] = (
-                ft_s[keep].astype(np.float64),
-                y_s[keep].astype(np.float64),
-            )
-        blocks[int(st)] = col_dict
-    return blocks
+        if col not in df.columns:
+            series[col] = (np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64))
+            continue
+        y = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=np.float64)
+        valid = ~np.isnan(y) & ~np.isnan(ft_ns_all.astype(np.float64))
+        if not valid.any():
+            series[col] = (np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64))
+            continue
+        ft_v = ft_ns_all[valid].astype(np.float64)
+        y_v = y[valid]
+        # Merge duplicate timestamps by averaging to keep a strictly increasing axis.
+        uniq_ft, inv = np.unique(ft_v, return_inverse=True)
+        sums = np.zeros(uniq_ft.shape[0], dtype=np.float64)
+        counts = np.zeros(uniq_ft.shape[0], dtype=np.float64)
+        np.add.at(sums, inv, y_v)
+        np.add.at(counts, inv, 1.0)
+        series[col] = (uniq_ft, sums / counts)
+    return series
 
 
 def _normalize_nwp_frame(df: pd.DataFrame, *, kind: str) -> pd.DataFrame:
@@ -140,19 +150,29 @@ def _normalize_nwp_frame(df: pd.DataFrame, *, kind: str) -> pd.DataFrame:
     - wind value cols: msl, t2m, u10, v10, u100, v100
     """
     out = df.copy()
-    if "forecast_time" not in out.columns and "dtime" in out.columns and "start_time" in out.columns:
+    if "forecast_time" not in out.columns and "dtime" in out.columns:
         dt_raw = out["dtime"]
-        dt_num = pd.to_numeric(dt_raw, errors="coerce")
-        start_utc = _nwp_to_utc_datetime(out["start_time"])
-        if dt_num.notna().any():
-            out["forecast_time"] = start_utc + pd.to_timedelta(dt_num, unit="h")
+        # Luoyang NWP/NWP_history often stores Beijing absolute wall-clock timestamps in dtime.
+        looks_like_abs_time = (
+            dt_raw.astype(str).str.contains(r"[-/:]", regex=True, na=False).mean() > 0.5
+        )
+        if looks_like_abs_time or "start_time" not in out.columns:
+            out["forecast_time"] = _dtime_bj_to_utc_datetime(dt_raw)
         else:
-            dt_td = pd.to_timedelta(dt_raw, errors="coerce")
-            out["forecast_time"] = start_utc + dt_td
+            dt_num = pd.to_numeric(dt_raw, errors="coerce")
+            start_utc = _nwp_to_utc_datetime(out["start_time"])
+            if dt_num.notna().any():
+                out["forecast_time"] = start_utc + pd.to_timedelta(dt_num, unit="h")
+            else:
+                dt_td = pd.to_timedelta(dt_raw, errors="coerce")
+                out["forecast_time"] = start_utc + dt_td
 
     if kind == "solar":
         if "ssrd" not in out.columns and "GHI_mean" in out.columns:
             out["ssrd"] = pd.to_numeric(out["GHI_mean"], errors="coerce")
+        if "GHI_mean" not in out.columns and "ssrd" in out.columns:
+            out["GHI_mean"] = pd.to_numeric(out["ssrd"], errors="coerce")
+    
     return out
 
 
@@ -171,51 +191,102 @@ def _resolve_nwp_csv_paths(nwp_dir: Path) -> tuple[Path | None, Path | None]:
     return (solar_candidates[0] if solar_candidates else None, wind_candidates[0] if wind_candidates else None)
 
 
-def _interp_nwp_col(
-    blocks: dict[int, dict[str, tuple[np.ndarray, np.ndarray]]] | None,
-    start_ns: int,
+def _interp_nwp_series_col(
+    series: dict[str, tuple[np.ndarray, np.ndarray]] | None,
     col: str,
     xq_ns_f: np.ndarray,
 ) -> np.ndarray:
+    """Interpolate a single column directly on the merged UTC forecast_time axis."""
     n = xq_ns_f.shape[0]
-    if blocks is None:
+    if not series:
         return np.full(n, np.nan, dtype=np.float64)
-    block = blocks.get(start_ns)
-    if block is None:
-        return np.full(n, np.nan, dtype=np.float64)
-    pair = block.get(col)
+    pair = series.get(col)
     if pair is None or pair[0].size == 0:
         return np.full(n, np.nan, dtype=np.float64)
     xp_ns_f, fp_f = pair
     return np.interp(xq_ns_f, xp_ns_f, fp_f)
 
 
+def _lookup_nwp_series_col_exact(
+    series: dict[str, tuple[np.ndarray, np.ndarray]] | None,
+    col: str,
+    xq_ns_i64: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Exact timestamp lookup for one NWP column.
+
+    Returns:
+      values: float32, missing filled with 0.
+      mask: float32, 1 where exact timestamp exists, else 0.
+    """
+    n = int(xq_ns_i64.shape[0])
+    values = np.zeros(n, dtype=np.float32)
+    mask = np.zeros(n, dtype=np.float32)
+    if not series:
+        return values, mask
+    pair = series.get(col)
+    if pair is None or pair[0].size == 0:
+        return values, mask
+
+    xp_ns_f, fp_f = pair
+    xp_ns_i64 = xp_ns_f.astype(np.int64, copy=False)
+    if xp_ns_i64.size == 0:
+        return values, mask
+
+    pos = np.searchsorted(xp_ns_i64, xq_ns_i64, side="left")
+    in_bounds = pos < xp_ns_i64.size
+    exact = np.zeros(n, dtype=bool)
+    exact[in_bounds] = xp_ns_i64[pos[in_bounds]] == xq_ns_i64[in_bounds]
+    if exact.any():
+        values[exact] = fp_f[pos[exact]].astype(np.float32, copy=False)
+        mask[exact] = 1.0
+    return values, mask
+
+
 def interpolate_nwp_features(
-    nwp_solar_blocks: dict[int, dict[str, tuple[np.ndarray, np.ndarray]]] | None,
-    nwp_wind_blocks: dict[int, dict[str, tuple[np.ndarray, np.ndarray]]] | None,
+    nwp_solar_series: dict[str, tuple[np.ndarray, np.ndarray]] | None,
+    nwp_wind_series: dict[str, tuple[np.ndarray, np.ndarray]] | None,
     forecast_timestamps_utc: list[pd.Timestamp],
     dhour: int = 12,
 ) -> np.ndarray | None:
-    if nwp_solar_blocks is None or nwp_wind_blocks is None:
-        return None
     if not forecast_timestamps_utc:
         return None
 
-    xq_ns_f = pd.DatetimeIndex(forecast_timestamps_utc).asi8.astype(np.float64)
-    t0_ns = int(pd.Timestamp(forecast_timestamps_utc[0]).value)
-    t_ref_ns = t0_ns - int(dhour) * _NS_PER_HOUR
-    midnight_ns = (t_ref_ns // _NS_PER_DAY) * _NS_PER_DAY
-    noon_ns = midnight_ns + 12 * _NS_PER_HOUR
-    prev_noon_ns = noon_ns if noon_ns < t_ref_ns else (noon_ns - _NS_PER_DAY)
+    xq_ns_i64 = pd.DatetimeIndex(forecast_timestamps_utc).asi8.astype(np.int64, copy=False)
+    _ = dhour  # kept for call-site compatibility
+    ssrd_vals, ssrd_mask = _lookup_nwp_series_col_exact(nwp_solar_series, "ssrd", xq_ns_i64)
+    t2m_vals, t2m_mask = _lookup_nwp_series_col_exact(nwp_wind_series, "t2m", xq_ns_i64)
+    # Forecast nwp_tensor channel order:
+    # [ssrd, ssrd_mask, t2m, t2m_mask]
+    return np.column_stack([ssrd_vals, ssrd_mask, t2m_vals, t2m_mask]).astype(np.float32, copy=False)
 
-    ssrd_interp = _interp_nwp_col(nwp_solar_blocks, prev_noon_ns, "ssrd", xq_ns_f)
+
+def interpolate_nwp_history_features(
+    nwp_hist_solar_series: dict[str, tuple[np.ndarray, np.ndarray]] | None,
+    nwp_hist_wind_series: dict[str, tuple[np.ndarray, np.ndarray]] | None,
+    history_timestamps_utc: list[pd.Timestamp],
+) -> np.ndarray | None:
+    """
+    Interpolate NWP history channels on PV history timestamps.
+
+    Output channel order:
+      [GHI_mean, msl, t2m, u10, v10, u100, v100, hist_valid_mask]
+    where hist_valid_mask = 1 means all feature values at that timestamp are valid,
+    and 0 means at least one feature is missing/invalid.
+    """
+    if nwp_hist_solar_series is None or nwp_hist_wind_series is None:
+        return None
+    if not history_timestamps_utc:
+        return None
+
+    xq_ns_f = pd.DatetimeIndex(history_timestamps_utc).asi8.astype(np.float64)
+    ghi_interp = _interp_nwp_series_col(nwp_hist_solar_series, "GHI_mean", xq_ns_f)
     wind_cols = ("msl", "t2m", "u10", "v10", "u100", "v100")
-    wind_interp = [
-        _interp_nwp_col(nwp_wind_blocks, prev_noon_ns, c, xq_ns_f) for c in wind_cols
-    ]
-    nwp_interp = np.column_stack([ssrd_interp] + wind_interp)
-    nwp_interp_clean, nwp_mask = _sanitize_nwp_interp(nwp_interp)
-    return np.concatenate([nwp_interp_clean, nwp_mask], axis=1)
+    wind_interp = [_interp_nwp_series_col(nwp_hist_wind_series, c, xq_ns_f) for c in wind_cols]
+    nwp_hist = np.column_stack([ghi_interp] + wind_interp)
+    nwp_hist_clean, nwp_hist_row_bad = _sanitize_nwp_interp(nwp_hist)
+    nwp_hist_valid_mask = 1.0 - nwp_hist_row_bad
+    return np.concatenate([nwp_hist_clean, nwp_hist_valid_mask], axis=1)
 
 
 class PVDataset(Dataset):
@@ -226,7 +297,7 @@ class PVDataset(Dataset):
     _GLOBAL_NWP_DF_CACHE: dict[str, pd.DataFrame] = {}
     _GLOBAL_NWP_BLOCK_CACHE: dict[
         tuple[str, tuple[str, ...]],
-        dict[int, dict[str, tuple[np.ndarray, np.ndarray]]],
+        dict[str, tuple[np.ndarray, np.ndarray]],
     ] = {}
 
     def __init__(
@@ -253,6 +324,7 @@ class PVDataset(Dataset):
         satimg_time_resolution_min: int,
         satimg_npy_shape_hwc: tuple[int, int, int],
         train_samples_per_csv: int = 1,
+        kt_noise_std: float = 0.0,
         train_fraction: float = 0.85,
         val_fraction: float = 0.15,
         test_start_bj: str = "2026-05-11 00:00:00",
@@ -260,12 +332,27 @@ class PVDataset(Dataset):
         sample_file_subset: list[Path | str] | None = None,
         enable_sat_sky_cache: bool = False,
     ) -> None:
+        t_init = time.perf_counter()
+        t_prev = t_init
+
+        def _log_stage(stage: str) -> None:
+            nonlocal t_prev
+            t_now = time.perf_counter()
+            step_s = t_now - t_prev
+            total_s = t_now - t_init
+            print(
+                f"[PVDataset2026][{split}] {stage}: step={step_s:.3f}s total={total_s:.3f}s",
+                flush=True,
+            )
+            t_prev = t_now
+
         if split not in ("train", "val", "test"):
             raise ValueError("split must be train|val|test")
         self.split = split
         self._config_path = Path(config_path).resolve()
         _ = pv_train_time_fraction  # kept only for call-site compatibility
         self._train_samples_per_csv = max(1, int(train_samples_per_csv))
+        self._kt_noise_std = max(0.0, float(kt_noise_std))
 
         self.pv_input_len = int(pv_input_len)
         self.pv_output_len = int(pv_output_len)
@@ -307,7 +394,16 @@ class PVDataset(Dataset):
         self._val_fraction = float(val_fraction)
         self._test_start_bj = pd.Timestamp(test_start_bj).tz_localize("Asia/Shanghai")
 
-        self._pv_dir = Path(pv_dir).resolve()
+        pv_raw = str(pv_dir).strip() if pv_dir is not None else ""
+        if not pv_raw:
+            raise ValueError("pv_dir must point to a total-power CSV file path")
+        pv_candidate = Path(pv_raw).expanduser().resolve()
+        if pv_candidate.is_dir():
+            raise ValueError(f"pv_dir must be a CSV file, got directory: {pv_candidate}")
+        self._pv_total_csv = pv_candidate
+        if not self._pv_total_csv.is_file():
+            raise FileNotFoundError(f"Total PV csv not found: {self._pv_total_csv}")
+        self._dev_dn_total = "NE=total"
         self._skyimg_dir = Path(skyimg_dir).resolve()
         self._satimg_dir = Path(satimg_dir).resolve()
         self.enable_sat_sky_cache = bool(enable_sat_sky_cache)
@@ -348,6 +444,7 @@ class PVDataset(Dataset):
                 print(f"[PVDataset2026] WARNING: open sky zarr failed: {e}")
         else:
             print(f"[PVDataset2026] WARNING: sky zarr dir not found: {self._skyimg_dir}")
+        _log_stage("sat/sky source init")
 
         cfg = {}
         if self._config_path.is_file():
@@ -362,6 +459,8 @@ class PVDataset(Dataset):
         data_dir = paths_cfg.get("data_dir")
         if nwp_path and data_dir:
             nwp_dir = Path(data_dir) / str(nwp_path)
+            if not nwp_dir.is_dir():
+                print(f"[PVDataset2026] WARNING: NWP dir not found: {nwp_dir}")
             solar_csv, wind_csv = _resolve_nwp_csv_paths(nwp_dir)
             try:
                 if solar_csv is not None and solar_csv.is_file():
@@ -386,7 +485,7 @@ class PVDataset(Dataset):
             if solar_block_key in self._GLOBAL_NWP_BLOCK_CACHE:
                 self._nwp_solar_blocks = self._GLOBAL_NWP_BLOCK_CACHE[solar_block_key]
             else:
-                self._nwp_solar_blocks = _precompute_nwp_blocks(self.nwp_solar_df, ("ssrd",))
+                self._nwp_solar_blocks = _precompute_nwp_series(self.nwp_solar_df, ("ssrd",))
                 if self._nwp_solar_blocks is not None:
                     self._GLOBAL_NWP_BLOCK_CACHE[solar_block_key] = self._nwp_solar_blocks
 
@@ -396,33 +495,75 @@ class PVDataset(Dataset):
             if wind_block_key in self._GLOBAL_NWP_BLOCK_CACHE:
                 self._nwp_wind_blocks = self._GLOBAL_NWP_BLOCK_CACHE[wind_block_key]
             else:
-                self._nwp_wind_blocks = _precompute_nwp_blocks(
+                self._nwp_wind_blocks = _precompute_nwp_series(
                     self.nwp_wind_df, ("msl", "t2m", "u10", "v10", "u100", "v100")
                 )
                 if self._nwp_wind_blocks is not None:
                     self._GLOBAL_NWP_BLOCK_CACHE[wind_block_key] = self._nwp_wind_blocks
+        _log_stage("forecast NWP load+precompute")
 
-        all_files = list_csv_files(self._pv_dir)
-        if not all_files:
-            raise FileNotFoundError(f"No CSV files found in {self._pv_dir}")
-        # Stable global mapping: same file name always gets same dev_idx across runs.
-        self.devDn_list = [p.stem.replace("_", "=") for p in all_files]
-        self._dev_idx_map = {d: i for i, d in enumerate(self.devDn_list)}
+        # NWP history: aligned with PV history timestamps (x_idx).
+        self.nwp_hist_solar_df = None
+        self.nwp_hist_wind_df = None
+        self._nwp_hist_solar_blocks = None
+        self._nwp_hist_wind_blocks = None
+        hist_solar_csv_key: str | None = None
+        hist_wind_csv_key: str | None = None
+        nwp_hist_path = paths_cfg.get("nwp_history_path", "NWP_history")
+        if data_dir and nwp_hist_path:
+            nwp_hist_dir = Path(data_dir) / str(nwp_hist_path)
+            if not nwp_hist_dir.is_dir():
+                print(f"[PVDataset2026] WARNING: NWP_history dir not found: {nwp_hist_dir}")
+            hist_solar_csv, hist_wind_csv = _resolve_nwp_csv_paths(nwp_hist_dir)
+            try:
+                if hist_solar_csv is not None and hist_solar_csv.is_file():
+                    hist_solar_csv_key = hist_solar_csv.resolve().as_posix()
+                    if hist_solar_csv_key in self._GLOBAL_NWP_DF_CACHE:
+                        self.nwp_hist_solar_df = self._GLOBAL_NWP_DF_CACHE[hist_solar_csv_key]
+                    else:
+                        self.nwp_hist_solar_df = _normalize_nwp_frame(
+                            pd.read_csv(hist_solar_csv), kind="solar"
+                        )
+                        self._GLOBAL_NWP_DF_CACHE[hist_solar_csv_key] = self.nwp_hist_solar_df
+                if hist_wind_csv is not None and hist_wind_csv.is_file():
+                    hist_wind_csv_key = hist_wind_csv.resolve().as_posix()
+                    if hist_wind_csv_key in self._GLOBAL_NWP_DF_CACHE:
+                        self.nwp_hist_wind_df = self._GLOBAL_NWP_DF_CACHE[hist_wind_csv_key]
+                    else:
+                        self.nwp_hist_wind_df = _normalize_nwp_frame(
+                            pd.read_csv(hist_wind_csv), kind="wind"
+                        )
+                        self._GLOBAL_NWP_DF_CACHE[hist_wind_csv_key] = self.nwp_hist_wind_df
+            except Exception as e:
+                print(f"[PVDataset2026] WARNING: read NWP_history CSV failed: {e}")
 
-        self.sample_files = all_files
-        if sample_file_subset is not None:
-            path_by_resolved = {p.resolve(): p for p in all_files}
-            subset: list[Path] = []
-            for raw in sample_file_subset:
-                key = Path(raw).resolve()
-                if key not in path_by_resolved:
-                    raise FileNotFoundError(f"sample_file_subset path not under pv_dir: {raw}")
-                subset.append(path_by_resolved[key])
-            self.sample_files = subset
-        elif max_files is not None and int(max_files) > 0:
-            self.sample_files = self.sample_files[: int(max_files)]
-        if not self.sample_files:
-            raise FileNotFoundError(f"No CSV files found in {self._pv_dir}")
+        if self.nwp_hist_solar_df is not None and hist_solar_csv_key is not None:
+            hist_solar_block_key = (hist_solar_csv_key, ("GHI_mean",))
+            if hist_solar_block_key in self._GLOBAL_NWP_BLOCK_CACHE:
+                self._nwp_hist_solar_blocks = self._GLOBAL_NWP_BLOCK_CACHE[hist_solar_block_key]
+            else:
+                self._nwp_hist_solar_blocks = _precompute_nwp_series(
+                    self.nwp_hist_solar_df, ("GHI_mean",)
+                )
+                if self._nwp_hist_solar_blocks is not None:
+                    self._GLOBAL_NWP_BLOCK_CACHE[hist_solar_block_key] = self._nwp_hist_solar_blocks
+
+        if self.nwp_hist_wind_df is not None and hist_wind_csv_key is not None:
+            hist_wind_block_key = (hist_wind_csv_key, ("msl", "t2m", "u10", "v10", "u100", "v100"))
+            if hist_wind_block_key in self._GLOBAL_NWP_BLOCK_CACHE:
+                self._nwp_hist_wind_blocks = self._GLOBAL_NWP_BLOCK_CACHE[hist_wind_block_key]
+            else:
+                self._nwp_hist_wind_blocks = _precompute_nwp_series(
+                    self.nwp_hist_wind_df, ("msl", "t2m", "u10", "v10", "u100", "v100")
+                )
+                if self._nwp_hist_wind_blocks is not None:
+                    self._GLOBAL_NWP_BLOCK_CACHE[hist_wind_block_key] = self._nwp_hist_wind_blocks
+        _log_stage("history NWP load+precompute")
+
+        # Total-station variant uses one fixed CSV (no per-inverter fanout).
+        self.devDn_list = [self._dev_dn_total]
+        self._dev_idx_map = {self._dev_dn_total: 0}
+        self.sample_files = [self._pv_total_csv]
 
         self._csv_cache: dict[str, pd.DataFrame] = {}
         self._csv_np_cache: dict[str, dict[str, np.ndarray]] = {}
@@ -441,10 +582,14 @@ class PVDataset(Dataset):
                 np_data = self._csv_df_to_numpy_cache(df)
                 self._GLOBAL_CSV_NP_CACHE[k] = np_data
             self._csv_np_cache[k] = np_data
+        _log_stage("PV csv load+numpy cache")
         ref_df = self._csv_cache[self.sample_files[0].resolve().as_posix()]
         self._init_anchor_tables(ref_df)
+        _log_stage("anchor table init")
         self._build_split_masks(ref_df)
+        _log_stage("split mask build")
         self._prefilter_files()
+        _log_stage("file prefilter")
         self._skipped_sample_template: dict | None = None
         if self.split in ("val", "test"):
             self._window_skip_warned_files: set[str] = set()
@@ -458,6 +603,7 @@ class PVDataset(Dataset):
             tpl["target_mask"] = torch.zeros_like(tpl["target_mask"])
             tpl["pv_mask"] = torch.zeros_like(tpl["pv_mask"])
             self._skipped_sample_template = tpl
+        _log_stage("skip-template build")
 
     def _init_anchor_tables(self, ref_df: pd.DataFrame) -> None:
         n = len(ref_df)
@@ -480,12 +626,14 @@ class PVDataset(Dataset):
     def _build_split_masks(self, ref_df: pd.DataFrame) -> None:
         collect_utc = pd.to_datetime(ref_df["collectTime"], utc=True)
         collect_bj = collect_utc.dt.tz_convert("Asia/Shanghai")
-        min_row = self._x_idx_per_anchor[:, 0]
+        first_target_row = self._y_idx_per_anchor[:, 0]
         max_row = self._y_idx_per_anchor[:, -1]
-        min_time = collect_bj.iloc[min_row]
+        first_target_time = collect_bj.iloc[first_target_row]
         max_time = collect_bj.iloc[max_row]
 
-        self._test_anchor_mask = (min_time >= self._test_start_bj).to_numpy(dtype=bool)
+        # Test split should be defined by target timestamps (not history start),
+        # otherwise long history windows can delay the first exported target time.
+        self._test_anchor_mask = (first_target_time >= self._test_start_bj).to_numpy(dtype=bool)
         pre_mask = (max_time < self._test_start_bj).to_numpy(dtype=bool)
         pre_idx = np.nonzero(pre_mask)[0]
         if pre_idx.size == 0:
@@ -878,11 +1026,10 @@ class PVDataset(Dataset):
 
         file_idx = int(file_idx)
         win_idx = int(win_idx)
-        p = self.sample_files[file_idx]
+        p = self.sample_files[0]
         k = p.resolve().as_posix()
         np_data = self._csv_np_cache[k]
-        dev_dn_i = p.stem.replace("_", "=")
-        dev_idx_i = torch.tensor(self._dev_idx_map[dev_dn_i], dtype=torch.long)
+        dev_idx_i = torch.tensor(0, dtype=torch.long)
 
         sample = self._try_build_sample_for_split_window(
             np_data,
@@ -912,6 +1059,7 @@ class PVDataset(Dataset):
             "p_mean",
             "forecast_timefeats",
             "nwp_tensor",
+            "nwp_history",
             "target_pv",
             "target_mask",
             "target_p_cs",
@@ -973,6 +1121,10 @@ class PVDataset(Dataset):
             p_mean_np = np.full(len(x_idx), max(mean_pow_x, 1e-6), dtype=np.float32)
         kt_np = np_data["kt"][x_idx]
         kt_mask_np = np_data["kt_mask"][x_idx]
+        if self.split == "train" and self._kt_noise_std > 0.0:
+            noise = np.random.normal(0.0, self._kt_noise_std, size=kt_np.shape).astype(np.float32)
+            valid_kt = (kt_mask_np > 0.5).astype(np.float32, copy=False)
+            kt_np = np.clip(kt_np + noise * valid_kt, 0.0, None)
         weather_ghi_np = np_data["weather_ghi"][x_idx]
         theory_ghi_np = np_data["theory_ghi"][x_idx]
         kt = torch.from_numpy(kt_np).unsqueeze(0)
@@ -1014,6 +1166,23 @@ class PVDataset(Dataset):
             self._nwp_solar_blocks, self._nwp_wind_blocks, list(pd.DatetimeIndex(forecast_timestamps))
         )
         nwp_tensor = None if nwp_out is None else torch.from_numpy(np.asarray(nwp_out, dtype=np.float32))
+        nwp_hist_out = interpolate_nwp_history_features(
+            self._nwp_hist_solar_blocks, self._nwp_hist_wind_blocks, list(pd.DatetimeIndex(timestamps))
+        )
+        # nwp_history must always be present:
+        # when history CSV is missing/unavailable, fill zeros and set mask channel to 0.
+        if nwp_hist_out is None:
+            nwp_history_np = np.zeros((len(x_idx), 8), dtype=np.float32)
+        else:
+            nwp_history_np = np.asarray(nwp_hist_out, dtype=np.float32)
+            if nwp_history_np.ndim != 2 or nwp_history_np.shape[1] != 8:
+                fallback = np.zeros((len(x_idx), 8), dtype=np.float32)
+                rows = min(fallback.shape[0], nwp_history_np.shape[0] if nwp_history_np.ndim == 2 else 0)
+                cols = min(fallback.shape[1], nwp_history_np.shape[1] if nwp_history_np.ndim == 2 else 0)
+                if rows > 0 and cols > 0:
+                    fallback[:rows, :cols] = nwp_history_np[:rows, :cols]
+                nwp_history_np = fallback
+        nwp_history = torch.from_numpy(nwp_history_np)
 
         pow_y = np_data["final_power"][y_idx]
         target_pv = torch.from_numpy(pow_y)
@@ -1038,12 +1207,14 @@ class PVDataset(Dataset):
             "p_mean": p_mean,
             "forecast_timefeats": forecast_timefeats,
             "nwp_tensor": nwp_tensor,
+            "nwp_history": nwp_history,
             "target_pv": target_pv,
             "target_mask": target_mask,
             "target_p_cs": target_p_cs,
             "target_weather_ghi": target_weather_ghi,
             "target_theory_ghi": target_theory_ghi,
             "sample_valid": torch.tensor(1.0, dtype=torch.float32),
+            "anchor_time_utc_ns": torch.tensor(int(time0_utc.value), dtype=torch.int64),
         }
         if not include_sat_sky:
             return out
@@ -1059,19 +1230,18 @@ class PVDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         if self.split == "train":
-            sample_path = self.sample_files[idx % len(self.sample_files)]
+            sample_path = self.sample_files[0]
             r_fixed = None
         elif self.split == "val":
             nw = self._num_val_windows
-            sample_path = self.sample_files[idx // nw]
+            sample_path = self.sample_files[0]
             r_fixed = int(self._val_r_indices[idx % nw])
         else:
             nw = self._num_test_windows
-            sample_path = self.sample_files[idx // nw]
+            sample_path = self.sample_files[0]
             r_fixed = int(self._test_r_indices[idx % nw])
 
-        dev_dn = sample_path.stem.replace("_", "=")
-        dev_idx = torch.tensor(self._dev_idx_map[dev_dn], dtype=torch.long)
+        dev_idx = torch.tensor(0, dtype=torch.long)
         key = sample_path.resolve().as_posix()
         np_data = self._csv_np_cache[key]
 
@@ -1089,12 +1259,10 @@ class PVDataset(Dataset):
             assert self._test_last_x_time_ref is not None
             t_ref = self._test_last_x_time_ref[win_idx]
 
-        file_idx = idx // nw
-        p = self.sample_files[file_idx]
+        p = self.sample_files[0]
         k = p.resolve().as_posix()
         np_data_i = self._csv_np_cache[k]
-        dev_dn_i = p.stem.replace("_", "=")
-        dev_idx_i = torch.tensor(self._dev_idx_map[dev_dn_i], dtype=torch.long)
+        dev_idx_i = torch.tensor(0, dtype=torch.long)
 
         sample = self._try_build_sample_for_split_window(
             np_data_i, dev_idx_i, r_fixed, t_ref, p.name, win_idx=win_idx
@@ -1165,6 +1333,8 @@ def collate_batched(batch: list[dict]) -> dict:
     }
     if "sample_valid" in batch[0]:
         out["sample_valid"] = _stack("sample_valid")
+    if "anchor_time_utc_ns" in batch[0]:
+        out["anchor_time_utc_ns"] = _stack("anchor_time_utc_ns")
     sat_tensor, sat_timefeats, sat_valid_mask = _collate_img_modality(
         "sat_tensor",
         "sat_timefeats",
@@ -1189,6 +1359,13 @@ def collate_batched(batch: list[dict]) -> dict:
 
     vals = [s["nwp_tensor"] for s in batch]
     out["nwp_tensor"] = None if any(v is None for v in vals) else torch.stack(vals)
+    vals_hist = [s.get("nwp_history") for s in batch]
+    sample_hist = next((v for v in vals_hist if isinstance(v, torch.Tensor)), None)
+    if sample_hist is None:
+        sample_hist = torch.zeros((batch[0]["pv"].shape[-1], 8), dtype=torch.float32)
+    out["nwp_history"] = torch.stack(
+        [v if isinstance(v, torch.Tensor) else torch.zeros_like(sample_hist) for v in vals_hist]
+    )
     return out
 
 
@@ -1224,9 +1401,18 @@ def collate_with_shared_sat_sky(
     }
     if "sample_valid" in pv_samples[0]:
         out["sample_valid"] = _stack("sample_valid")
+    if "anchor_time_utc_ns" in pv_samples[0]:
+        out["anchor_time_utc_ns"] = _stack("anchor_time_utc_ns")
 
     vals = [s["nwp_tensor"] for s in pv_samples]
     out["nwp_tensor"] = None if any(v is None for v in vals) else torch.stack(vals)
+    vals_hist = [s.get("nwp_history") for s in pv_samples]
+    sample_hist = next((v for v in vals_hist if isinstance(v, torch.Tensor)), None)
+    if sample_hist is None:
+        sample_hist = torch.zeros((pv_samples[0]["pv"].shape[-1], 8), dtype=torch.float32)
+    out["nwp_history"] = torch.stack(
+        [v if isinstance(v, torch.Tensor) else torch.zeros_like(sample_hist) for v in vals_hist]
+    )
 
     def _expand_img(
         tensor: torch.Tensor | None,
@@ -1277,13 +1463,18 @@ def _build_dataset_from_cfg(config_path: Path, split: str, max_files: int | None
     split_cfg = cfg.get("split_policy", {})
 
     data_dir = Path(paths_cfg["data_dir"]).expanduser()
-    pv_dir = data_dir / paths_cfg.get("pv_path", "pv")
+    pv_total_raw = paths_cfg.get("pv_total_path")
+    if not pv_total_raw:
+        raise KeyError("dataset config paths.pv_total_path is required for luoyang_2026total_zarr")
+    pv_total_csv = Path(str(pv_total_raw)).expanduser()
+    if not pv_total_csv.is_absolute():
+        pv_total_csv = data_dir / pv_total_csv
     sky_dir = data_dir / paths_cfg.get("sky_image_path", "luoyangASI_skimg_zarr")
     sat_dir = data_dir / paths_cfg.get("sat_path", "luoyang_sat_zarr")
 
     return PVDataset(
         config_path=config_path,
-        pv_dir=str(pv_dir),
+        pv_dir=str(pv_total_csv),
         skyimg_dir=str(sky_dir),
         satimg_dir=str(sat_dir),
         split=split,
@@ -1303,6 +1494,7 @@ def _build_dataset_from_cfg(config_path: Path, split: str, max_files: int | None
         satimg_time_resolution_min=int(sampling.get("satimg_time_resolution_min", 10)),
         satimg_npy_shape_hwc=tuple(sampling.get("satimg_npy_shape_hwc", [100, 100, 3])),
         train_samples_per_csv=int(sampling.get("train_samples_per_csv", 100)),
+        kt_noise_std=float(sampling.get("kt_noise_std", 0.01)),
         train_fraction=float(split_cfg.get("train_fraction", 0.85)),
         val_fraction=float(split_cfg.get("val_fraction", 0.15)),
         test_start_bj=str(split_cfg.get("test_start_bj", "2026-05-11 00:00:00")),
@@ -1321,6 +1513,30 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-files", type=int, default=8, help="Limit CSV count for fast smoke test")
     parser.add_argument(
+        "--plot-batch-idx",
+        type=int,
+        default=3,
+        help="Backward-compatible start offset: start sample ~= plot_batch_idx * batch_size.",
+    )
+    parser.add_argument(
+        "--plot-start-sample",
+        type=int,
+        default=None,
+        help="Absolute dataset sample index to start plotting from. Overrides --plot-batch-idx mapping if set.",
+    )
+    parser.add_argument(
+        "--plot-num-anchors",
+        type=int,
+        default=12,
+        help="Number of different anchors (samples) to plot per split.",
+    )
+    parser.add_argument(
+        "--plot-anchor-step",
+        type=int,
+        default=1,
+        help="Sample index stride between plotted anchors.",
+    )
+    parser.add_argument(
         "--plot-out-dir",
         type=Path,
         default=Path("tmp_2026_loader_plots"),
@@ -1332,6 +1548,64 @@ def main() -> None:
     print(f"[main] config: {config_path}")
     args.plot_out_dir.mkdir(parents=True, exist_ok=True)
 
+    def _anchor_strings(sample: dict) -> tuple[str, str]:
+        if "anchor_time_utc_ns" not in sample:
+            return "unknown", "unknown"
+        ts_utc = pd.Timestamp(int(sample["anchor_time_utc_ns"].item()), unit="ns", tz="UTC")
+        ts_bj = ts_utc.tz_convert("Asia/Shanghai")
+        return ts_utc.strftime("%Y-%m-%d %H:%M:%S UTC"), ts_bj.strftime("%Y-%m-%d %H:%M:%S BJ")
+
+    def _anchor_tag(sample: dict) -> str:
+        if "anchor_time_utc_ns" not in sample:
+            return "unknown"
+        ts_utc = pd.Timestamp(int(sample["anchor_time_utc_ns"].item()), unit="ns", tz="UTC")
+        return ts_utc.strftime("%Y%m%dT%H%M%SZ")
+
+    def _current_frame_rgb(
+        seq: torch.Tensor | None,
+        *,
+        fallback_hw: tuple[int, int] = (128, 128),
+    ) -> tuple[np.ndarray, str]:
+        """
+        Convert a [T, C, H, W] tensor sequence to displayable current-frame RGB [H, W, 3].
+        Uses the last frame (closest to anchor time in current sampling policy).
+        """
+        h0, w0 = fallback_hw
+        empty = np.zeros((h0, w0, 3), dtype=np.float32)
+        if seq is None:
+            return empty, "missing"
+        if not isinstance(seq, torch.Tensor) or seq.ndim != 4 or seq.shape[0] == 0:
+            return empty, "invalid"
+
+        frame = seq[-1].detach().cpu().float().numpy()  # [C,H,W]
+        if frame.ndim != 3:
+            return empty, "invalid"
+
+        if frame.shape[0] in (1, 3):
+            img = np.transpose(frame, (1, 2, 0))
+        else:
+            # Fallback for unexpected channel order.
+            img = frame
+            if img.ndim == 2:
+                img = img[..., None]
+
+        if img.shape[-1] == 1:
+            img = np.repeat(img, 3, axis=-1)
+        elif img.shape[-1] > 3:
+            img = img[..., :3]
+
+        finite = np.isfinite(img)
+        if not finite.any():
+            return np.zeros_like(img, dtype=np.float32), "all-nan"
+        vals = img[finite]
+        lo = float(np.percentile(vals, 1.0))
+        hi = float(np.percentile(vals, 99.0))
+        if hi <= lo:
+            out = np.zeros_like(img, dtype=np.float32)
+        else:
+            out = np.clip((img - lo) / (hi - lo), 0.0, 1.0).astype(np.float32, copy=False)
+        return out, "ok"
+
     for split in ("train", "val", "test"):
         ds = _build_dataset_from_cfg(config_path, split=split, max_files=args.max_files)
         print(
@@ -1342,42 +1616,176 @@ def main() -> None:
         )
         if len(ds) == 0:
             continue
-        loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate_batched)
-        batch = next(iter(loader))
-        print(
-            f"[{split}] pv={tuple(batch['pv'].shape)} target_pv={tuple(batch['target_pv'].shape)} "
-            f"sat={'None' if batch['sat_tensor'] is None else tuple(batch['sat_tensor'].shape)} "
-            f"sky={'None' if batch['skimg_tensor'] is None else tuple(batch['skimg_tensor'].shape)} "
-            f"nwp={'None' if batch['nwp_tensor'] is None else tuple(batch['nwp_tensor'].shape)}"
+
+        start_idx = (
+            int(args.plot_start_sample)
+            if args.plot_start_sample is not None
+            else max(0, int(args.plot_batch_idx) * int(args.batch_size))
         )
-        # Plot one sample from this batch for quick visual inspection.
-        sample_idx = 0
-        pv_np = batch["pv"][sample_idx, 0].detach().cpu().numpy()
-        p_cs_np = batch["p_cs"][sample_idx, 0].detach().cpu().numpy()
-        kt_np = batch["kt"][sample_idx, 0].detach().cpu().numpy()
-        kt_mask_np = batch["kt_mask"][sample_idx, 0].detach().cpu().numpy()
-        x = np.arange(len(pv_np))
-        fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
-        axes[0].plot(x, pv_np, lw=1.2, color="tab:blue")
-        axes[0].set_ylabel("pv")
-        axes[0].grid(True, alpha=0.25)
-        axes[1].plot(x, p_cs_np, lw=1.2, color="tab:orange")
-        axes[1].set_ylabel("p_cs")
-        axes[1].grid(True, alpha=0.25)
-        axes[2].plot(x, kt_np, lw=1.2, color="tab:green")
-        axes[2].set_ylabel("kt")
-        axes[2].grid(True, alpha=0.25)
-        axes[3].plot(x, kt_mask_np, lw=1.2, color="tab:red")
-        axes[3].set_ylabel("kt_mask")
-        axes[3].set_xlabel("history step")
-        axes[3].set_ylim(-0.05, 1.05)
-        axes[3].grid(True, alpha=0.25)
-        fig.suptitle(f"{split} batch sample0: pv / p_cs / kt / kt_mask")
-        fig.tight_layout()
-        out_path = args.plot_out_dir / f"{split}_batch_sample0_signals.png"
-        fig.savefig(out_path, dpi=160)
-        plt.close(fig)
-        print(f"[{split}] plot saved: {out_path.resolve()}")
+        step = max(1, int(args.plot_anchor_step))
+        max_to_plot = max(1, int(args.plot_num_anchors))
+
+        plotted = 0
+        for k in range(max_to_plot):
+            idx = start_idx + k * step
+            if idx >= len(ds):
+                break
+            sample = ds[idx]
+            anchor_utc_str, anchor_bj_str = _anchor_strings(sample)
+            anchor_tag = _anchor_tag(sample)
+            print(f"[{split}] plotting idx={idx} anchor={anchor_utc_str} ({anchor_bj_str})")
+
+            pv_np = sample["pv"][0].detach().cpu().numpy()
+            p_cs_np = sample["p_cs"][0].detach().cpu().numpy()
+            kt_np = sample["kt"][0].detach().cpu().numpy()
+            kt_mask_np = sample["kt_mask"][0].detach().cpu().numpy()
+            if sample.get("nwp_history") is None:
+                nwp_hist_ghi_np = np.zeros_like(pv_np)
+                ghi_hist_label = "nwp_history_ghi_mean (missing -> zeros)"
+            else:
+                # nwp_history channel order:
+                # [GHI_mean, msl, t2m, u10, v10, u100, v100, hist_valid_mask]
+                nwp_hist_ghi_np = sample["nwp_history"][:, 0].detach().cpu().numpy()
+                ghi_hist_label = "nwp_history_ghi_mean"
+
+            sat_img, sat_state = _current_frame_rgb(sample.get("sat_tensor"), fallback_hw=(100, 100))
+            sky_img, sky_state = _current_frame_rgb(sample.get("skimg_tensor"), fallback_hw=(224, 224))
+
+            x = np.arange(len(pv_np))
+            fig = plt.figure(figsize=(18, 10))
+            gs = fig.add_gridspec(4, 2, width_ratios=[3.2, 1.8], wspace=0.25, hspace=0.35)
+            axes = [fig.add_subplot(gs[i, 0]) for i in range(4)]
+            axes[0].plot(x, pv_np, lw=1.2, color="tab:blue")
+            axes[0].set_ylabel("pv")
+            axes[0].grid(True, alpha=0.25)
+            axes[1].plot(x, p_cs_np, lw=1.2, color="tab:orange")
+            axes[1].set_ylabel("p_cs")
+            axes[1].grid(True, alpha=0.25)
+            axes[2].plot(x, kt_np, lw=1.2, color="tab:green")
+            axes[2].set_ylabel("kt")
+            axes[2].grid(True, alpha=0.25)
+            axes[3].plot(x, kt_mask_np, lw=1.2, color="tab:red")
+            axes[3].set_ylabel("kt_mask")
+            axes[3].set_xlabel("history step")
+            axes[3].set_ylim(-0.05, 1.05)
+            axes[3].grid(True, alpha=0.25)
+
+            ax_sat = fig.add_subplot(gs[0:2, 1])
+            ax_sky = fig.add_subplot(gs[2:4, 1])
+            ax_sat.imshow(sat_img)
+            ax_sky.imshow(sky_img)
+            ax_sat.set_title(f"sat current frame (-1) [{sat_state}]")
+            ax_sky.set_title(f"sky current frame (-1) [{sky_state}]")
+            ax_sat.axis("off")
+            ax_sky.axis("off")
+            fig.suptitle(
+                f"{split} idx={idx}: pv / p_cs / kt / kt_mask + current sat/sky | "
+                f"anchor={anchor_utc_str} ({anchor_bj_str})"
+            )
+            fig.tight_layout()
+            out_path = args.plot_out_dir / f"{split}_idx{idx:06d}_{anchor_tag}_signals.png"
+            fig.savefig(out_path, dpi=160)
+            plt.close(fig)
+
+            # Overlay with scale adjustment:
+            # - Left axis: pv (raw)
+            # - Right axis: p_cs/kt and normalized NWP-history GHI_mean (0..1)
+            ghi_min = float(np.nanmin(nwp_hist_ghi_np)) if nwp_hist_ghi_np.size else 0.0
+            ghi_max = float(np.nanmax(nwp_hist_ghi_np)) if nwp_hist_ghi_np.size else 0.0
+            if np.isfinite(ghi_min) and np.isfinite(ghi_max) and ghi_max > ghi_min:
+                nwp_hist_ghi_norm = (nwp_hist_ghi_np - ghi_min) / (ghi_max - ghi_min)
+            else:
+                nwp_hist_ghi_norm = np.zeros_like(nwp_hist_ghi_np, dtype=np.float32)
+
+            fig_hist, ax_hist_l = plt.subplots(1, 1, figsize=(14, 4.5))
+            ax_hist_l.plot(x, pv_np, lw=1.1, color="tab:blue", label="pv")
+            ax_hist_l.set_xlabel("history step")
+            ax_hist_l.set_ylabel("pv", color="tab:blue")
+            ax_hist_l.tick_params(axis="y", labelcolor="tab:blue")
+            ax_hist_l.grid(True, alpha=0.25)
+
+            ax_hist_r = ax_hist_l.twinx()
+            ax_hist_r.plot(x, p_cs_np, lw=1.1, color="tab:orange", label="p_cs")
+            ax_hist_r.plot(x, kt_np, lw=1.1, color="tab:green", label="kt")
+            ax_hist_r.plot(
+                x,
+                nwp_hist_ghi_norm,
+                lw=1.1,
+                color="tab:red",
+                label=f"{ghi_hist_label}_norm",
+            )
+            ax_hist_r.set_ylabel("p_cs / kt / ghi_norm", color="tab:orange")
+            ax_hist_r.tick_params(axis="y", labelcolor="tab:orange")
+            ax_hist_r.set_ylim(-0.05, 1.05)
+
+            lines_l, labels_l = ax_hist_l.get_legend_handles_labels()
+            lines_r, labels_r = ax_hist_r.get_legend_handles_labels()
+            ax_hist_l.legend(lines_l + lines_r, labels_l + labels_r, loc="upper right")
+            fig_hist.suptitle(
+                f"{split} idx={idx}: pv / p_cs / kt / nwp_history_ghi_mean | "
+                f"anchor={anchor_utc_str} ({anchor_bj_str})"
+            )
+            fig_hist.tight_layout()
+            out_path_hist = args.plot_out_dir / f"{split}_idx{idx:06d}_{anchor_tag}_history_ghi_overlay.png"
+            fig_hist.savefig(out_path_hist, dpi=160)
+            plt.close(fig_hist)
+
+            target_pv_np = sample["target_pv"].detach().cpu().numpy()
+            if sample["nwp_tensor"] is None:
+                ssrd_np = np.zeros_like(target_pv_np)
+                ssrd_mask_np = np.zeros_like(target_pv_np)
+                t2m_np = np.zeros_like(target_pv_np)
+                t2m_mask_np = np.zeros_like(target_pv_np)
+                ssrd_label = "ssrd (nwp missing -> zeros)"
+                t2m_label = "t2m (nwp missing -> zeros)"
+            else:
+                # nwp feature order: [ssrd, ssrd_mask, t2m, t2m_mask]
+                ssrd_np = sample["nwp_tensor"][:, 0].detach().cpu().numpy()
+                ssrd_mask_np = sample["nwp_tensor"][:, 1].detach().cpu().numpy()
+                t2m_np = sample["nwp_tensor"][:, 2].detach().cpu().numpy()
+                t2m_mask_np = sample["nwp_tensor"][:, 3].detach().cpu().numpy()
+                ssrd_label = "ssrd"
+                t2m_label = "t2m"
+
+            x_out = np.arange(len(target_pv_np))
+            fig2, axes2 = plt.subplots(5, 1, figsize=(14, 11), sharex=True)
+            axes2[0].plot(x_out, target_pv_np, lw=1.2, color="tab:blue")
+            axes2[0].set_ylabel("target_pv")
+            axes2[0].grid(True, alpha=0.25)
+            axes2[1].plot(x_out, ssrd_np, lw=1.2, color="tab:green")
+            axes2[1].set_ylabel(ssrd_label)
+            axes2[1].grid(True, alpha=0.25)
+            axes2[2].plot(x_out, ssrd_mask_np, lw=1.2, color="tab:purple")
+            axes2[2].set_ylabel("ssrd_mask")
+            axes2[2].set_ylim(-0.05, 1.05)
+            axes2[2].grid(True, alpha=0.25)
+            axes2[3].plot(x_out, t2m_np, lw=1.2, color="tab:red")
+            axes2[3].set_ylabel(t2m_label)
+            axes2[3].grid(True, alpha=0.25)
+            axes2[4].plot(x_out, t2m_mask_np, lw=1.2, color="tab:brown")
+            axes2[4].set_ylabel("t2m_mask")
+            axes2[4].set_ylim(-0.05, 1.05)
+            axes2[4].set_xlabel("forecast step")
+            axes2[4].grid(True, alpha=0.25)
+            fig2.suptitle(
+                f"{split} idx={idx}: target_pv / ssrd / ssrd_mask / t2m / t2m_mask | "
+                f"anchor={anchor_utc_str} ({anchor_bj_str})"
+            )
+            fig2.tight_layout()
+            out_path2 = args.plot_out_dir / f"{split}_idx{idx:06d}_{anchor_tag}_targets_nwp_4ch.png"
+            fig2.savefig(out_path2, dpi=160)
+            plt.close(fig2)
+
+            print(
+                f"[{split}] plots saved: {out_path.name}, {out_path_hist.name}, "
+                f"{out_path2.name}"
+            )
+            plotted += 1
+
+        print(
+            f"[{split}] plotted {plotted}/{max_to_plot} anchors "
+            f"(start={start_idx}, step={step}, len={len(ds)})"
+        )
 
 
 if __name__ == "__main__":
