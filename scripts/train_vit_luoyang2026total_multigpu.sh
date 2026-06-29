@@ -17,7 +17,7 @@ PYTHON_BIN=${PYTHON_BIN:-python}
 CONFIG=${CONFIG:-conf_train.yaml}
 DATASET_CONFIG=${DATASET_CONFIG:-conf_luoyang_2026_4h.yaml}
 TASK=${TASK:-4h}
-CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-checkpoints_smallstepsize}
+CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-checkpoints_pvnwp_128bs}
 EXTRA_ARGS=${EXTRA_ARGS:-}
 
 if [ "${#GPUS[@]}" -eq 0 ]; then

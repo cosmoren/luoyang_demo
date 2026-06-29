@@ -3,7 +3,7 @@ paths:
   pv_path: pv
   pv_total_path: pv_total.csv
   sky_image_path: luoyangASI_skimg_zarr1
-  sat_path: luoyang_sat_zarr
+  sat_path: luoyang_sat_zarr1
   nwp_path: NWP
 
 sampling:
