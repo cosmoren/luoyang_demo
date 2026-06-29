@@ -49,9 +49,9 @@ ylj_raw_parquet:
   fut_len: 192 # length of observe_power_future per row
   native_interval_min: 15 # minutes per native index; X/Y strides must be multiples of this
   naive_tz: "Asia/Shanghai" # timestamp_win is naive local; converted to UTC for solar features
-  train_parquet: "ds_v322_2024.parquet" #"ds_v322_2024.parquet"
+  train_parquet: "synthetic_real.parquet" #"ds_v322_2024.parquet"
   test_parquet: "ds_v322_1219_2025_1-12.parquet"
-  solar_features_csv: "solar_features_ylj_2024_2025_15min.csv" # "solar_features_ylj_2024_2025_15min.csv" # china_local_time join; missing -> solar mask 0
+  solar_features_csv: "solar_features_ylj_2017_2025_15min.csv" # "solar_features_ylj_2024_2025_15min.csv" # china_local_time join; missing -> solar mask 0
 
 # Hyperparameters for training/train.py (CLI flags override these when passed)
 training:
@@ -60,8 +60,8 @@ training:
   pv_input_interval_min: 15 # multiple of 5 or csv_interval_min
   pv_input_len: 192
   t_off_min: 15 # single-horizon forecast offset (minutes)
-  pv_output_interval_min: 240 # multiple of 5 or csv_interval_min
-  pv_output_len: 1 # 16 hours
+  pv_output_interval_min: 15 # multiple of 5 or csv_interval_min
+  pv_output_len: 192 # 16 hours
   pv_output_rand: false #true # when pv_output_len>1: true=random sparse samples, false=deterministic interval grid
   # Chronological split per CSV: first N rows = train, rest = test; N = int(n_rows * fraction)
   pv_train_time_fraction: 0.7
@@ -78,7 +78,7 @@ training:
   satimg_time_resolution_min: 10 # multiple of 10
   satimg_npy_shape_hwc: [100, 100, 3] # expected np.load array layout (height, width, channels)
   # Optimization and training loop
-  epochs: 50
+  epochs: 5
   lr: 5e-4
   batch_size: 64 # 32
   save_every: 1
@@ -87,20 +87,3 @@ training:
   train_max_batches_per_epoch: null
   # kt training (train_ylj.py): model sees kt/20; loss on reconstructed kW power (raw kW targets).
   pv_value_scale: 1.0
-
-  # Rolling daily finetune + operational forecast (``training/train_ylj_rolling.py``).
-ylj_rolling_finetune:
-  lookback_days: 10
-  finetune_end_time: "00:00" # naive China HH:MM on day D; slides window toward issue time
-  predict_issue_time: "09:00" # operational forecast anchor (must be >= finetune_end_time)
-  finetune_epochs: 2
-  finetune_lr: 1.0e-4
-  predict_start: "2025-01-01"
-  predict_end: "2025-12-30"
-  base_ckpt: "ckpt_0603/checkpoints_ylj_48h_48h_kt_raw_parquet_nwp_sat_run9/pv_forecast_epoch_3.pt"
-  train_parquet: "only_2024_real.parquet" # fallback: only_2024.parquet
-  test_parquet: "ds_v322_1219_2025_1-12.parquet"
-  solar_features_csv: "solar_features_ylj_2024_2025_15min.csv"
-  pv_output_len: 192 # 48 h at 15 min; base ckpt must match
-  output_csv: "rolling_finetune_predictions.csv"
-  ckpt_dir: "rolling_finetune_ckpts"

@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="/data/luoyang_demo_0521"
 CFG="$ROOT/config/datasets/conf_ylj.yaml"
-CKPT_DIR="$ROOT/checkpoints_ylj_48h_4h_nwp_kt_raw_parquet_synthetic_real"
+CKPT_DIR="$ROOT/checkpoints_ylj_48h_4h_nwp_kt_raw_parquet_synthetic_real_smoothed_ssrd"
 OUT_DIR="$CKPT_DIR/test_csvs_every10_seqpairs"
 
 mkdir -p "$OUT_DIR"

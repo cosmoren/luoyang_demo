@@ -45,10 +45,90 @@ def _batch_model_kwargs(batch: dict, device: torch.device) -> dict:
     out: dict = {}
     nwp = batch.get("nwp_tensor")
     out["nwp_tensor"] = None if nwp is None else nwp.to(device)
-    for key in ("sat_tensor", "sat_timefeats"):
+    for key in ("sat_tensor", "sat_timefeats", "parquet_hist"):
         v = batch.get(key)
         out[key] = None if v is None else v.to(device)
     return out
+
+
+def _ylj_parquet_hist_enabled(args: argparse.Namespace) -> dict[str, bool]:
+    from dataloader.ylj_zarr import resolve_ylj_parquet_hist_enabled
+
+    return resolve_ylj_parquet_hist_enabled(args)
+
+
+def _ylj_n_parquet_hist_channels(enabled: dict[str, bool]) -> int:
+    from dataloader.ylj_zarr import active_ylj_parquet_hist_specs
+
+    return len(active_ylj_parquet_hist_specs(enabled))
+
+
+def _ylj_parquet_hist_ckpt_flags(enabled: dict[str, bool]) -> dict[str, bool]:
+    from dataloader.ylj_zarr import ylj_parquet_hist_ckpt_flags
+
+    return ylj_parquet_hist_ckpt_flags(enabled)
+
+
+def _assert_ckpt_hist_flags(ckpt: dict, enabled: dict[str, bool]) -> None:
+    from dataloader.ylj_zarr import YLJ_PARQUET_HIST_SPECS
+
+    for spec in YLJ_PARQUET_HIST_SPECS:
+        ckpt_val = bool(ckpt.get(spec.ckpt_key, False))
+        current = bool(enabled.get(spec.feature_id, False))
+        if ckpt_val != current:
+            raise ValueError(
+                f"Checkpoint {spec.ckpt_key}={ckpt_val} but --{spec.cli_flag}={current}. "
+                f"Pass --{spec.cli_flag} (or --ylj_parquet_use_all) to match the checkpoint."
+            )
+
+
+def _assert_ckpt_tcn_multi_kernel_flag(ckpt: dict, use_multi_kernel_tcn: bool) -> None:
+    ckpt_val = bool(ckpt.get("tcn_multi_kernel", False))
+    if ckpt_val != use_multi_kernel_tcn:
+        raise ValueError(
+            f"Checkpoint tcn_multi_kernel={ckpt_val} but --tcn_multi_kernel={use_multi_kernel_tcn}. "
+            "Pass --tcn_multi_kernel to match the checkpoint."
+        )
+
+
+def _assert_ckpt_cross_attn_layers_flag(ckpt: dict, cross_attn_layers: int) -> None:
+    ckpt_val = int(ckpt.get("cross_attn_layers", 1))
+    if ckpt_val != int(cross_attn_layers):
+        raise ValueError(
+            f"Checkpoint cross_attn_layers={ckpt_val} but "
+            f"--cross_attn_2layer={int(cross_attn_layers) == 2}. "
+            "Pass --cross_attn_2layer to match a 2-layer checkpoint."
+        )
+
+
+def _assert_ckpt_nwp_residual_flag(ckpt: dict, use_nwp_residual: bool) -> None:
+    ckpt_val = bool(ckpt.get("nwp_residual", False))
+    if ckpt_val != use_nwp_residual:
+        raise ValueError(
+            f"Checkpoint nwp_residual={ckpt_val} but --nwp_residual={use_nwp_residual}. "
+            "Pass --nwp_residual to match the checkpoint."
+        )
+
+
+def _assert_ckpt_hist_compression_flag(ckpt: dict, use_hist_compression: bool) -> None:
+    ckpt_val = bool(ckpt.get("hist_compression", False))
+    if ckpt_val != use_hist_compression:
+        raise ValueError(
+            f"Checkpoint hist_compression={ckpt_val} but --hist_compression={use_hist_compression}. "
+            "Pass --hist_compression to match the checkpoint."
+        )
+
+
+def _assert_ckpt_hist_compression_cond_forecast_flag(
+    ckpt: dict, hist_compression_cond_forecast: bool
+) -> None:
+    ckpt_val = bool(ckpt.get("hist_compression_cond_forecast", False))
+    if ckpt_val != hist_compression_cond_forecast:
+        raise ValueError(
+            f"Checkpoint hist_compression_cond_forecast={ckpt_val} but "
+            f"--hist_compression_cond_forecast={hist_compression_cond_forecast}. "
+            "Pass --hist_compression_cond_forecast to match the checkpoint."
+        )
 
 
 def _masked_pv_loss_tensors(
@@ -755,9 +835,109 @@ def main() -> None:
         help="With --ylj_raw_parquet: attach NWP from fixed SSRD/T2m predict columns in the Parquet (no NWP files).",
     )
     parser.add_argument(
+        "--ylj_parquet_ghi",
+        action="store_true",
+        help="With --ylj_raw_parquet: add historical GHI_real as an extra TCN input channel (input-only).",
+    )
+    parser.add_argument(
+        "--ylj_parquet_ghi_solargis",
+        action="store_true",
+        help="With --ylj_raw_parquet: add historical GHI_SOLARGIS (/1500) as an extra TCN input channel.",
+    )
+    parser.add_argument(
+        "--ylj_parquet_temp_solargis",
+        action="store_true",
+        help="With --ylj_raw_parquet: add historical TEMP_SOLARGIS (/18) as an extra TCN input channel.",
+    )
+    parser.add_argument(
+        "--ylj_parquet_use_all",
+        action="store_true",
+        help="Enable all Parquet history channels (14 total: irradiance/temp, engineered, SOLARGIS met).",
+    )
+    parser.add_argument(
+        "--ylj_parquet_kt_ramp",
+        action="store_true",
+        help="With --ylj_raw_parquet: add historical kt_ramp (/16) as an extra TCN input channel.",
+    )
+    parser.add_argument(
+        "--ylj_parquet_ghi_ramp",
+        action="store_true",
+        help="With --ylj_raw_parquet: add historical GHI_ramp (/1000) as an extra TCN input channel.",
+    )
+    parser.add_argument(
+        "--ylj_parquet_ghi_roll_mean",
+        action="store_true",
+        help="With --ylj_raw_parquet: add historical ghi_roll_mean (/1500) as an extra TCN input channel.",
+    )
+    parser.add_argument(
+        "--ylj_parquet_ghi_roll_std",
+        action="store_true",
+        help="With --ylj_raw_parquet: add historical ghi_roll_std (/500) as an extra TCN input channel.",
+    )
+    parser.add_argument(
+        "--ylj_parquet_om_cloud_pct",
+        action="store_true",
+        help="With --ylj_raw_parquet: add historical om_cloud_pct (/100) as an extra TCN input channel.",
+    )
+    parser.add_argument(
+        "--ylj_parquet_om_cloud_pct_low_mid",
+        action="store_true",
+        help="With --ylj_raw_parquet: add historical om_cloud_pct_low_mid (/200) as an extra TCN input channel.",
+    )
+    parser.add_argument(
+        "--ylj_parquet_ws_solargis",
+        action="store_true",
+        help="With --ylj_raw_parquet: add historical WS_SOLARGIS (/15) as an extra TCN input channel.",
+    )
+    parser.add_argument(
+        "--ylj_parquet_wd_solargis",
+        action="store_true",
+        help="With --ylj_raw_parquet: add historical WD_SOLARGIS (/360) as an extra TCN input channel.",
+    )
+    parser.add_argument(
+        "--ylj_parquet_prec_solargis",
+        action="store_true",
+        help="With --ylj_raw_parquet: add historical PREC_SOLARGIS (/10) as an extra TCN input channel.",
+    )
+    parser.add_argument(
+        "--ylj_parquet_pwat_solargis",
+        action="store_true",
+        help="With --ylj_raw_parquet: add historical PWAT_SOLARGIS (/25) as an extra TCN input channel.",
+    )
+    parser.add_argument(
+        "--ylj_parquet_sdwe_solargis",
+        action="store_true",
+        help="With --ylj_raw_parquet: add historical SDWE_SOLARGIS (/25) as an extra TCN input channel.",
+    )
+    parser.add_argument(
         "--ylj_sat_zarr",
         action="store_true",
         help="With --ylj_raw_parquet: load Himawari satellite from paths.sat_path Zarr (yalongjiang_zarr).",
+    )
+    parser.add_argument(
+        "--tcn_multi_kernel",
+        action="store_true",
+        help="Use parallel TCN branches with kernel sizes [3, 7, 11, 15, 31] instead of a single k=3 stack.",
+    )
+    parser.add_argument(
+        "--cross_attn_2layer",
+        action="store_true",
+        help="Stack two cross-attention layers (forecast query attends to history twice).",
+    )
+    parser.add_argument(
+        "--nwp_residual",
+        action="store_true",
+        help="Concatenate an NWP skip embedding into pv_feats_head (alongside cross-attn output).",
+    )
+    parser.add_argument(
+        "--hist_compression",
+        action="store_true",
+        help="Compress PV history (192 -> 48 tokens) before forecast cross-attention.",
+    )
+    parser.add_argument(
+        "--hist_compression_cond_forecast",
+        action="store_true",
+        help="With --hist_compression: build compression queries from forecast time + NWP features.",
     )
     parser.add_argument(
         "--resume",
@@ -773,6 +953,9 @@ def main() -> None:
     args = parser.parse_args()
     satimg_hwc = tuple(args.satimg_npy_shape_hwc)
 
+    if args.hist_compression_cond_forecast and not args.hist_compression:
+        parser.error("--hist_compression_cond_forecast requires --hist_compression")
+
     if args.test_dataloader:
         loader_test(args, satimg_hwc)
         return
@@ -784,7 +967,18 @@ def main() -> None:
     pv_device_df = pd.read_excel(pv_device_path)
     dev_dn_list = pv_device_df["devDn"].dropna().unique().tolist()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = pv_forecasting_model_vit_nwp(dev_dn_list=dev_dn_list).to(device)
+    hist_enabled = _ylj_parquet_hist_enabled(args)
+    n_hist = _ylj_n_parquet_hist_channels(hist_enabled)
+    cross_attn_layers = 2 if args.cross_attn_2layer else 1
+    model = pv_forecasting_model_vit_nwp(
+        dev_dn_list=dev_dn_list,
+        n_parquet_hist_channels=n_hist,
+        use_multi_kernel_tcn=args.tcn_multi_kernel,
+        cross_attn_layers=cross_attn_layers,
+        use_nwp_residual=args.nwp_residual,
+        use_hist_compression=args.hist_compression,
+        hist_compression_cond_forecast=args.hist_compression_cond_forecast,
+    ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -849,6 +1043,14 @@ def main() -> None:
                     break
         if ckpt_path is not None:
             ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+            _assert_ckpt_hist_flags(ckpt, hist_enabled)
+            _assert_ckpt_tcn_multi_kernel_flag(ckpt, args.tcn_multi_kernel)
+            _assert_ckpt_cross_attn_layers_flag(ckpt, cross_attn_layers)
+            _assert_ckpt_nwp_residual_flag(ckpt, args.nwp_residual)
+            _assert_ckpt_hist_compression_flag(ckpt, args.hist_compression)
+            _assert_ckpt_hist_compression_cond_forecast_flag(
+                ckpt, args.hist_compression_cond_forecast
+            )
             model.load_state_dict(ckpt["model_state_dict"])
             print(f"Loaded checkpoint for test-only mode: {ckpt_path} (epoch={ckpt.get('epoch', '?')})")
         else:
@@ -928,6 +1130,13 @@ def main() -> None:
             print("resume=True but no checkpoint found; starting training from epoch 1.")
         else:
             ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+            _assert_ckpt_tcn_multi_kernel_flag(ckpt, args.tcn_multi_kernel)
+            _assert_ckpt_cross_attn_layers_flag(ckpt, cross_attn_layers)
+            _assert_ckpt_nwp_residual_flag(ckpt, args.nwp_residual)
+            _assert_ckpt_hist_compression_flag(ckpt, args.hist_compression)
+            _assert_ckpt_hist_compression_cond_forecast_flag(
+                ckpt, args.hist_compression_cond_forecast
+            )
             model.load_state_dict(ckpt["model_state_dict"])
             if "optimizer_state_dict" in ckpt:
                 optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -989,6 +1198,13 @@ def main() -> None:
             "scheduler_state_dict": scheduler.state_dict(),
             "train_loss": avg_loss,
             "dev_dn_list": dev_dn_list,
+            "n_parquet_hist_channels": n_hist,
+            "tcn_multi_kernel": bool(args.tcn_multi_kernel),
+            "cross_attn_layers": cross_attn_layers,
+            "nwp_residual": bool(args.nwp_residual),
+            "hist_compression": bool(args.hist_compression),
+            "hist_compression_cond_forecast": bool(args.hist_compression_cond_forecast),
+            **_ylj_parquet_hist_ckpt_flags(hist_enabled),
         }
 
         if epoch == 1:

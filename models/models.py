@@ -86,6 +86,62 @@ class TemporalCNN1d(nn.Module):
         return out
 
 
+class TemporalCNN1dMultiKernel(nn.Module):
+    """
+    Parallel 1D temporal CNN branches with different kernel sizes; outputs are
+    concatenated along channels and projected to out_channels. Input [B, C, T],
+    output [B, C_out, T]. Optional mask applied element-wise before convs.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 1,
+        hidden_channels: list = (32, 64, 64),
+        kernel_sizes: tuple = (3, 7, 11, 15, 31),
+        out_channels: int = 64,
+        use_batchnorm: bool = True,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.hidden_channels = list(hidden_channels)
+        self.kernel_sizes = tuple(kernel_sizes)
+        self.out_channels = out_channels
+        self.use_batchnorm = use_batchnorm
+        self.dropout = dropout
+
+        branch_out = self.hidden_channels[-1]
+        branches = []
+        for k in self.kernel_sizes:
+            layers = []
+            c_in = in_channels
+            for c_out in self.hidden_channels:
+                layers.append(nn.Conv1d(c_in, c_out, k, padding=k // 2))
+                if use_batchnorm:
+                    layers.append(nn.BatchNorm1d(c_out))
+                layers.append(nn.ReLU(inplace=True))
+                if dropout > 0:
+                    layers.append(nn.Dropout(dropout))
+                c_in = c_out
+            branches.append(nn.Sequential(*layers))
+        self.branches = nn.ModuleList(branches)
+        self.conv_out = nn.Conv1d(branch_out * len(self.kernel_sizes), out_channels, 1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if mask is not None:
+            x = x * mask.to(x.dtype)
+        outs = [branch(x) for branch in self.branches]
+        return self.conv_out(torch.cat(outs, dim=1))
+
+
+_TCN_MULTI_KERNEL_SIZES = (3, 7, 11, 15, 31)
+_NUM_HIST_COMPRESSION_TOKENS = 48
+
+
 class MLP(nn.Module):
     """
     Small MLP: Linear -> ReLU -> [Linear -> ReLU] -> Linear.
@@ -369,11 +425,39 @@ def _slice_luoyang_pv_solar_timefeats(feats: Optional[torch.Tensor]) -> Optional
 
 # Using PV history and NWP to forecast PV, solar features and NWP features are used as query
 class pv_forecasting_model_vit_nwp(nn.Module):
-    def __init__(self, use_batchnorm: bool = True, dropout: float = 0.0, dev_dn_list: Optional[list] = None):
+    def __init__(
+        self,
+        use_batchnorm: bool = True,
+        dropout: float = 0.0,
+        dev_dn_list: Optional[list] = None,
+        n_parquet_hist_channels: int = 0,
+        *,
+        use_multi_kernel_tcn: bool = False,
+        cross_attn_layers: int = 1,
+        use_nwp_residual: bool = False,
+        use_hist_compression: bool = False,
+        hist_compression_cond_forecast: bool = False,
+        use_ghi: bool = False,
+        use_ghi_solargis: bool = False,
+        use_temp_solargis: bool = False,
+    ):
         super().__init__()
 
         self.use_batchnorm = use_batchnorm
         self.dropout = dropout
+        self.use_multi_kernel_tcn = bool(use_multi_kernel_tcn)
+        self.cross_attn_layers = int(cross_attn_layers)
+        if self.cross_attn_layers not in (1, 2):
+            raise ValueError("cross_attn_layers must be 1 or 2")
+        self.use_nwp_residual = bool(use_nwp_residual)
+        self.use_hist_compression = bool(use_hist_compression)
+        self.hist_compression_cond_forecast = bool(hist_compression_cond_forecast)
+        if self.hist_compression_cond_forecast and not self.use_hist_compression:
+            raise ValueError("hist_compression_cond_forecast requires use_hist_compression=True")
+        # Legacy bools kept for callers that still pass them; channel count is authoritative.
+        if n_parquet_hist_channels <= 0 and (use_ghi or use_ghi_solargis or use_temp_solargis):
+            n_parquet_hist_channels = int(use_ghi) + int(use_ghi_solargis) + int(use_temp_solargis)
+        self.n_parquet_hist_channels = int(n_parquet_hist_channels)
 
         dim = 64
         self.sat_mod_embed = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
@@ -381,10 +465,57 @@ class pv_forecasting_model_vit_nwp(nn.Module):
         self.inverter_embedding = nn.Embedding(num_embeddings=1000, embedding_dim=16)
         # YLJ / Luoyang yr: TCN 2+3=5 (kt, mask, sin_ze, cos_ze, dt); query MLP 3+3=6
         self._pv_timefeat_dim = 3
-        self.TCN = TemporalCNN1d(in_channels=2 + self._pv_timefeat_dim, out_channels=64, use_batchnorm=use_batchnorm, dropout=dropout)
+        tcn_in_channels = 2 + self._pv_timefeat_dim + self.n_parquet_hist_channels
+        tcn_kw = dict(
+            in_channels=tcn_in_channels,
+            out_channels=64,
+            use_batchnorm=use_batchnorm,
+            dropout=dropout,
+        )
+        if self.use_multi_kernel_tcn:
+            self.TCN = TemporalCNN1dMultiKernel(
+                **tcn_kw,
+                kernel_sizes=_TCN_MULTI_KERNEL_SIZES,
+            )
+        else:
+            self.TCN = TemporalCNN1d(**tcn_kw)
         self.query_mlp = MLP(in_dim=self._pv_timefeat_dim + 3, hidden_dims=(64, 64), out_dim=64, dropout=0.0)
-        self.cross_attention_pv = CrossAttention(query_dim=64, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
-        self.pv_feats_head = MLP(in_dim=80, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
+        _ca_kw = dict(
+            query_dim=64,
+            key_dim=64,
+            value_dim=64,
+            embed_dim=64,
+            num_heads=4,
+            dropout=dropout,
+        )
+        if self.cross_attn_layers == 1:
+            self.cross_attention_pv = CrossAttention(**_ca_kw)
+        else:
+            self.cross_attention_pv_1 = CrossAttention(**_ca_kw)
+            self.cross_attention_pv_2 = CrossAttention(**_ca_kw)
+        if self.use_hist_compression:
+            n_cmp = _NUM_HIST_COMPRESSION_TOKENS
+            self.learnable_pv_queries = nn.Parameter(
+                torch.randn(1, n_cmp, dim) * 0.02
+            )
+            self.cross_attention_pv_compression = CrossAttention(**_ca_kw)
+            if self.hist_compression_cond_forecast:
+                self.compression_forecast_mlp = MLP(
+                    in_dim=self._pv_timefeat_dim + 3,
+                    hidden_dims=(64, 64),
+                    out_dim=dim,
+                    dropout=0.0,
+                )
+        _nwp_query_in = self._pv_timefeat_dim + 3
+        if self.use_nwp_residual:
+            self.nwp_skip_mlp = MLP(
+                in_dim=_nwp_query_in,
+                hidden_dims=(64,),
+                out_dim=dim,
+                dropout=0.0,
+            )
+        pv_feats_in = 80 + (dim if self.use_nwp_residual else 0)
+        self.pv_feats_head = MLP(in_dim=pv_feats_in, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
         self.fc = FC(in_dim=64, out_dim=1)
 
         self.sat_time_mlp = nn.Sequential(
@@ -412,7 +543,67 @@ class pv_forecasting_model_vit_nwp(nn.Module):
             coarse_query_grid_hw=(6, 8),
         )
 
-    def forward(self, device_id: torch.Tensor, pv: torch.Tensor, 
+    def _apply_cross_attention_pv(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_value_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if self.cross_attn_layers == 1:
+            return self.cross_attention_pv(
+                query=query,
+                key=key,
+                value=value,
+                key_value_mask=key_value_mask,
+            )
+        h = self.cross_attention_pv_1(
+            query=query,
+            key=key,
+            value=value,
+            key_value_mask=key_value_mask,
+        )
+        return self.cross_attention_pv_2(
+            query=h,
+            key=key,
+            value=value,
+            key_value_mask=key_value_mask,
+        )
+
+    def _pv_hist_key_padding_mask(self, pv_mask: torch.Tensor) -> torch.Tensor:
+        if pv_mask.dim() == 3:
+            return pv_mask.squeeze(1)
+        return pv_mask
+
+    def _compress_pv_history(
+        self,
+        kv_hist_mem: torch.Tensor,
+        key_value_mask: torch.Tensor,
+        forecast_ssrd_timefeats: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B = kv_hist_mem.shape[0]
+        if self.hist_compression_cond_forecast:
+            if forecast_ssrd_timefeats is None:
+                raise ValueError(
+                    "forecast_ssrd_timefeats required for forecast-conditioned history compression"
+                )
+            if forecast_ssrd_timefeats.shape[1] == 1:
+                fc_in = forecast_ssrd_timefeats[:, 0]
+            else:
+                fc_in = forecast_ssrd_timefeats.mean(dim=1)
+            fc_emb = self.compression_forecast_mlp(fc_in)
+            compression_queries = self.learnable_pv_queries + fc_emb.unsqueeze(1)
+        else:
+            compression_queries = self.learnable_pv_queries.expand(B, -1, -1)
+        compressed = self.cross_attention_pv_compression(
+            query=compression_queries,
+            key=kv_hist_mem,
+            value=kv_hist_mem,
+            key_value_mask=key_value_mask,
+        )
+        return compressed + compression_queries
+
+    def forward(self, device_id: torch.Tensor, pv: torch.Tensor,
                 pv_mask: Optional[torch.Tensor] = None, 
                 pv_timefeats: Optional[torch.Tensor] = None,
                 forecast_timefeats: Optional[torch.Tensor] = None,
@@ -420,12 +611,47 @@ class pv_forecasting_model_vit_nwp(nn.Module):
                 sat_timefeats: Optional[torch.Tensor] = None,
                 skimg_tensor: Optional[torch.Tensor] = None,
                 skimg_timefeats: Optional[torch.Tensor] = None,
-                nwp_tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
+                nwp_tensor: Optional[torch.Tensor] = None,
+                parquet_hist: Optional[torch.Tensor] = None,
+                ghi_hist: Optional[torch.Tensor] = None,
+                ghi_solargis_hist: Optional[torch.Tensor] = None,
+                temp_solargis_hist: Optional[torch.Tensor] = None) -> torch.Tensor:
         
         pv_masked = pv * pv_mask.to(pv.dtype)
         pv_timefeats = _slice_luoyang_pv_solar_timefeats(pv_timefeats)
         forecast_timefeats = _slice_luoyang_pv_solar_timefeats(forecast_timefeats)
-        pv_history = torch.cat([pv_masked, pv_mask, pv_timefeats.permute(0, 2, 1)], dim=1)  # [B, C=5, T]
+        hist_channels = [pv_masked, pv_mask]
+        if self.n_parquet_hist_channels > 0:
+            if parquet_hist is None:
+                # Legacy per-channel kwargs (GHI only).
+                legacy = [ghi_hist, ghi_solargis_hist, temp_solargis_hist]
+                if any(t is not None for t in legacy):
+                    parquet_hist = torch.cat(
+                        [
+                            (t if t is not None else torch.zeros_like(pv)).to(device=pv.device, dtype=pv.dtype)
+                            for t in legacy[: self.n_parquet_hist_channels]
+                        ],
+                        dim=1,
+                    )
+                else:
+                    parquet_hist = torch.zeros(
+                        pv.shape[0],
+                        self.n_parquet_hist_channels,
+                        pv.shape[-1],
+                        device=pv.device,
+                        dtype=pv.dtype,
+                    )
+            else:
+                parquet_hist = parquet_hist.to(device=pv.device, dtype=pv.dtype)
+            if parquet_hist.shape[1] != self.n_parquet_hist_channels:
+                raise ValueError(
+                    f"parquet_hist has {parquet_hist.shape[1]} channels but model expects "
+                    f"{self.n_parquet_hist_channels}"
+                )
+            for ci in range(self.n_parquet_hist_channels):
+                hist_channels.append(parquet_hist[:, ci : ci + 1, :])
+        hist_channels.append(pv_timefeats.permute(0, 2, 1))
+        pv_history = torch.cat(hist_channels, dim=1)
         pv_hist_mem = self.TCN(pv_history, pv_mask)
         KV_hist_mem = pv_hist_mem.permute(0, 2, 1)  # [B, T=192, 64]
 
@@ -449,12 +675,25 @@ class pv_forecasting_model_vit_nwp(nn.Module):
         forecast_query = self.query_mlp(forecast_ssrd_timefeats)
 
         B = forecast_query.shape[0]
+        pv_km = self._pv_hist_key_padding_mask(pv_mask)
+        pv_hist_keys = KV_hist_mem
+        pv_hist_km = pv_km
+        if self.use_hist_compression:
+            pv_hist_keys = self._compress_pv_history(
+                KV_hist_mem,
+                pv_km,
+                forecast_ssrd_timefeats if self.hist_compression_cond_forecast else None,
+            )
+            pv_hist_km = torch.ones(
+                B,
+                pv_hist_keys.shape[1],
+                device=pv.device,
+                dtype=pv_mask.dtype,
+            )
+
         if sat_tensor is None or sat_tensor.max() == 0:
-            hist_keys = KV_hist_mem
-            if pv_mask.dim() == 3:
-                key_value_mask = pv_mask.squeeze(1)
-            else:
-                key_value_mask = pv_mask
+            hist_keys = pv_hist_keys
+            key_value_mask = pv_hist_km
         else:
             B_sat, T_sat, C_sat, H_sat, W_sat = sat_tensor.shape
             if C_sat != 3:
@@ -486,14 +725,10 @@ class pv_forecasting_model_vit_nwp(nn.Module):
             sat_compressed = sat_compressed + self.sat_time_mlp(sat_timefeats_48)
 
             sat_mask = torch.ones(B, sat_compressed.shape[1], device=pv.device, dtype=pv.dtype)
-            hist_keys = torch.cat([KV_hist_mem, sat_compressed], dim=1)
-            if pv_mask.dim() == 3:
-                pv_km = pv_mask.squeeze(1)
-            else:
-                pv_km = pv_mask
-            key_value_mask = torch.cat([pv_km, sat_mask], dim=1)
+            hist_keys = torch.cat([pv_hist_keys, sat_compressed], dim=1)
+            key_value_mask = torch.cat([pv_hist_km, sat_mask], dim=1)
 
-        forecast_pv_features = self.cross_attention_pv(
+        forecast_pv_features = self._apply_cross_attention_pv(
             query=forecast_query,
             key=hist_keys,
             value=hist_keys,
@@ -503,7 +738,10 @@ class pv_forecasting_model_vit_nwp(nn.Module):
         inverter_features = self.inverter_embedding(device_id).unsqueeze(1).repeat(
             1, forecast_pv_features.shape[1], 1
         )
-        fused = torch.cat([forecast_pv_features, inverter_features], dim=2)
+        fused_parts = [forecast_pv_features, inverter_features]
+        if self.use_nwp_residual:
+            fused_parts.append(self.nwp_skip_mlp(forecast_ssrd_timefeats))
+        fused = torch.cat(fused_parts, dim=2)
         pv_feats = self.pv_feats_head(fused)
         pv = self.fc(pv_feats)
 

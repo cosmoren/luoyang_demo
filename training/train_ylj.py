@@ -34,8 +34,10 @@ from config_utils import get_resolved_paths
 from dataloader.ylj_zarr import (
     YljRawParquetDataset,
     YljRawParquetEmptyValDataset,
+    YLJ_PARQUET_HIST_SPECS,
     _utc_wall_naive,
     collate_ylj_batched,
+    resolve_ylj_parquet_hist_enabled,
     ylj_raw_parquet_matrix_config_from_conf,
 )
 import training.train as base_train
@@ -81,6 +83,60 @@ def _ylj_forward_kt(
     return kt_pred, pv_pred
 
 
+# YLJ plant capacity (kW) for ACC metrics; matches YANG analysis scripts.
+_YLJ_CAPACITY_KW = 468.0
+
+
+@torch.no_grad()
+def _ylj_evaluate(
+    model: nn.Module,
+    device: torch.device,
+    loader: DataLoader,
+    criterion: nn.Module,
+) -> tuple[float, float]:
+    """kt-faithful eval: forecast via ``_ylj_forward_kt`` (kW), pooled masked MAE/RMSE.
+
+    Mirrors the seqpairs-CSV metric (pred clamped >=0, gt<0 skipped, masked by
+    ``target_mask``) and normalizes ACC by the YLJ plant capacity.
+    """
+    model.eval()
+    total_loss = 0.0
+    n = 0
+    errs: list[np.ndarray] = []
+    for batch in loader:
+        B = int(batch["dev_idx"].size(0))
+        _, pv_pred = _ylj_forward_kt(model, batch, device)
+        target_pv = batch["target_pv"].to(device)
+        target_mask = batch["target_mask"].to(device)
+        pred_loss, tgt_loss = base_train._masked_pv_loss_tensors(
+            batch, pv_pred, target_pv, target_mask, device
+        )
+        total_loss += float(criterion(pred_loss, tgt_loss).item())
+        n += B
+
+        pred = pv_pred.detach().cpu().float().numpy()
+        gt = target_pv.detach().cpu().float().numpy()
+        msk = target_mask.detach().cpu().float().numpy()
+        valid = (msk > 0) & (gt >= 0.0)
+        if valid.any():
+            pred = np.clip(pred, 0.0, None)
+            errs.append((pred[valid] - gt[valid]).astype(np.float64))
+
+    if not errs:
+        return total_loss / max(n, 1), float("nan")
+
+    err = np.concatenate(errs)
+    mae = float(np.mean(np.abs(err)))
+    rmse = float(np.sqrt(np.mean(err**2)))
+    cap = _YLJ_CAPACITY_KW
+    print(
+        f"[ylj eval] points={err.size}  MAE={mae:.6f}  RMSE={rmse:.6f}  "
+        f"ACC(MAE)={1.0 - mae / cap:.6f}  ACC(RMSE)={1.0 - rmse / cap:.6f}  "
+        f"(capacity={cap} kW)"
+    )
+    return total_loss / max(n, 1), rmse
+
+
 def _ylj_train_one_epoch(
     model: nn.Module,
     device: torch.device,
@@ -111,7 +167,11 @@ def _ylj_train_one_epoch(
         optimizer.zero_grad()
         _, pv_pred = _ylj_forward_kt(model, batch, device)
         target_pv = batch["target_pv"].to(device)
-        loss = criterion(pv_pred, target_pv)
+        target_mask = batch["target_mask"].to(device)
+        pred_loss, tgt_loss = base_train._masked_pv_loss_tensors(
+            batch, pv_pred, target_pv, target_mask, device
+        )
+        loss = criterion(pred_loss, tgt_loss)
         loss.backward()
         optimizer.step()
         loss_b = float(loss.item())
@@ -145,6 +205,10 @@ def _use_ylj_parquet_nwp(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "ylj_parquet_nwp", False))
 
 
+def _ylj_parquet_hist_enabled(args: argparse.Namespace) -> dict[str, bool]:
+    return resolve_ylj_parquet_hist_enabled(args)
+
+
 def _use_ylj_sat_zarr(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "ylj_sat_zarr", False))
 
@@ -155,6 +219,11 @@ def _build_pv_dataset(
     del satimg_hwc  # Zarr satellite uses fixed Luoyang window; NPY shape unused.
     if _use_ylj_parquet_nwp(args) and not _use_ylj_raw_parquet(args):
         raise ValueError("--ylj_parquet_nwp requires --ylj_raw_parquet")
+    for spec in YLJ_PARQUET_HIST_SPECS:
+        if bool(getattr(args, spec.cli_flag, False)) and not _use_ylj_raw_parquet(args):
+            raise ValueError(f"--{spec.cli_flag} requires --ylj_raw_parquet")
+    if bool(getattr(args, "ylj_parquet_use_all", False)) and not _use_ylj_raw_parquet(args):
+        raise ValueError("--ylj_parquet_use_all requires --ylj_raw_parquet")
     if _use_ylj_sat_zarr(args) and not _use_ylj_raw_parquet(args):
         raise ValueError("--ylj_sat_zarr requires --ylj_raw_parquet")
     if not _use_ylj_raw_parquet(args):
@@ -222,6 +291,7 @@ def _build_pv_dataset(
         dev_dn_index=dev_i,
         matrix=mx_cfg,
         use_nwp=_use_ylj_parquet_nwp(args),
+        parquet_hist_enabled=_ylj_parquet_hist_enabled(args),
         use_sat_zarr=_use_ylj_sat_zarr(args),
         sat_zarr_dir=sat_zarr_dir,
         pv_value_scale=float(hp["pv_value_scale"]),
@@ -618,6 +688,8 @@ def main() -> None:
             _export_test_sequence_pairs_csv(model, device, loader, p15),
             0,
         )
+        # kt-faithful test metric (replaces base_train.evaluate's raw-pv path).
+        base_train.evaluate = _ylj_evaluate
         # Force all-row anchors for test split when running through base_train.
         _orig_parse_args = argparse.ArgumentParser.parse_args
 

@@ -31,13 +31,13 @@ DEFAULT_LATITUDE = 29.9254
 DEFAULT_LONGITUDE = 100.5703
 DEFAULT_TZ = "Asia/Shanghai"
 DEFAULT_RAW_DIR = "/data/training_data/ylj_dataset_raw"
-DEFAULT_TRAIN_PARQUET = "synthetic_real.parquet"
+DEFAULT_TRAIN_PARQUET = "ds_v322_2024.parquet"
 DEFAULT_TEST_PARQUET = "ds_v322_1219_2025_1-12.parquet"
 DEFAULT_HIST_LEN = 672
 DEFAULT_NATIVE_INTERVAL_MIN = 15
 DEFAULT_P_MEAN_YEAR = 2024
 DEFAULT_OUT = (
-    "/data/training_data/ylj_dataset_raw/solar_features_ylj_2017_2025_15min.csv"
+    "/data/training_data/ylj_dataset_raw/solar_features_ylj_2024_2025_15min.csv"
 )
 
 OUTPUT_COLS = [
