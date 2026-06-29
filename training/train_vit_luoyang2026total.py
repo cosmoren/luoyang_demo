@@ -439,6 +439,8 @@ def _build_parser(h: dict, config_default: str, dataset_default: str) -> argpars
     parser.add_argument("--ema-decay", type=float, default=0.99)
     parser.add_argument("--ema-warmup-epochs", type=int, default=5)
     parser.add_argument("--max-files", type=int, default=None)
+    parser.add_argument("--nwp-dropout-prob", type=float, default=0.0)
+    parser.add_argument("--nwp-history-dropout-prob", type=float, default=0.0)
     return parser
 
 
@@ -507,7 +509,8 @@ def main() -> None:
     args = parser.parse_args()
     print(
         f"[startup] task={args.task} config={args.config} dataset_config={args.dataset_config} "
-        f"epochs={args.epochs} batch_size={args.batch_size}"
+        f"epochs={args.epochs} batch_size={args.batch_size} "
+        f"nwp_dropout={args.nwp_dropout_prob} nwp_history_dropout={args.nwp_history_dropout_prob}"
     )
     if args.init_checkpoint and args.resume_checkpoint:
         raise ValueError("Use only one of --init-checkpoint or --resume-checkpoint.")
@@ -523,7 +526,11 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[startup] Initializing model/optimizer on device={device}...")
-    model = pv_forecasting_model_vit_imgs(dev_dn_list=dev_dn_list).to(device)
+    model = pv_forecasting_model_vit_imgs(
+        dev_dn_list=dev_dn_list,
+        nwp_dropout_prob=args.nwp_dropout_prob,
+        nwp_history_dropout_prob=args.nwp_history_dropout_prob,
+    ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,

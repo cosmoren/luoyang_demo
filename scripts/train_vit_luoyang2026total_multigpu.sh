@@ -8,7 +8,7 @@
 #   GPUS="0 1" TASK=4h DATASET_CONFIG=conf_luoyang_2026_4h.yaml bash scripts/train_vit_luoyang2026total_multigpu.sh
 #
 # Extra args example:
-#   EXTRA_ARGS="--epochs 30 --batch_size 64 --num_workers 8"
+#   EXTRA_ARGS="--epochs 30 --batch_size 64 --num_workers 8 --nwp-dropout-prob 0.05 --nwp-history-dropout-prob 0.0"
 
 set -euo pipefail
 
@@ -17,8 +17,8 @@ PYTHON_BIN=${PYTHON_BIN:-python}
 CONFIG=${CONFIG:-conf_train.yaml}
 DATASET_CONFIG=${DATASET_CONFIG:-conf_luoyang_2026_4h.yaml}
 TASK=${TASK:-4h}
-CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-checkpoints_pvnwp_128bs}
-EXTRA_ARGS=${EXTRA_ARGS:-}
+CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-checkpoints_dropout05}
+EXTRA_ARGS=${EXTRA_ARGS:---nwp-dropout-prob 0.5 --nwp-history-dropout-prob 0.0}
 
 if [ "${#GPUS[@]}" -eq 0 ]; then
   echo "No GPUs configured. Set GPUS, e.g. GPUS=\"0 1\"." >&2

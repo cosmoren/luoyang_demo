@@ -586,6 +586,8 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         dev_dn_list: Optional[list] = None,
         nwp_features: Optional[list[str]] = None,
         use_invalid_mask: bool = _DEFAULT_VIT_IMGS_NWP_USE_INVALID_MASK,
+        nwp_dropout_prob: float = 0.0,
+        nwp_history_dropout_prob: float = 0.0,
     ):
         super().__init__()
 
@@ -606,6 +608,10 @@ class pv_forecasting_model_vit_imgs(nn.Module):
             raise ValueError(f"Duplicate NWP feature(s) in nwp_features: {sorted(set(dupes))}")
         self.nwp_features: list[str] = nwp_features
         self.use_invalid_mask: bool = bool(use_invalid_mask)
+        self.nwp_dropout_prob: float = max(0.0, min(1.0, float(nwp_dropout_prob)))
+        self.nwp_history_dropout_prob: float = max(
+            0.0, min(1.0, float(nwp_history_dropout_prob))
+        )
         # Pre-resolve column indices in ``nwp_tensor`` (last dim = 8 features + 1 mask).
         self._nwp_feature_indices: list[int] = [
             _FOLSOM_NWP_FEATURE_COLS.index(name) for name in self.nwp_features
@@ -676,6 +682,17 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         self.pv_feats_head = MLP(in_dim=80, hidden_dims=(128, 64), out_dim=64, dropout=0.0)  # PV 64 + sat 64 + inverter 16
         self.fc = FC(in_dim=64, out_dim=1)
 
+    @staticmethod
+    def _apply_channel_dropout(x: torch.Tensor, p: float, training: bool) -> torch.Tensor:
+        if (not training) or p <= 0.0:
+            return x
+        keep = 1.0 - float(p)
+        if keep <= 0.0:
+            return torch.zeros_like(x)
+        bsz, _, channels = x.shape
+        mask = (torch.rand((bsz, 1, channels), device=x.device) < keep).to(x.dtype)
+        return x * mask / keep
+
     def forward(self, device_id: torch.Tensor, pv: torch.Tensor, 
                 pv_mask: Optional[torch.Tensor] = None, 
                 pv_timefeats: Optional[torch.Tensor] = None,
@@ -693,6 +710,20 @@ class pv_forecasting_model_vit_imgs(nn.Module):
 
         pv_timefeats = pv_timefeats[:, :, [2,3,8]]
         forecast_timefeats = forecast_timefeats[:, :, [2,3,8]]
+
+        if nwp_history is not None and self.nwp_history_dropout_prob > 0.0 and nwp_history.shape[-1] >= 3:
+            hist_feats = torch.stack(
+                [
+                    (nwp_history[:, :, 0] / 1000.0 - 0.5) * 2.0,
+                    (nwp_history[:, :, 2] - 288.15) / 10.0,
+                ],
+                dim=2,
+            )
+            _ = self._apply_channel_dropout(
+                hist_feats,
+                p=self.nwp_history_dropout_prob,
+                training=self.training,
+            )
 
         pv_history = torch.cat([pv_masked, pv_mask, pv_timefeats.permute(0, 2, 1)], dim=1)  # [B, C=11, T]
         pv_hist_mem = self.TCN(pv_history, pv_mask)     # [B, C_out, T]()
@@ -716,12 +747,21 @@ class pv_forecasting_model_vit_imgs(nn.Module):
 
         nwp_channels = [forecast_timefeats]
         if nwp_tensor is not None:
-            ssrd_norm = (nwp_tensor[:, :, 0] / 1000.0 - 0.5) * 2.0
-            t2m_norm = (nwp_tensor[:, :, 2] - 288.15) / 10.0
-            nwp_channels.append(ssrd_norm.unsqueeze(2))
-            nwp_channels.append(nwp_tensor[:, :, 1].unsqueeze(2))
-            nwp_channels.append(t2m_norm.unsqueeze(2))
-            nwp_channels.append(nwp_tensor[:, :, 3].unsqueeze(2))
+            nwp_feats = torch.stack(
+                [
+                    (nwp_tensor[:, :, 0] / 1000.0 - 0.5) * 2.0,
+                    nwp_tensor[:, :, 1],
+                    (nwp_tensor[:, :, 2] - 288.15) / 10.0,
+                    nwp_tensor[:, :, 3],
+                ],
+                dim=2,
+            )
+            nwp_feats = self._apply_channel_dropout(
+                nwp_feats,
+                p=self.nwp_dropout_prob,
+                training=self.training,
+            )
+            nwp_channels.append(nwp_feats)
         else:
             zero_nwp_feat = torch.zeros(
                 forecast_timefeats.shape[:2],
@@ -869,6 +909,8 @@ class pv_forecasting_model_vit_total(nn.Module):
         dev_dn_list: Optional[list] = None,
         nwp_features: Optional[list[str]] = None,
         use_invalid_mask: bool = _DEFAULT_VIT_IMGS_NWP_USE_INVALID_MASK,
+        nwp_dropout_prob: float = 0.0,
+        nwp_history_dropout_prob: float = 0.0,
     ):
         super().__init__()
 
@@ -889,6 +931,10 @@ class pv_forecasting_model_vit_total(nn.Module):
             raise ValueError(f"Duplicate NWP feature(s) in nwp_features: {sorted(set(dupes))}")
         self.nwp_features: list[str] = nwp_features
         self.use_invalid_mask: bool = bool(use_invalid_mask)
+        self.nwp_dropout_prob: float = max(0.0, min(1.0, float(nwp_dropout_prob)))
+        self.nwp_history_dropout_prob: float = max(
+            0.0, min(1.0, float(nwp_history_dropout_prob))
+        )
         # Pre-resolve column indices in ``nwp_tensor`` (last dim = 8 features + 1 mask).
         self._nwp_feature_indices: list[int] = [
             _FOLSOM_NWP_FEATURE_COLS.index(name) for name in self.nwp_features
@@ -958,6 +1004,21 @@ class pv_forecasting_model_vit_total(nn.Module):
         self.pv_feats_head = MLP(in_dim=64, hidden_dims=(128, 64), out_dim=64, dropout=0.0)  # PV 64 + sat 64 + inverter 16
         self.fc = FC(in_dim=64, out_dim=1)
 
+    @staticmethod
+    def _apply_channel_dropout(x: torch.Tensor, p: float, training: bool) -> torch.Tensor:
+        """
+        Channel-wise dropout on [B, T, C] tensors.
+        Drops entire channels per-sample across all timesteps.
+        """
+        if (not training) or p <= 0.0:
+            return x
+        keep = 1.0 - float(p)
+        if keep <= 0.0:
+            return torch.zeros_like(x)
+        bsz, _, channels = x.shape
+        mask = (torch.rand((bsz, 1, channels), device=x.device) < keep).to(x.dtype)
+        return x * mask / keep
+
     def forward(
         self,
         device_id: torch.Tensor,
@@ -980,12 +1041,20 @@ class pv_forecasting_model_vit_total(nn.Module):
         pv_timefeats = pv_timefeats[:, :, [2,3,8]]
         forecast_timefeats = forecast_timefeats[:, :, [2,3,8]]
         
-        '''
-        ghi_history = (nwp_history[:, :, 0] / 1000.0 - 0.5) * 2.0
-        t2m_history = (nwp_history[:, :, 2] - 288.15) / 10.0
-        valid_mask_history = nwp_history[:, :, -1]
-        pv_timefeats = torch.cat([pv_timefeats, ghi_history.unsqueeze(2), t2m_history.unsqueeze(2), valid_mask_history.unsqueeze(2)], dim=2)
-        ''' 
+        if nwp_history is not None and self.nwp_history_dropout_prob > 0.0 and nwp_history.shape[-1] >= 3:
+            hist_feats = torch.stack(
+                [
+                    (nwp_history[:, :, 0] / 1000.0 - 0.5) * 2.0,
+                    (nwp_history[:, :, 2] - 288.15) / 10.0,
+                ],
+                dim=2,
+            )
+            # Keep this preprocessed history tensor ready for future fusion paths.
+            _ = self._apply_channel_dropout(
+                hist_feats,
+                p=self.nwp_history_dropout_prob,
+                training=self.training,
+            )
 
         pv_history = torch.cat([pv_masked, pv_mask, pv_timefeats.permute(0, 2, 1)], dim=1)  # [B, C=8, T]
 
@@ -1000,22 +1069,27 @@ class pv_forecasting_model_vit_total(nn.Module):
         # nwp_tensor layout: [ssrd, msl, t2m, u10, v10, u100, v100, nan_mask]
         nwp_channels = [forecast_timefeats]
         if nwp_tensor is not None:
-            ssrd_norm = (nwp_tensor[:, :, 0] / 1000.0 - 0.5) * 2.0
-            t2m_norm = (nwp_tensor[:, :, 2] - 288.15) / 10.0
-            nwp_channels.append(ssrd_norm.unsqueeze(2))
-            nwp_channels.append(t2m_norm.unsqueeze(2))
+            nwp_feat_list = [
+                (nwp_tensor[:, :, 0] / 1000.0 - 0.5) * 2.0,
+                (nwp_tensor[:, :, 2] - 288.15) / 10.0,
+            ]
             if self.use_invalid_mask:
-                nwp_channels.append(nwp_tensor[:, :, -1].unsqueeze(2))
+                nwp_feat_list.append(nwp_tensor[:, :, -1])
+            nwp_feats = torch.stack(nwp_feat_list, dim=2)
+            nwp_feats = self._apply_channel_dropout(
+                nwp_feats,
+                p=self.nwp_dropout_prob,
+                training=self.training,
+            )
+            nwp_channels.append(nwp_feats)
         else:
             zero_nwp_feat = torch.zeros(
                 forecast_timefeats.shape[:2],
                 device=forecast_timefeats.device,
                 dtype=forecast_timefeats.dtype,
             )
-            nwp_channels.append(zero_nwp_feat.unsqueeze(2))  # ssrd
-            nwp_channels.append(zero_nwp_feat.unsqueeze(2))  # t2m
-            if self.use_invalid_mask:
-                nwp_channels.append(zero_nwp_feat.unsqueeze(2))
+            n_nwp_channels = 2 + (1 if self.use_invalid_mask else 0)
+            nwp_channels.append(zero_nwp_feat.unsqueeze(2).repeat(1, 1, n_nwp_channels))
         forecast_ssrd_timefeats = torch.cat(nwp_channels, dim=2)
         forecast_query = self.query_mlp(forecast_ssrd_timefeats)
 
