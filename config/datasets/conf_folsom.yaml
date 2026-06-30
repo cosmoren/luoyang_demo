@@ -19,7 +19,7 @@ site:
   name: "Folsom, CA"
 
 paths:
-  data_dir: "/work/folsom_dataset"
+  data_dir: "../folsom_ds/processed/sample_250k"
   # PVDataset reads this Excel via train_vit_test.py main() to build dev_dn_list.
   # FolsomIrradianceDataset itself never reads it (returns dev_idx=0 for the single GHI sensor),
   # so we keep the Luoyang Excel as a placeholder; trainer's nn.Embedding lookup still works.
@@ -28,8 +28,8 @@ paths:
   # set ``folsom_irradiance_csv`` explicitly so the loader does not glob ``pv_path``.
   pv_path: irradiance
   folsom_irradiance_csv: irradiance/Folsom_irradiance.csv
-  sky_format: zarr
-  sky_image_path: sky_zarr
+  sky_format: jpg
+  sky_image_path: sky
   # Folsom GOES-15 GridSat-CONUS per-frame shards live under
   # ``<data_dir>/sat_goes_gridsat/YYYY/MM/goes15_YYYYMMDD_HHMM.npy`` (3 x 100 x 100 float16,
   # values in [0, 1]; ~94k files covering 2014-01-01 -> 2016-12-31 UTC). Used when
@@ -50,7 +50,7 @@ sampling:
   # Going past 4M total draws is mostly diminishing returns. CLI flag
   # --train_epoch_len overrides this; fallback if absent is the dataloader
   # constant _DEFAULT_FOLSOM_TRAIN_EPOCH_LEN.
-  train_epoch_len: 100000
+  train_epoch_len: 10000
   # CSV row spacing (Folsom is 1-min; Luoyang was 5-min).
   csv_interval_min: 1
   # PVDataset / FolsomIrradianceDataset input window (X) and forecast window (Y).
@@ -110,7 +110,7 @@ sampling:
   # sat_tensor / sat_timefeats are None; the model (see models/models.py:727) treats
   # None / all-zero as "no sat" and uses a learned zero embedding instead. The CLI
   # flag --use-satellite / --no-use-satellite on the trainer overrides this value.
-  use_satellite: true
+  use_satellite: false
   # Satellite stack: 24 frames at 15-min cadence ending floor_15(time0 - 30 min) (oldest -> newest).
   # NPY shards on disk are CHW (3, 100, 100) float16 already in [0, 1]; the loader returns float32.
   # ``satimg_npy_shape_hwc`` is kept in [H, W, C] order to match the PVDataset constructor signature;
