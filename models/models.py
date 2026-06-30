@@ -164,8 +164,7 @@ class FC(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [..., in_dim]. Returns: [..., out_dim]."""
-        kt = torch.sigmoid( self.fc(x) ) * 2.2
-        # kt = self.fc(x)
+        kt = self.fc(x)
         return kt
 
 
@@ -394,7 +393,9 @@ class pv_forecasting_model_vit(nn.Module):
         # Fuse and predict
         fused = torch.cat([forecast_pv_features, inverter_features], dim=2)   # [B=1,T=192,C=80]
         pv_feats = self.pv_feats_head(fused)
-        pv = self.fc(pv_feats)
+        delta_kt = self.fc(pv_feats)
+
+        
 
         return pv.squeeze(-1)
 
@@ -621,15 +622,22 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         query_mlp_in_dim = 3 + 4
 
         dim = 64
+        self.tabm_mod_embed = nn.Parameter(torch.randn(1, 1, dim) * 0.02)   # TabM modality embedding
         self.pv_mod_embed = nn.Parameter(torch.randn(1, 1, dim) * 0.02)   # PV modality embedding
         self.sat_mod_embed = nn.Parameter(torch.randn(1, 1, dim) * 0.02)   # Satellite image modality embedding
         self.sky_mod_embed = nn.Parameter(torch.randn(1, 1, dim) * 0.02)   # Sky imagem odality embedding
 
         self.inverter_embedding = nn.Embedding(num_embeddings=1000, embedding_dim=16)
-        self.pv_hist_in_channels = 5
+        self.pv_hist_in_channels = 8
         self.nwp_future_steps = 16
-        self.nwp_future_channels = 4
+        self.nwp_future_channels = 2
         self.nwp_future_flat_dim = self.nwp_future_steps * self.nwp_future_channels
+        self.TCN = TemporalCNN1d(
+            in_channels=self.pv_hist_in_channels,
+            out_channels=64,
+            use_batchnorm=use_batchnorm,
+            dropout=dropout,
+        )
 
         self.time_mlp = nn.Sequential(
             nn.Linear(3, 64),
@@ -700,6 +708,11 @@ class pv_forecasting_model_vit_imgs(nn.Module):
             arch_type="tabm-mini",
             start_scaling_init="normal",
         )
+        # Cached feature right before TabM final output projection.
+        self.pv_tabm_preoutput_features: Optional[torch.Tensor] = None
+        self._pv_tabm_output_pre_hook_handle = self.pv_tabm_head.output.register_forward_pre_hook(
+            self._capture_pv_tabm_preoutput_features
+        )
 
     @staticmethod
     def _apply_channel_dropout(x: torch.Tensor, p: float, training: bool) -> torch.Tensor:
@@ -711,6 +724,14 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         bsz, _, channels = x.shape
         mask = (torch.rand((bsz, 1, channels), device=x.device) < keep).to(x.dtype)
         return x * mask / keep
+
+    def _capture_pv_tabm_preoutput_features(self, module: nn.Module, inputs: tuple) -> None:
+        _ = module
+        if not inputs:
+            self.pv_tabm_preoutput_features = None
+            return
+        x = inputs[0]
+        self.pv_tabm_preoutput_features = x if isinstance(x, torch.Tensor) else None
 
     def forward(self, device_id: torch.Tensor, pv: torch.Tensor, 
                 pv_mask: Optional[torch.Tensor] = None, 
@@ -743,50 +764,54 @@ class pv_forecasting_model_vit_imgs(nn.Module):
             nwp_forecast_history_ghi = ((nwp_forecast_history[:, :, 0] / 1000.0 - 0.5) * 2.0).unsqueeze(1)
         delta_nwp_history_ghi = nwp_history_ghi - nwp_forecast_history_ghi
 
-        pv_history = torch.cat([pv_masked, pv_mask, pv_timefeats.permute(0, 2, 1)], dim=1)  # [B, C=11, T]
-        if pv_history.shape[1] != self.pv_hist_in_channels:
-            raise ValueError(
-                f"pv_history channel mismatch: expected {self.pv_hist_in_channels}, got {pv_history.shape[1]}"
-            )
-        if pv_history.shape[2] != self.pv_hist_len:
-            raise ValueError(
-                f"pv_history length mismatch: expected {self.pv_hist_len}, got {pv_history.shape[2]}"
-            )
-        pv_hist_flat = pv_history.reshape(pv_history.shape[0], -1)
-        if nwp_tensor is None:
-            nwp_tensor_flat = torch.zeros(
-                pv_history.shape[0],
-                self.nwp_future_flat_dim,
-                device=pv_history.device,
-                dtype=pv_history.dtype,
-            )
-        else:
-            if nwp_tensor.ndim != 3:
-                raise ValueError(f"nwp_tensor expected [B,T,C], got shape {tuple(nwp_tensor.shape)}")
-            if nwp_tensor.shape[1] * nwp_tensor.shape[2] != self.nwp_future_flat_dim:
-                raise ValueError(
-                    "nwp_tensor flattened dim mismatch: "
-                    f"expected {self.nwp_future_flat_dim}, got {nwp_tensor.shape[1] * nwp_tensor.shape[2]}"
-                )
-            nwp_tensor_flat = nwp_tensor.reshape(nwp_tensor.shape[0], -1)
+        pv_history = torch.cat(
+            [
+                pv_masked,
+                pv_mask,
+                pv_timefeats.permute(0, 2, 1),
+                nwp_history_ghi,
+                nwp_forecast_history_ghi,
+                delta_nwp_history_ghi,
+            ],
+            dim=1,
+        )  # [B, C=8, T]
+
+        nwp_ssrd_normalized = (nwp_tensor[:, :, 0] / 1000.0 - 0.5) * 2.0
+        nwp_t2m_normalized = (nwp_tensor[:, :, 2] - 288.15) / 10.0
+
         
+        pv_hist_flat = pv_history.reshape(pv_history.shape[0], -1)
+        nwp_tensor_for_tabm = torch.stack(
+            [
+                nwp_ssrd_normalized,
+                nwp_t2m_normalized,
+            ],
+            dim=2,
+        )
+        nwp_tensor_flat = nwp_tensor_for_tabm.reshape(nwp_tensor_for_tabm.shape[0], -1)
+        cur_nwp_dim = nwp_tensor_flat.shape[1]
+        if cur_nwp_dim < self.nwp_future_flat_dim:
+            pad = torch.zeros(
+                nwp_tensor_flat.shape[0],
+                self.nwp_future_flat_dim - cur_nwp_dim,
+                device=nwp_tensor_flat.device,
+                dtype=nwp_tensor_flat.dtype,
+            )
+            nwp_tensor_flat = torch.cat([nwp_tensor_flat, pad], dim=1)
+        elif cur_nwp_dim > self.nwp_future_flat_dim:
+            nwp_tensor_flat = nwp_tensor_flat[:, : self.nwp_future_flat_dim]
+
         x_num = torch.cat([pv_hist_flat, nwp_tensor_flat], dim=1)
 
+        self.pv_tabm_preoutput_features = None
         tabm_out = self.pv_tabm_head(x_num=x_num, x_cat=None)  # [B, K, 1]
-        kt_4h = tabm_out.mean(dim=1)  # [B, 1]
-        return kt_4h
-    
-        # PV time features compression -> 48 compressed PV tokens.
-        pv_timefeats_corase = pv_timefeats[:, self.corase_idx, :]
-        pv_timefeats_corase = self.time_mlp(pv_timefeats_corase)
-        learnable_pv_queries = self.learnable_pv_queries.repeat(pv_timefeats_corase.shape[0], 1, 1)
-        corase_queries = learnable_pv_queries + pv_timefeats_corase
-        KV_hist_mem_compressed = self.cross_attention_pv_compression(
-            query=corase_queries,
-            key=KV_hist_mem,
-            value=KV_hist_mem,
-        )  # [B,48,D=64]
-        KV_hist_mem_compressed = KV_hist_mem_compressed + corase_queries + self.pv_mod_embed
+        # self.pv_tabm_preoutput_features is captured by hook on self.pv_tabm_head.output
+        if self.pv_tabm_preoutput_features is None:
+            raise RuntimeError("pv_tabm_preoutput_features hook capture failed.")
+        tabm_summary_feature = self.pv_tabm_preoutput_features  # [B,1,64]
+        tabm_summary_token = tabm_summary_feature + self.tabm_mod_embed
+        kt_tabm = tabm_out.mean(dim=1)  # [B, 1]
+
 
         # Forecast queries: Luoyang total variant only uses two NWP channels:
         # ssrd (idx=0) and t2m (idx=2), where nwp_tensor layout is
@@ -826,7 +851,6 @@ class pv_forecasting_model_vit_imgs(nn.Module):
 
         # satellite images encoder
         B, T_out, _ = forecast_query.shape
-        pv_mask = torch.ones(B, KV_hist_mem_compressed.shape[1], device=pv.device, dtype=pv.dtype)
 
         if sat_tensor is None or sat_tensor.max() == 0:
             sat_compressed = torch.zeros(B, 48, 64, device=pv.device, dtype=pv.dtype) + self.sat_mod_embed
@@ -920,10 +944,14 @@ class pv_forecasting_model_vit_imgs(nn.Module):
             sky_compressed = sky_compressed * skimg_valid_mask.unsqueeze(2)
             sky_mask = sky_mask * skimg_valid_mask
 
-        hist_mem_compressed = torch.cat([KV_hist_mem_compressed, sat_compressed, sky_compressed], dim=1)
-        key_value_mask = torch.cat([pv_mask, sat_mask, sky_mask], dim=1)
+        tabm_mask = torch.ones(B, tabm_summary_token.shape[1], device=pv.device, dtype=pv.dtype)
+        hist_mem_compressed = torch.cat(
+            [tabm_summary_token, sat_compressed, sky_compressed], dim=1
+        )
+        key_value_mask = torch.cat([tabm_mask, sat_mask, sky_mask], dim=1)
 
-        forecast_pv_features = self.cross_attention_pv(query=forecast_query, key=hist_mem_compressed, value=hist_mem_compressed, key_value_mask=key_value_mask)
+
+        forecast_pv_features = self.cross_attention_pv(query=forecast_query[:,2:3,:], key=hist_mem_compressed, value=hist_mem_compressed, key_value_mask=key_value_mask)
 
         # Inverter features (embeddings)
         inverter_features = self.inverter_embedding(device_id).unsqueeze(1).repeat(1, forecast_pv_features.shape[1], 1)
@@ -931,9 +959,11 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         # Fuse and predict
         fused = torch.cat([forecast_pv_features, inverter_features], dim=2)
         pv_feats = self.pv_feats_head(fused)
-        pv = self.fc(pv_feats)
+        delta_kt= self.fc(pv_feats)
 
-        return pv.squeeze(-1)
+        kt = kt_tabm + delta_kt
+
+        return kt.squeeze(-1)
 
 
 # Using PV history and NWP to forecast PV, solar features and NWP features are used as query

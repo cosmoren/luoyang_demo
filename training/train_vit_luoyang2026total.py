@@ -200,20 +200,16 @@ def _task_loss_and_vectors(
         loss = criterion(pv_pred, target_pv)
         pred_np = pv_pred.detach().cpu().float().numpy().reshape(-1)
         tgt_np = target_pv.detach().cpu().float().numpy().reshape(-1)
-    elif task == "4h":
-        # Model outputs one value [B,1] for t0+4h; supervise only target[:, 15].
-        if pv_pred.ndim == 2 and pv_pred.shape[1] > 1:
-            pred_4h = pv_pred[:, idx]
-        else:
-            pred_4h = pv_pred.reshape(-1)
-        tgt_4h = target_pv[:, idx]
-        loss = criterion(pred_4h, tgt_4h)
-        pred_np = pred_4h.detach().cpu().float().numpy()
-        tgt_np = tgt_4h.detach().cpu().float().numpy()
     else:
-        loss = criterion(pv_pred[:, idx], target_pv[:, idx])
-        pred_np = pv_pred[:, idx].detach().cpu().float().numpy()
-        tgt_np = target_pv[:, idx].detach().cpu().float().numpy()
+        # For 15m/4h tasks, supervise only the current task point.
+        if pv_pred.ndim == 2 and pv_pred.shape[1] > idx:
+            pred_pt = pv_pred[:, idx]
+        else:
+            pred_pt = pv_pred.reshape(-1)
+        tgt_pt = target_pv[:, idx]
+        loss = criterion(pred_pt, tgt_pt)
+        pred_np = pred_pt.detach().cpu().float().numpy()
+        tgt_np = tgt_pt.detach().cpu().float().numpy()
     return loss, pred_np, tgt_np
 
 
