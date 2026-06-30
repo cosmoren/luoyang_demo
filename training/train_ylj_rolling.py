@@ -200,6 +200,9 @@ def _load_model_from_checkpoint(
         hist_compression_cond_forecast=bool(
             ckpt.get("hist_compression_cond_forecast", False)
         ),
+        use_split_pv_sat_attn=bool(ckpt.get("split_pv_sat_attn", False)),
+        use_last_k_head=bool(ckpt.get("last_k_head", False)),
+        last_k_head_k=int(ckpt.get("last_k_head_k", 8)),
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     return model

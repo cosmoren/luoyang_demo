@@ -140,6 +140,7 @@ class TemporalCNN1dMultiKernel(nn.Module):
 
 _TCN_MULTI_KERNEL_SIZES = (3, 7, 11, 15, 31)
 _NUM_HIST_COMPRESSION_TOKENS = 48
+_DEFAULT_LAST_K_HEAD_K = 8
 
 
 class MLP(nn.Module):
@@ -437,6 +438,9 @@ class pv_forecasting_model_vit_nwp(nn.Module):
         use_nwp_residual: bool = False,
         use_hist_compression: bool = False,
         hist_compression_cond_forecast: bool = False,
+        use_split_pv_sat_attn: bool = False,
+        use_last_k_head: bool = False,
+        last_k_head_k: int = _DEFAULT_LAST_K_HEAD_K,
         use_ghi: bool = False,
         use_ghi_solargis: bool = False,
         use_temp_solargis: bool = False,
@@ -454,6 +458,11 @@ class pv_forecasting_model_vit_nwp(nn.Module):
         self.hist_compression_cond_forecast = bool(hist_compression_cond_forecast)
         if self.hist_compression_cond_forecast and not self.use_hist_compression:
             raise ValueError("hist_compression_cond_forecast requires use_hist_compression=True")
+        self.use_split_pv_sat_attn = bool(use_split_pv_sat_attn)
+        self.use_last_k_head = bool(use_last_k_head)
+        self.last_k_head_k = int(last_k_head_k)
+        if self.use_last_k_head and self.last_k_head_k < 1:
+            raise ValueError("last_k_head_k must be >= 1 when use_last_k_head=True")
         # Legacy bools kept for callers that still pass them; channel count is authoritative.
         if n_parquet_hist_channels <= 0 and (use_ghi or use_ghi_solargis or use_temp_solargis):
             n_parquet_hist_channels = int(use_ghi) + int(use_ghi_solargis) + int(use_temp_solargis)
@@ -493,6 +502,8 @@ class pv_forecasting_model_vit_nwp(nn.Module):
         else:
             self.cross_attention_pv_1 = CrossAttention(**_ca_kw)
             self.cross_attention_pv_2 = CrossAttention(**_ca_kw)
+        if self.use_split_pv_sat_attn:
+            self.cross_attention_sat = CrossAttention(**_ca_kw)
         if self.use_hist_compression:
             n_cmp = _NUM_HIST_COMPRESSION_TOKENS
             self.learnable_pv_queries = nn.Parameter(
@@ -514,7 +525,20 @@ class pv_forecasting_model_vit_nwp(nn.Module):
                 out_dim=dim,
                 dropout=0.0,
             )
-        pv_feats_in = 80 + (dim if self.use_nwp_residual else 0)
+        pv_feats_in = 64 + 16
+        if self.use_split_pv_sat_attn:
+            pv_feats_in += 64
+        if self.use_nwp_residual:
+            pv_feats_in += dim
+        if self.use_last_k_head:
+            last_k_in = self.last_k_head_k * (1 + self.n_parquet_hist_channels) + self._pv_timefeat_dim
+            self.last_k_head_mlp = MLP(
+                in_dim=last_k_in,
+                hidden_dims=(64,),
+                out_dim=dim,
+                dropout=0.0,
+            )
+            pv_feats_in += dim
         self.pv_feats_head = MLP(in_dim=pv_feats_in, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
         self.fc = FC(in_dim=64, out_dim=1)
 
@@ -603,6 +627,90 @@ class pv_forecasting_model_vit_nwp(nn.Module):
         )
         return compressed + compression_queries
 
+    def _apply_cross_attention_sat(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_value_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        return self.cross_attention_sat(
+            query=query,
+            key=key,
+            value=value,
+            key_value_mask=key_value_mask,
+        )
+
+    def _resolve_parquet_hist(
+        self,
+        pv: torch.Tensor,
+        parquet_hist: Optional[torch.Tensor],
+        ghi_hist: Optional[torch.Tensor],
+        ghi_solargis_hist: Optional[torch.Tensor],
+        temp_solargis_hist: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if self.n_parquet_hist_channels <= 0:
+            return None
+        if parquet_hist is None:
+            legacy = [ghi_hist, ghi_solargis_hist, temp_solargis_hist]
+            if any(t is not None for t in legacy):
+                parquet_hist = torch.cat(
+                    [
+                        (t if t is not None else torch.zeros_like(pv)).to(device=pv.device, dtype=pv.dtype)
+                        for t in legacy[: self.n_parquet_hist_channels]
+                    ],
+                    dim=1,
+                )
+            else:
+                parquet_hist = torch.zeros(
+                    pv.shape[0],
+                    self.n_parquet_hist_channels,
+                    pv.shape[-1],
+                    device=pv.device,
+                    dtype=pv.dtype,
+                )
+        else:
+            parquet_hist = parquet_hist.to(device=pv.device, dtype=pv.dtype)
+        if parquet_hist.shape[1] != self.n_parquet_hist_channels:
+            raise ValueError(
+                f"parquet_hist has {parquet_hist.shape[1]} channels but model expects "
+                f"{self.n_parquet_hist_channels}"
+            )
+        return parquet_hist
+
+    def _build_last_k_head_embedding(
+        self,
+        pv: torch.Tensor,
+        pv_mask: torch.Tensor,
+        pv_timefeats: torch.Tensor,
+        parquet_hist: Optional[torch.Tensor],
+        tq: int,
+    ) -> torch.Tensor:
+        B = pv.shape[0]
+        k = min(self.last_k_head_k, pv.shape[-1])
+        pv_masked = pv * pv_mask.to(pv.dtype)
+        kt_last = pv_masked[:, :, -k:]
+        if k < self.last_k_head_k:
+            kt_last = F.pad(kt_last, (self.last_k_head_k - k, 0))
+        parts = [kt_last.reshape(B, -1)]
+        if self.n_parquet_hist_channels > 0:
+            if parquet_hist is None:
+                parquet_hist = torch.zeros(
+                    B,
+                    self.n_parquet_hist_channels,
+                    pv.shape[-1],
+                    device=pv.device,
+                    dtype=pv.dtype,
+                )
+            ph_last = parquet_hist[:, :, -k:]
+            if k < self.last_k_head_k:
+                ph_last = F.pad(ph_last, (self.last_k_head_k - k, 0))
+            parts.append(ph_last.reshape(B, -1))
+        parts.append(pv_timefeats[:, -1, :])
+        flat = torch.cat(parts, dim=-1)
+        emb = self.last_k_head_mlp(flat)
+        return emb.unsqueeze(1).expand(-1, tq, -1)
+
     def forward(self, device_id: torch.Tensor, pv: torch.Tensor,
                 pv_mask: Optional[torch.Tensor] = None, 
                 pv_timefeats: Optional[torch.Tensor] = None,
@@ -620,34 +728,11 @@ class pv_forecasting_model_vit_nwp(nn.Module):
         pv_masked = pv * pv_mask.to(pv.dtype)
         pv_timefeats = _slice_luoyang_pv_solar_timefeats(pv_timefeats)
         forecast_timefeats = _slice_luoyang_pv_solar_timefeats(forecast_timefeats)
+        parquet_hist = self._resolve_parquet_hist(
+            pv, parquet_hist, ghi_hist, ghi_solargis_hist, temp_solargis_hist
+        )
         hist_channels = [pv_masked, pv_mask]
         if self.n_parquet_hist_channels > 0:
-            if parquet_hist is None:
-                # Legacy per-channel kwargs (GHI only).
-                legacy = [ghi_hist, ghi_solargis_hist, temp_solargis_hist]
-                if any(t is not None for t in legacy):
-                    parquet_hist = torch.cat(
-                        [
-                            (t if t is not None else torch.zeros_like(pv)).to(device=pv.device, dtype=pv.dtype)
-                            for t in legacy[: self.n_parquet_hist_channels]
-                        ],
-                        dim=1,
-                    )
-                else:
-                    parquet_hist = torch.zeros(
-                        pv.shape[0],
-                        self.n_parquet_hist_channels,
-                        pv.shape[-1],
-                        device=pv.device,
-                        dtype=pv.dtype,
-                    )
-            else:
-                parquet_hist = parquet_hist.to(device=pv.device, dtype=pv.dtype)
-            if parquet_hist.shape[1] != self.n_parquet_hist_channels:
-                raise ValueError(
-                    f"parquet_hist has {parquet_hist.shape[1]} channels but model expects "
-                    f"{self.n_parquet_hist_channels}"
-                )
             for ci in range(self.n_parquet_hist_channels):
                 hist_channels.append(parquet_hist[:, ci : ci + 1, :])
         hist_channels.append(pv_timefeats.permute(0, 2, 1))
@@ -692,8 +777,22 @@ class pv_forecasting_model_vit_nwp(nn.Module):
             )
 
         if sat_tensor is None or sat_tensor.max() == 0:
-            hist_keys = pv_hist_keys
-            key_value_mask = pv_hist_km
+            if self.use_split_pv_sat_attn:
+                h_pv = self._apply_cross_attention_pv(
+                    query=forecast_query,
+                    key=pv_hist_keys,
+                    value=pv_hist_keys,
+                    key_value_mask=pv_hist_km,
+                )
+                h_sat = torch.zeros_like(h_pv)
+                forecast_pv_features = torch.cat([h_pv, h_sat], dim=2)
+            else:
+                forecast_pv_features = self._apply_cross_attention_pv(
+                    query=forecast_query,
+                    key=pv_hist_keys,
+                    value=pv_hist_keys,
+                    key_value_mask=pv_hist_km,
+                )
         else:
             B_sat, T_sat, C_sat, H_sat, W_sat = sat_tensor.shape
             if C_sat != 3:
@@ -725,15 +824,29 @@ class pv_forecasting_model_vit_nwp(nn.Module):
             sat_compressed = sat_compressed + self.sat_time_mlp(sat_timefeats_48)
 
             sat_mask = torch.ones(B, sat_compressed.shape[1], device=pv.device, dtype=pv.dtype)
-            hist_keys = torch.cat([pv_hist_keys, sat_compressed], dim=1)
-            key_value_mask = torch.cat([pv_hist_km, sat_mask], dim=1)
-
-        forecast_pv_features = self._apply_cross_attention_pv(
-            query=forecast_query,
-            key=hist_keys,
-            value=hist_keys,
-            key_value_mask=key_value_mask,
-        )
+            if self.use_split_pv_sat_attn:
+                h_pv = self._apply_cross_attention_pv(
+                    query=forecast_query,
+                    key=pv_hist_keys,
+                    value=pv_hist_keys,
+                    key_value_mask=pv_hist_km,
+                )
+                h_sat = self._apply_cross_attention_sat(
+                    query=forecast_query,
+                    key=sat_compressed,
+                    value=sat_compressed,
+                    key_value_mask=sat_mask,
+                )
+                forecast_pv_features = torch.cat([h_pv, h_sat], dim=2)
+            else:
+                hist_keys = torch.cat([pv_hist_keys, sat_compressed], dim=1)
+                key_value_mask = torch.cat([pv_hist_km, sat_mask], dim=1)
+                forecast_pv_features = self._apply_cross_attention_pv(
+                    query=forecast_query,
+                    key=hist_keys,
+                    value=hist_keys,
+                    key_value_mask=key_value_mask,
+                )
 
         inverter_features = self.inverter_embedding(device_id).unsqueeze(1).repeat(
             1, forecast_pv_features.shape[1], 1
@@ -741,6 +854,12 @@ class pv_forecasting_model_vit_nwp(nn.Module):
         fused_parts = [forecast_pv_features, inverter_features]
         if self.use_nwp_residual:
             fused_parts.append(self.nwp_skip_mlp(forecast_ssrd_timefeats))
+        if self.use_last_k_head:
+            fused_parts.append(
+                self._build_last_k_head_embedding(
+                    pv, pv_mask, pv_timefeats, parquet_hist, forecast_pv_features.shape[1]
+                )
+            )
         fused = torch.cat(fused_parts, dim=2)
         pv_feats = self.pv_feats_head(fused)
         pv = self.fc(pv_feats)

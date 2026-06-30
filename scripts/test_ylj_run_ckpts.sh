@@ -18,6 +18,9 @@
 #   USE_NWP_RESIDUAL  1 -> --nwp_residual           (default 0; must match training)
 #   USE_HIST_COMPRESSION  1 -> --hist_compression     (default 0; must match training)
 #   USE_HIST_COMPRESSION_COND_FORECAST 1 -> --hist_compression_cond_forecast (needs USE_HIST_COMPRESSION=1)
+#   USE_SPLIT_PV_SAT_ATTN 1 -> --split_pv_sat_attn       (default 0; must match training)
+#   USE_LAST_K_HEAD  1 -> --last_k_head                  (default 0; must match training)
+#   LAST_K_HEAD_K    steps for last-K head               (default 8)
 #   CKPT_GLOB glob for checkpoints in the run dir (default 'pv_forecast_epoch_*.pt')
 #   EPOCH_START  skip checkpoints with epoch < this (default 11)
 #   OUT_PREFIX prefix for output CSVs (default test_seqpairs_)
@@ -36,6 +39,9 @@ USE_CROSS_ATTN_2LAYER=${USE_CROSS_ATTN_2LAYER:-0}
 USE_NWP_RESIDUAL=${USE_NWP_RESIDUAL:-0}
 USE_HIST_COMPRESSION=${USE_HIST_COMPRESSION:-1}
 USE_HIST_COMPRESSION_COND_FORECAST=${USE_HIST_COMPRESSION_COND_FORECAST:-0}
+USE_SPLIT_PV_SAT_ATTN=${USE_SPLIT_PV_SAT_ATTN:-0}
+USE_LAST_K_HEAD=${USE_LAST_K_HEAD:-0}
+LAST_K_HEAD_K=${LAST_K_HEAD_K:-8}
 CKPT_GLOB=${CKPT_GLOB:-pv_forecast_epoch_*.pt}
 EPOCH_START=${EPOCH_START:-11}
 OUT_PREFIX=${OUT_PREFIX:-test_seqpairs_}
@@ -87,6 +93,13 @@ if [ "$USE_HIST_COMPRESSION_COND_FORECAST" = "1" ]; then
   HIST_COMPRESSION_COND_FORECAST_FLAG="--hist_compression_cond_forecast"
   TAG="${TAG}_fc"
 fi
+SPLIT_PV_SAT_ATTN_FLAG=""
+[ "$USE_SPLIT_PV_SAT_ATTN" = "1" ] && { SPLIT_PV_SAT_ATTN_FLAG="--split_pv_sat_attn"; TAG="${TAG}_splitattn"; }
+LAST_K_HEAD_FLAG=""
+if [ "$USE_LAST_K_HEAD" = "1" ]; then
+  LAST_K_HEAD_FLAG="--last_k_head --last_k_head_k $LAST_K_HEAD_K"
+  TAG="${TAG}_lk${LAST_K_HEAD_K}"
+fi
 
 BASE_DIR=${BASE_DIR:-"$ROOT/checkpoints_ylj_48h_4h_${TAG}"}
 CKPT_DIR="$BASE_DIR/$RUN"
@@ -134,7 +147,7 @@ _parse_ylj_eval_metrics() {
   ' <<< "$eval_line"
 }
 
-echo "[test_ylj_run_ckpts] tag=$TAG use_all=${USE_ALL:-0} nwp=$USE_NWP sat=$USE_SAT tcn_multi_kernel=$USE_TCN_MULTI_KERNEL cross_attn_2layer=$USE_CROSS_ATTN_2LAYER nwp_residual=$USE_NWP_RESIDUAL hist_compression=$USE_HIST_COMPRESSION hist_compression_cond_forecast=$USE_HIST_COMPRESSION_COND_FORECAST"
+echo "[test_ylj_run_ckpts] tag=$TAG use_all=${USE_ALL:-0} nwp=$USE_NWP sat=$USE_SAT tcn_multi_kernel=$USE_TCN_MULTI_KERNEL cross_attn_2layer=$USE_CROSS_ATTN_2LAYER nwp_residual=$USE_NWP_RESIDUAL hist_compression=$USE_HIST_COMPRESSION hist_compression_cond_forecast=$USE_HIST_COMPRESSION_COND_FORECAST split_pv_sat_attn=$USE_SPLIT_PV_SAT_ATTN last_k_head=$USE_LAST_K_HEAD last_k_head_k=$LAST_K_HEAD_K"
 echo "[test_ylj_run_ckpts] parquet hist flags: ${PARQUET_HIST_FLAGS:-<none>}"
 echo "[test_ylj_run_ckpts] run=$RUN  dir=$CKPT_DIR  ckpts=${#CKPTS[@]} (epoch>=$EPOCH_START, found ${#_ALL_CKPTS[@]} total)"
 
@@ -156,6 +169,8 @@ for CKPT in "${CKPTS[@]}"; do
     $NWP_RESIDUAL_FLAG \
     $HIST_COMPRESSION_FLAG \
     $HIST_COMPRESSION_COND_FORECAST_FLAG \
+    $SPLIT_PV_SAT_ATTN_FLAG \
+    $LAST_K_HEAD_FLAG \
     --config "$CFG" \
     --ylj_raw_parquet $PARQUET_HIST_FLAGS $NWP_FLAG $SAT_FLAG \
     --test_only \

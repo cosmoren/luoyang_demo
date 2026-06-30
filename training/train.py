@@ -131,6 +131,32 @@ def _assert_ckpt_hist_compression_cond_forecast_flag(
         )
 
 
+def _assert_ckpt_split_pv_sat_attn_flag(ckpt: dict, use_split_pv_sat_attn: bool) -> None:
+    ckpt_val = bool(ckpt.get("split_pv_sat_attn", False))
+    if ckpt_val != use_split_pv_sat_attn:
+        raise ValueError(
+            f"Checkpoint split_pv_sat_attn={ckpt_val} but "
+            f"--split_pv_sat_attn={use_split_pv_sat_attn}. "
+            "Pass --split_pv_sat_attn to match the checkpoint."
+        )
+
+
+def _assert_ckpt_last_k_head(ckpt: dict, use_last_k_head: bool, last_k_head_k: int) -> None:
+    ckpt_flag = bool(ckpt.get("last_k_head", False))
+    if ckpt_flag != use_last_k_head:
+        raise ValueError(
+            f"Checkpoint last_k_head={ckpt_flag} but --last_k_head={use_last_k_head}. "
+            "Pass --last_k_head to match the checkpoint."
+        )
+    ckpt_k = int(ckpt.get("last_k_head_k", 0))
+    expected_k = int(last_k_head_k) if use_last_k_head else 0
+    if ckpt_k != expected_k:
+        raise ValueError(
+            f"Checkpoint last_k_head_k={ckpt_k} but expected {expected_k} "
+            f"(--last_k_head={use_last_k_head}, --last_k_head_k={last_k_head_k})."
+        )
+
+
 def _masked_pv_loss_tensors(
     batch: dict,
     pv_pred: torch.Tensor,
@@ -940,6 +966,22 @@ def main() -> None:
         help="With --hist_compression: build compression queries from forecast time + NWP features.",
     )
     parser.add_argument(
+        "--split_pv_sat_attn",
+        action="store_true",
+        help="Separate cross-attention over PV history and satellite tokens (when sat is used).",
+    )
+    parser.add_argument(
+        "--last_k_head",
+        action="store_true",
+        help="Concatenate last-K kt + parquet hist (+ last-step solar timefeats) into pv_feats_head.",
+    )
+    parser.add_argument(
+        "--last_k_head_k",
+        type=int,
+        default=8,
+        help="History steps for --last_k_head (default 8).",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Resume training from latest checkpoint in checkpoint_dir.",
@@ -956,6 +998,9 @@ def main() -> None:
     if args.hist_compression_cond_forecast and not args.hist_compression:
         parser.error("--hist_compression_cond_forecast requires --hist_compression")
 
+    if args.last_k_head and args.last_k_head_k < 1:
+        parser.error("--last_k_head_k must be >= 1 when --last_k_head is set")
+
     if args.test_dataloader:
         loader_test(args, satimg_hwc)
         return
@@ -970,6 +1015,7 @@ def main() -> None:
     hist_enabled = _ylj_parquet_hist_enabled(args)
     n_hist = _ylj_n_parquet_hist_channels(hist_enabled)
     cross_attn_layers = 2 if args.cross_attn_2layer else 1
+    last_k_head_k = int(args.last_k_head_k) if args.last_k_head else 0
     model = pv_forecasting_model_vit_nwp(
         dev_dn_list=dev_dn_list,
         n_parquet_hist_channels=n_hist,
@@ -978,6 +1024,9 @@ def main() -> None:
         use_nwp_residual=args.nwp_residual,
         use_hist_compression=args.hist_compression,
         hist_compression_cond_forecast=args.hist_compression_cond_forecast,
+        use_split_pv_sat_attn=args.split_pv_sat_attn,
+        use_last_k_head=args.last_k_head,
+        last_k_head_k=args.last_k_head_k if args.last_k_head else 8,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -1051,6 +1100,8 @@ def main() -> None:
             _assert_ckpt_hist_compression_cond_forecast_flag(
                 ckpt, args.hist_compression_cond_forecast
             )
+            _assert_ckpt_split_pv_sat_attn_flag(ckpt, args.split_pv_sat_attn)
+            _assert_ckpt_last_k_head(ckpt, args.last_k_head, last_k_head_k)
             model.load_state_dict(ckpt["model_state_dict"])
             print(f"Loaded checkpoint for test-only mode: {ckpt_path} (epoch={ckpt.get('epoch', '?')})")
         else:
@@ -1137,6 +1188,8 @@ def main() -> None:
             _assert_ckpt_hist_compression_cond_forecast_flag(
                 ckpt, args.hist_compression_cond_forecast
             )
+            _assert_ckpt_split_pv_sat_attn_flag(ckpt, args.split_pv_sat_attn)
+            _assert_ckpt_last_k_head(ckpt, args.last_k_head, last_k_head_k)
             model.load_state_dict(ckpt["model_state_dict"])
             if "optimizer_state_dict" in ckpt:
                 optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -1204,6 +1257,9 @@ def main() -> None:
             "nwp_residual": bool(args.nwp_residual),
             "hist_compression": bool(args.hist_compression),
             "hist_compression_cond_forecast": bool(args.hist_compression_cond_forecast),
+            "split_pv_sat_attn": bool(args.split_pv_sat_attn),
+            "last_k_head": bool(args.last_k_head),
+            "last_k_head_k": last_k_head_k,
             **_ylj_parquet_hist_ckpt_flags(hist_enabled),
         }
 
