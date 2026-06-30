@@ -50,6 +50,7 @@ OPTIONAL_MODALITY_KEYS = (
     "skimg_valid_mask",
     "nwp_tensor",
     "nwp_history",
+    "nwp_forecast_history",
 )
 
 
@@ -126,6 +127,7 @@ def forward_vit(model: nn.Module, d: dict) -> torch.Tensor:
             skimg_valid_mask=d["skimg_valid_mask"],
             nwp_tensor=d["nwp_tensor"],
             nwp_history=d["nwp_history"],
+            nwp_forecast_history=d["nwp_forecast_history"],
         )
     except Exception as e:
         details = ", ".join(
@@ -142,6 +144,7 @@ def forward_vit(model: nn.Module, d: dict) -> torch.Tensor:
                 f"skimg_valid_mask={_shape_of(d.get('skimg_valid_mask'))}",
                 f"nwp_tensor={_shape_of(d.get('nwp_tensor'))}",
                 f"nwp_history={_shape_of(d.get('nwp_history'))}",
+                f"nwp_forecast_history={_shape_of(d.get('nwp_forecast_history'))}",
             ]
         )
         raise RuntimeError(f"forward_vit failed with tensor shapes: {details}") from e
@@ -198,11 +201,15 @@ def _task_loss_and_vectors(
         pred_np = pv_pred.detach().cpu().float().numpy().reshape(-1)
         tgt_np = target_pv.detach().cpu().float().numpy().reshape(-1)
     elif task == "4h":
-        # Train on the first 16 forecast steps for denser supervision,
-        # but keep metric/export vectors on the 4h point (idx=15).
-        loss = criterion(pv_pred[:, : idx + 1], target_pv[:, : idx + 1])
-        pred_np = pv_pred[:, idx].detach().cpu().float().numpy()
-        tgt_np = target_pv[:, idx].detach().cpu().float().numpy()
+        # Model outputs one value [B,1] for t0+4h; supervise only target[:, 15].
+        if pv_pred.ndim == 2 and pv_pred.shape[1] > 1:
+            pred_4h = pv_pred[:, idx]
+        else:
+            pred_4h = pv_pred.reshape(-1)
+        tgt_4h = target_pv[:, idx]
+        loss = criterion(pred_4h, tgt_4h)
+        pred_np = pred_4h.detach().cpu().float().numpy()
+        tgt_np = tgt_4h.detach().cpu().float().numpy()
     else:
         loss = criterion(pv_pred[:, idx], target_pv[:, idx])
         pred_np = pv_pred[:, idx].detach().cpu().float().numpy()

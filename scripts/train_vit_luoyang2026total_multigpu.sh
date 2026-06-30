@@ -17,7 +17,7 @@ PYTHON_BIN=${PYTHON_BIN:-python}
 CONFIG=${CONFIG:-conf_train.yaml}
 DATASET_CONFIG=${DATASET_CONFIG:-conf_luoyang_2026_4h.yaml}
 TASK=${TASK:-4h}
-CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-checkpoints_dropout05}
+CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-checkpoints_test}
 EXTRA_ARGS=${EXTRA_ARGS:---nwp-dropout-prob 0.5 --nwp-history-dropout-prob 0.0}
 
 if [ "${#GPUS[@]}" -eq 0 ]; then

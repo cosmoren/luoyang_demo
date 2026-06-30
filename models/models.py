@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from typing import Optional
 import torch.nn.functional as F
+from tabm import TabM
 
 from modules.SatEncoder import (
     AlternatingIntraInterFrameAttention,
@@ -625,7 +626,10 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         self.sky_mod_embed = nn.Parameter(torch.randn(1, 1, dim) * 0.02)   # Sky imagem odality embedding
 
         self.inverter_embedding = nn.Embedding(num_embeddings=1000, embedding_dim=16)
-        self.TCN = TemporalCNN1d(in_channels=5, out_channels=64, use_batchnorm=use_batchnorm, dropout=dropout)
+        self.pv_hist_in_channels = 5
+        self.nwp_future_steps = 16
+        self.nwp_future_channels = 4
+        self.nwp_future_flat_dim = self.nwp_future_steps * self.nwp_future_channels
 
         self.time_mlp = nn.Sequential(
             nn.Linear(3, 64),
@@ -635,6 +639,8 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         self.corase_idx = [18, 54, 90, 126, 162, 198, 234, 270, 295, 308, 322, 335, 349, 362, 376, 389,
                            403, 416, 430, 443, 457, 470, 484, 497, 505, 508, 511, 514, 517, 520, 523, 526,
                            529, 532, 535, 538, 541, 544, 547, 550, 553, 556, 559, 562, 565, 568, 571, 574]
+        # This model path uses 576-step history (derived from coarse idx settings).
+        self.pv_hist_len = max(self.corase_idx) + 2
         self.learnable_pv_queries = nn.Parameter(torch.randn(1, 48, 64))
         self.cross_attention_pv_compression = CrossAttention(query_dim=64, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)        
         self.query_mlp = MLP(in_dim=query_mlp_in_dim, hidden_dims=(64, 64), out_dim=64, dropout=0.0)
@@ -681,6 +687,19 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         self.cross_attention_pv = CrossAttention(query_dim=64, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
         self.pv_feats_head = MLP(in_dim=80, hidden_dims=(128, 64), out_dim=64, dropout=0.0)  # PV 64 + sat 64 + inverter 16
         self.fc = FC(in_dim=64, out_dim=1)
+        # New PV-only 4h branch implemented with TabM:
+        # flatten pv_history to table features and predict kt at t0+4h.
+        self.pv_tabm_head = TabM(
+            n_num_features=self.pv_hist_in_channels * self.pv_hist_len + self.nwp_future_flat_dim,
+            cat_cardinalities=None,
+            d_out=1,
+            n_blocks=2,
+            d_block=64,
+            dropout=dropout,
+            k=1,
+            arch_type="tabm-mini",
+            start_scaling_init="normal",
+        )
 
     @staticmethod
     def _apply_channel_dropout(x: torch.Tensor, p: float, training: bool) -> torch.Tensor:
@@ -704,31 +723,59 @@ class pv_forecasting_model_vit_imgs(nn.Module):
                 sat_valid_mask: Optional[torch.Tensor] = None,
                 skimg_valid_mask: Optional[torch.Tensor] = None,
                 nwp_tensor: Optional[torch.Tensor] = None,
-                nwp_history: Optional[torch.Tensor] = None) -> torch.Tensor:
+                nwp_history: Optional[torch.Tensor] = None,
+                nwp_forecast_history: Optional[torch.Tensor] = None) -> torch.Tensor:
         
         pv_masked = pv * pv_mask.to(pv.dtype)
 
         pv_timefeats = pv_timefeats[:, :, [2,3,8]]
         forecast_timefeats = forecast_timefeats[:, :, [2,3,8]]
 
-        if nwp_history is not None and self.nwp_history_dropout_prob > 0.0 and nwp_history.shape[-1] >= 3:
-            hist_feats = torch.stack(
-                [
-                    (nwp_history[:, :, 0] / 1000.0 - 0.5) * 2.0,
-                    (nwp_history[:, :, 2] - 288.15) / 10.0,
-                ],
-                dim=2,
-            )
-            _ = self._apply_channel_dropout(
-                hist_feats,
-                p=self.nwp_history_dropout_prob,
-                training=self.training,
-            )
+
+        # Read history features for PV branch; if missing, fallback to zeros.
+        if nwp_history is None:
+            nwp_history_ghi = torch.zeros_like(pv_masked)
+        else:
+            nwp_history_ghi = ((nwp_history[:, :, 0] / 1000.0 - 0.5) * 2.0).unsqueeze(1)
+        if nwp_forecast_history is None:
+            nwp_forecast_history_ghi = torch.zeros_like(pv_masked)
+        else:
+            nwp_forecast_history_ghi = ((nwp_forecast_history[:, :, 0] / 1000.0 - 0.5) * 2.0).unsqueeze(1)
+        delta_nwp_history_ghi = nwp_history_ghi - nwp_forecast_history_ghi
 
         pv_history = torch.cat([pv_masked, pv_mask, pv_timefeats.permute(0, 2, 1)], dim=1)  # [B, C=11, T]
-        pv_hist_mem = self.TCN(pv_history, pv_mask)     # [B, C_out, T]()
-        KV_hist_mem = pv_hist_mem.permute(0, 2, 1)   # [B, T, C_out]
+        if pv_history.shape[1] != self.pv_hist_in_channels:
+            raise ValueError(
+                f"pv_history channel mismatch: expected {self.pv_hist_in_channels}, got {pv_history.shape[1]}"
+            )
+        if pv_history.shape[2] != self.pv_hist_len:
+            raise ValueError(
+                f"pv_history length mismatch: expected {self.pv_hist_len}, got {pv_history.shape[2]}"
+            )
+        pv_hist_flat = pv_history.reshape(pv_history.shape[0], -1)
+        if nwp_tensor is None:
+            nwp_tensor_flat = torch.zeros(
+                pv_history.shape[0],
+                self.nwp_future_flat_dim,
+                device=pv_history.device,
+                dtype=pv_history.dtype,
+            )
+        else:
+            if nwp_tensor.ndim != 3:
+                raise ValueError(f"nwp_tensor expected [B,T,C], got shape {tuple(nwp_tensor.shape)}")
+            if nwp_tensor.shape[1] * nwp_tensor.shape[2] != self.nwp_future_flat_dim:
+                raise ValueError(
+                    "nwp_tensor flattened dim mismatch: "
+                    f"expected {self.nwp_future_flat_dim}, got {nwp_tensor.shape[1] * nwp_tensor.shape[2]}"
+                )
+            nwp_tensor_flat = nwp_tensor.reshape(nwp_tensor.shape[0], -1)
+        
+        x_num = torch.cat([pv_hist_flat, nwp_tensor_flat], dim=1)
 
+        tabm_out = self.pv_tabm_head(x_num=x_num, x_cat=None)  # [B, K, 1]
+        kt_4h = tabm_out.mean(dim=1)  # [B, 1]
+        return kt_4h
+    
         # PV time features compression -> 48 compressed PV tokens.
         pv_timefeats_corase = pv_timefeats[:, self.corase_idx, :]
         pv_timefeats_corase = self.time_mlp(pv_timefeats_corase)
@@ -1034,6 +1081,7 @@ class pv_forecasting_model_vit_total(nn.Module):
         skimg_valid_mask: Optional[torch.Tensor] = None,
         nwp_tensor: Optional[torch.Tensor] = None,
         nwp_history: Optional[torch.Tensor] = None,
+        nwp_forecast_history: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         
         pv_masked = pv * pv_mask.to(pv.dtype)

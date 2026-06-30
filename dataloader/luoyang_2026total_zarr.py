@@ -142,6 +142,56 @@ def _precompute_nwp_series(
     return series
 
 
+def _precompute_nwp_series_latest_start(
+    df: pd.DataFrame | None, value_cols: tuple[str, ...]
+) -> dict[str, tuple[np.ndarray, np.ndarray]] | None:
+    """
+    Build per-column series on UTC ``forecast_time`` by taking latest ``start_time`` per timestamp.
+
+    Unlike ``_precompute_nwp_series`` (which averages duplicate forecast_time points),
+    this keeps exactly one row per forecast_time: the row with max start_time.
+    """
+    if df is None:
+        return None
+    if "forecast_time" not in df.columns:
+        return {}
+    if "start_time" not in df.columns:
+        # Fallback for datasets without run initialization time.
+        return _precompute_nwp_series(df, value_cols)
+
+    ft_ns_all = _nwp_to_utc_datetime(df["forecast_time"]).astype("int64").to_numpy()
+    st_ns_all = _nwp_to_utc_datetime(df["start_time"]).astype("int64").to_numpy()
+    nat_i64 = np.iinfo(np.int64).min
+    valid_time = (ft_ns_all != nat_i64) & (st_ns_all != nat_i64)
+    if not valid_time.any():
+        return {}
+
+    series: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for col in value_cols:
+        if col not in df.columns:
+            series[col] = (np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64))
+            continue
+        y = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=np.float64)
+        valid = valid_time & np.isfinite(y)
+        if not valid.any():
+            series[col] = (np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64))
+            continue
+        tmp = pd.DataFrame(
+            {
+                "forecast_time_ns": ft_ns_all[valid].astype(np.int64, copy=False),
+                "start_time_ns": st_ns_all[valid].astype(np.int64, copy=False),
+                "value": y[valid],
+            }
+        )
+        tmp = tmp.sort_values(["forecast_time_ns", "start_time_ns"]).drop_duplicates(
+            subset=["forecast_time_ns"], keep="last"
+        )
+        xp = tmp["forecast_time_ns"].to_numpy(dtype=np.float64, copy=False)
+        fp = tmp["value"].to_numpy(dtype=np.float64, copy=False)
+        series[col] = (xp, fp)
+    return series
+
+
 def _normalize_nwp_frame(df: pd.DataFrame, *, kind: str) -> pd.DataFrame:
     """
     Normalize NWP schema to expected columns:
@@ -283,6 +333,32 @@ def interpolate_nwp_history_features(
     ghi_interp = _interp_nwp_series_col(nwp_hist_solar_series, "GHI_mean", xq_ns_f)
     wind_cols = ("msl", "t2m", "u10", "v10", "u100", "v100")
     wind_interp = [_interp_nwp_series_col(nwp_hist_wind_series, c, xq_ns_f) for c in wind_cols]
+    nwp_hist = np.column_stack([ghi_interp] + wind_interp)
+    nwp_hist_clean, nwp_hist_row_bad = _sanitize_nwp_interp(nwp_hist)
+    nwp_hist_valid_mask = 1.0 - nwp_hist_row_bad
+    return np.concatenate([nwp_hist_clean, nwp_hist_valid_mask], axis=1)
+
+
+def interpolate_nwp_forecast_history_features(
+    nwp_fcst_hist_solar_series: dict[str, tuple[np.ndarray, np.ndarray]] | None,
+    nwp_fcst_hist_wind_series: dict[str, tuple[np.ndarray, np.ndarray]] | None,
+    history_timestamps_utc: list[pd.Timestamp],
+) -> np.ndarray | None:
+    """
+    Interpolate forecast-derived history channels on PV history timestamps.
+
+    Output channel order matches nwp_history:
+      [GHI_mean, msl, t2m, u10, v10, u100, v100, hist_valid_mask]
+    """
+    if nwp_fcst_hist_solar_series is None or nwp_fcst_hist_wind_series is None:
+        return None
+    if not history_timestamps_utc:
+        return None
+
+    xq_ns_f = pd.DatetimeIndex(history_timestamps_utc).asi8.astype(np.float64)
+    ghi_interp = _interp_nwp_series_col(nwp_fcst_hist_solar_series, "GHI_mean", xq_ns_f)
+    wind_cols = ("msl", "t2m", "u10", "v10", "u100", "v100")
+    wind_interp = [_interp_nwp_series_col(nwp_fcst_hist_wind_series, c, xq_ns_f) for c in wind_cols]
     nwp_hist = np.column_stack([ghi_interp] + wind_interp)
     nwp_hist_clean, nwp_hist_row_bad = _sanitize_nwp_interp(nwp_hist)
     nwp_hist_valid_mask = 1.0 - nwp_hist_row_bad
@@ -500,6 +576,39 @@ class PVDataset(Dataset):
                 )
                 if self._nwp_wind_blocks is not None:
                     self._GLOBAL_NWP_BLOCK_CACHE[wind_block_key] = self._nwp_wind_blocks
+
+        # Forecast-history NWP: aligned to PV history timestamps but sourced from NWP forecast CSVs.
+        # For duplicate forecast_time values, keep latest start_time per timestamp.
+        self._nwp_forecast_hist_solar_blocks = None
+        if self.nwp_solar_df is not None and solar_csv_key is not None:
+            fcst_hist_solar_block_key = (solar_csv_key, ("latest_start", "GHI_mean"))
+            if fcst_hist_solar_block_key in self._GLOBAL_NWP_BLOCK_CACHE:
+                self._nwp_forecast_hist_solar_blocks = self._GLOBAL_NWP_BLOCK_CACHE[fcst_hist_solar_block_key]
+            else:
+                self._nwp_forecast_hist_solar_blocks = _precompute_nwp_series_latest_start(
+                    self.nwp_solar_df, ("GHI_mean",)
+                )
+                if self._nwp_forecast_hist_solar_blocks is not None:
+                    self._GLOBAL_NWP_BLOCK_CACHE[fcst_hist_solar_block_key] = (
+                        self._nwp_forecast_hist_solar_blocks
+                    )
+
+        self._nwp_forecast_hist_wind_blocks = None
+        if self.nwp_wind_df is not None and wind_csv_key is not None:
+            fcst_hist_wind_block_key = (
+                wind_csv_key,
+                ("latest_start", "msl", "t2m", "u10", "v10", "u100", "v100"),
+            )
+            if fcst_hist_wind_block_key in self._GLOBAL_NWP_BLOCK_CACHE:
+                self._nwp_forecast_hist_wind_blocks = self._GLOBAL_NWP_BLOCK_CACHE[fcst_hist_wind_block_key]
+            else:
+                self._nwp_forecast_hist_wind_blocks = _precompute_nwp_series_latest_start(
+                    self.nwp_wind_df, ("msl", "t2m", "u10", "v10", "u100", "v100")
+                )
+                if self._nwp_forecast_hist_wind_blocks is not None:
+                    self._GLOBAL_NWP_BLOCK_CACHE[fcst_hist_wind_block_key] = (
+                        self._nwp_forecast_hist_wind_blocks
+                    )
         _log_stage("forecast NWP load+precompute")
 
         # NWP history: aligned with PV history timestamps (x_idx).
@@ -1169,6 +1278,11 @@ class PVDataset(Dataset):
         nwp_hist_out = interpolate_nwp_history_features(
             self._nwp_hist_solar_blocks, self._nwp_hist_wind_blocks, list(pd.DatetimeIndex(timestamps))
         )
+        nwp_forecast_hist_out = interpolate_nwp_forecast_history_features(
+            self._nwp_forecast_hist_solar_blocks,
+            self._nwp_forecast_hist_wind_blocks,
+            list(pd.DatetimeIndex(timestamps)),
+        )
         # nwp_history must always be present:
         # when history CSV is missing/unavailable, fill zeros and set mask channel to 0.
         if nwp_hist_out is None:
@@ -1183,6 +1297,26 @@ class PVDataset(Dataset):
                     fallback[:rows, :cols] = nwp_history_np[:rows, :cols]
                 nwp_history_np = fallback
         nwp_history = torch.from_numpy(nwp_history_np)
+        # nwp_forecast_history must always be present:
+        # values are from NWP forecast files, aligned to PV history timestamps.
+        if nwp_forecast_hist_out is None:
+            nwp_forecast_history_np = np.zeros((len(x_idx), 8), dtype=np.float32)
+        else:
+            nwp_forecast_history_np = np.asarray(nwp_forecast_hist_out, dtype=np.float32)
+            if nwp_forecast_history_np.ndim != 2 or nwp_forecast_history_np.shape[1] != 8:
+                fallback = np.zeros((len(x_idx), 8), dtype=np.float32)
+                rows = min(
+                    fallback.shape[0],
+                    nwp_forecast_history_np.shape[0] if nwp_forecast_history_np.ndim == 2 else 0,
+                )
+                cols = min(
+                    fallback.shape[1],
+                    nwp_forecast_history_np.shape[1] if nwp_forecast_history_np.ndim == 2 else 0,
+                )
+                if rows > 0 and cols > 0:
+                    fallback[:rows, :cols] = nwp_forecast_history_np[:rows, :cols]
+                nwp_forecast_history_np = fallback
+        nwp_forecast_history = torch.from_numpy(nwp_forecast_history_np)
 
         pow_y = np_data["final_power"][y_idx]
         target_pv = torch.from_numpy(pow_y)
@@ -1208,6 +1342,7 @@ class PVDataset(Dataset):
             "forecast_timefeats": forecast_timefeats,
             "nwp_tensor": nwp_tensor,
             "nwp_history": nwp_history,
+            "nwp_forecast_history": nwp_forecast_history,
             "target_pv": target_pv,
             "target_mask": target_mask,
             "target_p_cs": target_p_cs,
@@ -1366,6 +1501,13 @@ def collate_batched(batch: list[dict]) -> dict:
     out["nwp_history"] = torch.stack(
         [v if isinstance(v, torch.Tensor) else torch.zeros_like(sample_hist) for v in vals_hist]
     )
+    vals_fcst_hist = [s.get("nwp_forecast_history") for s in batch]
+    sample_fcst_hist = next((v for v in vals_fcst_hist if isinstance(v, torch.Tensor)), None)
+    if sample_fcst_hist is None:
+        sample_fcst_hist = torch.zeros((batch[0]["pv"].shape[-1], 8), dtype=torch.float32)
+    out["nwp_forecast_history"] = torch.stack(
+        [v if isinstance(v, torch.Tensor) else torch.zeros_like(sample_fcst_hist) for v in vals_fcst_hist]
+    )
     return out
 
 
@@ -1412,6 +1554,13 @@ def collate_with_shared_sat_sky(
         sample_hist = torch.zeros((pv_samples[0]["pv"].shape[-1], 8), dtype=torch.float32)
     out["nwp_history"] = torch.stack(
         [v if isinstance(v, torch.Tensor) else torch.zeros_like(sample_hist) for v in vals_hist]
+    )
+    vals_fcst_hist = [s.get("nwp_forecast_history") for s in pv_samples]
+    sample_fcst_hist = next((v for v in vals_fcst_hist if isinstance(v, torch.Tensor)), None)
+    if sample_fcst_hist is None:
+        sample_fcst_hist = torch.zeros((pv_samples[0]["pv"].shape[-1], 8), dtype=torch.float32)
+    out["nwp_forecast_history"] = torch.stack(
+        [v if isinstance(v, torch.Tensor) else torch.zeros_like(sample_fcst_hist) for v in vals_fcst_hist]
     )
 
     def _expand_img(
@@ -1647,6 +1796,14 @@ def main() -> None:
                 # [GHI_mean, msl, t2m, u10, v10, u100, v100, hist_valid_mask]
                 nwp_hist_ghi_np = sample["nwp_history"][:, 0].detach().cpu().numpy()
                 ghi_hist_label = "nwp_history_ghi_mean"
+            if sample.get("nwp_forecast_history") is None:
+                nwp_fcst_hist_ghi_np = np.zeros_like(pv_np)
+                ghi_fcst_hist_label = "nwp_forecast_history_ghi_mean (missing -> zeros)"
+            else:
+                # nwp_forecast_history channel order:
+                # [GHI_mean, msl, t2m, u10, v10, u100, v100, hist_valid_mask]
+                nwp_fcst_hist_ghi_np = sample["nwp_forecast_history"][:, 0].detach().cpu().numpy()
+                ghi_fcst_hist_label = "nwp_forecast_history_ghi_mean"
 
             sat_img, sat_state = _current_frame_rgb(sample.get("sat_tensor"), fallback_hw=(100, 100))
             sky_img, sky_state = _current_frame_rgb(sample.get("skimg_tensor"), fallback_hw=(224, 224))
@@ -1696,6 +1853,12 @@ def main() -> None:
                 nwp_hist_ghi_norm = (nwp_hist_ghi_np - ghi_min) / (ghi_max - ghi_min)
             else:
                 nwp_hist_ghi_norm = np.zeros_like(nwp_hist_ghi_np, dtype=np.float32)
+            fcst_ghi_min = float(np.nanmin(nwp_fcst_hist_ghi_np)) if nwp_fcst_hist_ghi_np.size else 0.0
+            fcst_ghi_max = float(np.nanmax(nwp_fcst_hist_ghi_np)) if nwp_fcst_hist_ghi_np.size else 0.0
+            if np.isfinite(fcst_ghi_min) and np.isfinite(fcst_ghi_max) and fcst_ghi_max > fcst_ghi_min:
+                nwp_fcst_hist_ghi_norm = (nwp_fcst_hist_ghi_np - fcst_ghi_min) / (fcst_ghi_max - fcst_ghi_min)
+            else:
+                nwp_fcst_hist_ghi_norm = np.zeros_like(nwp_fcst_hist_ghi_np, dtype=np.float32)
 
             fig_hist, ax_hist_l = plt.subplots(1, 1, figsize=(14, 4.5))
             ax_hist_l.plot(x, pv_np, lw=1.1, color="tab:blue", label="pv")
@@ -1714,6 +1877,13 @@ def main() -> None:
                 color="tab:red",
                 label=f"{ghi_hist_label}_norm",
             )
+            ax_hist_r.plot(
+                x,
+                nwp_fcst_hist_ghi_norm,
+                lw=1.1,
+                color="tab:purple",
+                label=f"{ghi_fcst_hist_label}_norm",
+            )
             ax_hist_r.set_ylabel("p_cs / kt / ghi_norm", color="tab:orange")
             ax_hist_r.tick_params(axis="y", labelcolor="tab:orange")
             ax_hist_r.set_ylim(-0.05, 1.05)
@@ -1722,13 +1892,66 @@ def main() -> None:
             lines_r, labels_r = ax_hist_r.get_legend_handles_labels()
             ax_hist_l.legend(lines_l + lines_r, labels_l + labels_r, loc="upper right")
             fig_hist.suptitle(
-                f"{split} idx={idx}: pv / p_cs / kt / nwp_history_ghi_mean | "
+                f"{split} idx={idx}: pv / p_cs / kt / nwp_history_ghi_mean / nwp_forecast_history_ghi_mean | "
                 f"anchor={anchor_utc_str} ({anchor_bj_str})"
             )
             fig_hist.tight_layout()
             out_path_hist = args.plot_out_dir / f"{split}_idx{idx:06d}_{anchor_tag}_history_ghi_overlay.png"
             fig_hist.savefig(out_path_hist, dpi=160)
             plt.close(fig_hist)
+
+            # Direct history-vs-forecast-history feature check for loader validation:
+            # - ssrd-like channel: index 0 (GHI_mean)
+            # - t2m channel: index 2
+            if sample.get("nwp_history") is None:
+                hist_ssrd_like_np = np.zeros_like(pv_np)
+                hist_t2m_np = np.zeros_like(pv_np)
+            else:
+                hist_ssrd_like_np = sample["nwp_history"][:, 0].detach().cpu().numpy()
+                hist_t2m_np = sample["nwp_history"][:, 2].detach().cpu().numpy()
+            if sample.get("nwp_forecast_history") is None:
+                fcst_hist_ssrd_like_np = np.zeros_like(pv_np)
+                fcst_hist_t2m_np = np.zeros_like(pv_np)
+            else:
+                fcst_hist_ssrd_like_np = sample["nwp_forecast_history"][:, 0].detach().cpu().numpy()
+                fcst_hist_t2m_np = sample["nwp_forecast_history"][:, 2].detach().cpu().numpy()
+
+            fig_cmp, axes_cmp = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+            axes_cmp[0].plot(x, hist_ssrd_like_np, lw=1.1, color="tab:blue", label="nwp_history_ssrd_like(ch0)")
+            axes_cmp[0].plot(
+                x,
+                fcst_hist_ssrd_like_np,
+                lw=1.1,
+                color="tab:orange",
+                label="nwp_forecast_history_ssrd_like(ch0)",
+            )
+            axes_cmp[0].set_ylabel("ssrd-like")
+            axes_cmp[0].grid(True, alpha=0.25)
+            axes_cmp[0].legend(loc="upper right")
+
+            axes_cmp[1].plot(x, hist_t2m_np, lw=1.1, color="tab:green", label="nwp_history_t2m(ch2)")
+            axes_cmp[1].plot(
+                x,
+                fcst_hist_t2m_np,
+                lw=1.1,
+                color="tab:red",
+                label="nwp_forecast_history_t2m(ch2)",
+            )
+            axes_cmp[1].set_ylabel("t2m")
+            axes_cmp[1].set_xlabel("history step")
+            axes_cmp[1].grid(True, alpha=0.25)
+            axes_cmp[1].legend(loc="upper right")
+
+            fig_cmp.suptitle(
+                f"{split} idx={idx}: nwp_history vs nwp_forecast_history (ssrd-like & t2m) | "
+                f"anchor={anchor_utc_str} ({anchor_bj_str})"
+            )
+            fig_cmp.tight_layout()
+            out_path_cmp = (
+                args.plot_out_dir / f"{split}_idx{idx:06d}_{anchor_tag}_history_vs_forecast_history_ssrd_t2m.png"
+            )
+            fig_cmp.savefig(out_path_cmp, dpi=160)
+            plt.close(fig_cmp)
 
             target_pv_np = sample["target_pv"].detach().cpu().numpy()
             if sample["nwp_tensor"] is None:
@@ -1777,7 +2000,7 @@ def main() -> None:
             plt.close(fig2)
 
             print(
-                f"[{split}] plots saved: {out_path.name}, {out_path_hist.name}, "
+                f"[{split}] plots saved: {out_path.name}, {out_path_hist.name}, {out_path_cmp.name}, "
                 f"{out_path2.name}"
             )
             plotted += 1
