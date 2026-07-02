@@ -1,5 +1,5 @@
 paths:
-  data_dir: "/work/datasets/luoyang_2026_SPMF"
+  data_dir: "/home/hw1/datasets/luoyang_2026_SPMF"
   pv_path: pv
   pv_total_path: pv_total.csv
   sky_image_path: luoyangASI_skimg_zarr

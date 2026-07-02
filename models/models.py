@@ -698,14 +698,14 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         # New PV-only 4h branch implemented with TabM:
         # flatten pv_history to table features and predict kt at t0+4h.
         self.pv_tabm_head = TabM(
-            n_num_features=self.pv_hist_in_channels * self.pv_hist_len + self.nwp_future_flat_dim,
+            n_num_features=2336,
             cat_cardinalities=None,
             d_out=1,
             n_blocks=2,
             d_block=64,
             dropout=dropout,
             k=1,
-            arch_type="tabm-mini",
+            arch_type="tabm",
             start_scaling_init="normal",
         )
         # Cached feature right before TabM final output projection.
@@ -780,7 +780,7 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         nwp_t2m_normalized = (nwp_tensor[:, :, 2] - 288.15) / 10.0
 
         
-        pv_hist_flat = pv_history.reshape(pv_history.shape[0], -1)
+        pv_hist_flat = pv_history[:,[0,5,6,7],:].reshape(pv_history.shape[0], -1)
         nwp_tensor_for_tabm = torch.stack(
             [
                 nwp_ssrd_normalized,
@@ -812,6 +812,7 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         tabm_summary_token = tabm_summary_feature + self.tabm_mod_embed
         kt_tabm = tabm_out.mean(dim=1)  # [B, 1]
 
+        return kt_tabm  # [B, 1] — keep dim so pv_pred = kt * target_p_cs * p_mean is [B, 1]
 
         # Forecast queries: Luoyang total variant only uses two NWP channels:
         # ssrd (idx=0) and t2m (idx=2), where nwp_tensor layout is
@@ -964,317 +965,5 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         kt = kt_tabm + delta_kt
 
         return kt.squeeze(-1)
-
-
-# Using PV history and NWP to forecast PV, solar features and NWP features are used as query
-class pv_forecasting_model_vit_total(nn.Module):
-    """
-    Like ``pv_forecasting_model_vit_nwp`` but satellite frames go through
-    :func:`modules.SatEncoder.patchify_spatiotemporal_images` and
-    :class:`modules.SatEncoder.AlternatingIntraInterFrameAttention`, then cross-attend into the forecast query.
-
-    NWP forecast-query channels are configurable: ``nwp_features`` selects which columns
-    of ``_FOLSOM_NWP_FEATURE_COLS`` to read from ``nwp_tensor`` (each normalised via
-    :data:`NWP_FEATURE_NORMALIZERS`), and ``use_invalid_mask`` toggles passing the trailing
-    per-step invalid mask channel (``nwp_tensor[:, :, -1]``) through as-is.
-    """
-
-    def __init__(
-        self,
-        use_batchnorm: bool = True,
-        dropout: float = 0.0,
-        dev_dn_list: Optional[list] = None,
-        nwp_features: Optional[list[str]] = None,
-        use_invalid_mask: bool = _DEFAULT_VIT_IMGS_NWP_USE_INVALID_MASK,
-        nwp_dropout_prob: float = 0.0,
-        nwp_history_dropout_prob: float = 0.0,
-    ):
-        super().__init__()
-
-        self.use_batchnorm = use_batchnorm
-        self.dropout = dropout
-
-        if nwp_features is None:
-            nwp_features = list(_DEFAULT_VIT_IMGS_NWP_FEATURES)
-        nwp_features = list(nwp_features)
-        unknown = [n for n in nwp_features if n not in NWP_FEATURE_NORMALIZERS]
-        if unknown:
-            raise ValueError(
-                f"Unknown NWP feature(s) {unknown}; valid features are "
-                f"{sorted(NWP_FEATURE_NORMALIZERS)}"
-            )
-        dupes = [n for n in nwp_features if nwp_features.count(n) > 1]
-        if dupes:
-            raise ValueError(f"Duplicate NWP feature(s) in nwp_features: {sorted(set(dupes))}")
-        self.nwp_features: list[str] = nwp_features
-        self.use_invalid_mask: bool = bool(use_invalid_mask)
-        self.nwp_dropout_prob: float = max(0.0, min(1.0, float(nwp_dropout_prob)))
-        self.nwp_history_dropout_prob: float = max(
-            0.0, min(1.0, float(nwp_history_dropout_prob))
-        )
-        # Pre-resolve column indices in ``nwp_tensor`` (last dim = 8 features + 1 mask).
-        self._nwp_feature_indices: list[int] = [
-            _FOLSOM_NWP_FEATURE_COLS.index(name) for name in self.nwp_features
-        ]
-        # Forecast-query input dim = 3 time feats + N NWP features (+ 1 if mask passed through).
-        query_mlp_in_dim = 3 + len(self.nwp_features) + (1 if self.use_invalid_mask else 0)
-
-        dim = 64
-        self.pv_mod_embed = nn.Parameter(torch.randn(1, 1, dim) * 0.02)   # PV modality embedding
-        self.sat_mod_embed = nn.Parameter(torch.randn(1, 1, dim) * 0.02)   # Satellite image modality embedding
-        self.sky_mod_embed = nn.Parameter(torch.randn(1, 1, dim) * 0.02)   # Sky imagem odality embedding
-
-        self.TCN = TemporalCNN1d(in_channels=5, out_channels=64, use_batchnorm=use_batchnorm, dropout=dropout)
-
-        self.time_mlp = nn.Sequential(
-            nn.Linear(3, 64),
-            nn.GELU(),
-            nn.Linear(64, 64),
-        )
-        self.corase_idx = [18, 54, 90, 126, 162, 198, 234, 270, 295, 308, 322, 335, 349, 362, 376, 389,
-                           403, 416, 430, 443, 457, 470, 484, 497, 505, 508, 511, 514, 517, 520, 523, 526,
-                           529, 532, 535, 538, 541, 544, 547, 550, 553, 556, 559, 562, 565, 568, 571, 574]
-        self.learnable_pv_queries = nn.Parameter(torch.randn(1, 48, 64))
-        self.cross_attention_pv_compression = CrossAttention(query_dim=64, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)        
-        self.query_mlp = MLP(in_dim=query_mlp_in_dim, hidden_dims=(64, 64), out_dim=64, dropout=0.0)
-
-        self.sat_embed_dim = 64
-        self.sat_patch_embed = VideoPatchSpatiotemporalEmbed(
-            embed_dim=self.sat_embed_dim, patch_size=16, image_size=112
-        )
-        self.sat_alt_attn = AlternatingIntraInterFrameAttention(
-            embed_dim=self.sat_embed_dim, num_heads=8, num_cycles=4, dropout=dropout
-        )
-
-        self.sat_two_stage_compressor = SatelliteTwoStageCompressor(
-                                            dim=self.sat_embed_dim,
-                                            num_frames=24,
-                                            num_patches=49,
-                                            num_frame_queries=8,   # 196 -> 8 per frame
-                                            num_sat_queries=48,    # 24*8=192 -> 48 final tokens
-                                            num_heads=8,
-                                            use_patch_pos=True,
-                                            use_frame_time=True,
-                                            use_coarse_spatial=True,
-                                            coarse_query_grid_hw=(6, 8),)
-        
-        self.sky_embed_dim = 64
-        self.sky_patch_embed = SkyPatchSpatiotemporalEmbed(
-            embed_dim=self.sky_embed_dim, patch_size=16, image_size=224
-        )
-        self.sky_alt_attn = SkyAlternatingIntraInterFrameAttention(
-            embed_dim=self.sky_embed_dim, num_heads=8, num_cycles=4, dropout=dropout
-        )
-        self.sky_two_stage_compressor = SkyTwoStageCompressor(
-                                            dim=self.sky_embed_dim,
-                                            num_frames=30,
-                                            num_patches=196,
-                                            num_frame_queries=8,
-                                            num_sky_queries=48,
-                                            num_heads=8,
-                                            use_patch_pos=True,
-                                            use_frame_time=True,
-                                            use_coarse_spatial=True,
-                                            coarse_query_grid_hw=(6, 8),)
-
-        self.cross_attention_pv = CrossAttention(query_dim=64, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
-        self.pv_feats_head = MLP(in_dim=64, hidden_dims=(128, 64), out_dim=64, dropout=0.0)  # PV 64 + sat 64 + inverter 16
-        self.fc = FC(in_dim=64, out_dim=1)
-
-    @staticmethod
-    def _apply_channel_dropout(x: torch.Tensor, p: float, training: bool) -> torch.Tensor:
-        """
-        Channel-wise dropout on [B, T, C] tensors.
-        Drops entire channels per-sample across all timesteps.
-        """
-        if (not training) or p <= 0.0:
-            return x
-        keep = 1.0 - float(p)
-        if keep <= 0.0:
-            return torch.zeros_like(x)
-        bsz, _, channels = x.shape
-        mask = (torch.rand((bsz, 1, channels), device=x.device) < keep).to(x.dtype)
-        return x * mask / keep
-
-    def forward(
-        self,
-        device_id: torch.Tensor,
-        pv: torch.Tensor,
-        pv_mask: Optional[torch.Tensor] = None,
-        pv_timefeats: Optional[torch.Tensor] = None,
-        forecast_timefeats: Optional[torch.Tensor] = None,
-        sat_tensor: Optional[torch.Tensor] = None,
-        sat_timefeats: Optional[torch.Tensor] = None,
-        skimg_tensor: Optional[torch.Tensor] = None,
-        skimg_timefeats: Optional[torch.Tensor] = None,
-        sat_valid_mask: Optional[torch.Tensor] = None,
-        skimg_valid_mask: Optional[torch.Tensor] = None,
-        nwp_tensor: Optional[torch.Tensor] = None,
-        nwp_history: Optional[torch.Tensor] = None,
-        nwp_forecast_history: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        
-        pv_masked = pv * pv_mask.to(pv.dtype)
-
-        pv_timefeats = pv_timefeats[:, :, [2,3,8]]
-        forecast_timefeats = forecast_timefeats[:, :, [2,3,8]]
-        
-        if nwp_history is not None and self.nwp_history_dropout_prob > 0.0 and nwp_history.shape[-1] >= 3:
-            hist_feats = torch.stack(
-                [
-                    (nwp_history[:, :, 0] / 1000.0 - 0.5) * 2.0,
-                    (nwp_history[:, :, 2] - 288.15) / 10.0,
-                ],
-                dim=2,
-            )
-            # Keep this preprocessed history tensor ready for future fusion paths.
-            _ = self._apply_channel_dropout(
-                hist_feats,
-                p=self.nwp_history_dropout_prob,
-                training=self.training,
-            )
-
-        pv_history = torch.cat([pv_masked, pv_mask, pv_timefeats.permute(0, 2, 1)], dim=1)  # [B, C=8, T]
-
-        pv_hist_mem = self.TCN(pv_history, pv_mask)     # [B, C_out, T]()
-        KV_hist_mem = pv_hist_mem.permute(0, 2, 1)   # [B, T, C_out]
-
-        # Temporarily disable PV token compression for ablation:
-        # keep full history tokens as keys/values.
-        KV_hist_mem_compressed = KV_hist_mem + self.pv_mod_embed
-
-        # Forecast queries: Luoyang total variant uses only ssrd and t2m from nwp_tensor.
-        # nwp_tensor layout: [ssrd, msl, t2m, u10, v10, u100, v100, nan_mask]
-        nwp_channels = [forecast_timefeats]
-        if nwp_tensor is not None:
-            nwp_feat_list = [
-                (nwp_tensor[:, :, 0] / 1000.0 - 0.5) * 2.0,
-                (nwp_tensor[:, :, 2] - 288.15) / 10.0,
-            ]
-            if self.use_invalid_mask:
-                nwp_feat_list.append(nwp_tensor[:, :, -1])
-            nwp_feats = torch.stack(nwp_feat_list, dim=2)
-            nwp_feats = self._apply_channel_dropout(
-                nwp_feats,
-                p=self.nwp_dropout_prob,
-                training=self.training,
-            )
-            nwp_channels.append(nwp_feats)
-        else:
-            zero_nwp_feat = torch.zeros(
-                forecast_timefeats.shape[:2],
-                device=forecast_timefeats.device,
-                dtype=forecast_timefeats.dtype,
-            )
-            n_nwp_channels = 2 + (1 if self.use_invalid_mask else 0)
-            nwp_channels.append(zero_nwp_feat.unsqueeze(2).repeat(1, 1, n_nwp_channels))
-        forecast_ssrd_timefeats = torch.cat(nwp_channels, dim=2)
-        forecast_query = self.query_mlp(forecast_ssrd_timefeats)
-
-        # satellite images encoder
-        B, T_out, _ = forecast_query.shape
-        pv_mask = torch.ones(B, KV_hist_mem_compressed.shape[1], device=pv.device, dtype=pv.dtype)
-
-        if sat_tensor is None or sat_tensor.max() == 0:
-            sat_compressed = torch.zeros(B, 48, 64, device=pv.device, dtype=pv.dtype) + self.sat_mod_embed
-            sat_mask = torch.zeros(B, 48, device=pv.device, dtype=pv.dtype)
-        else:
-            B_sat, T_sat, C_sat, H_sat, W_sat = sat_tensor.shape
-            if C_sat != 3:
-                raise ValueError(f"sat_tensor expected 3 channels, got {C_sat}")
-            sat_hr = nn.functional.interpolate(
-                sat_tensor.reshape(B_sat * T_sat, C_sat, H_sat, W_sat),
-                size=(112, 112),
-                mode="bilinear",
-                align_corners=False,
-            ).view(B_sat, T_sat, 3, 112, 112)
-
-            sat_timefeats = sat_timefeats[:, :, [2,3,8]]
-            sat_patch_tokens = patchify_spatiotemporal_images(sat_hr, self.sat_patch_embed, timefeats=sat_timefeats[:,:,-1].unsqueeze(2))
-            sat_patch_tokens = self.sat_alt_attn(sat_patch_tokens)  # [B,T=24,P=49,D=64]
-            sat_start = sat_timefeats[:, 0, -1]   # [B]
-            sat_end   = sat_timefeats[:, -1, -1]  # [B]
-            sat_steps = torch.linspace(0, 1, 48, device=sat_patch_tokens.device)
-            sat_query_times = sat_start[:, None] + (sat_end - sat_start)[:, None] * sat_steps  # [B, 48]
-            sat_compressed = self.sat_two_stage_compressor(sat_patch_tokens, sat_query_times) + self.sat_mod_embed  # [B,P=48,D=64]
-
-            sat_timefeats_48 = F.interpolate(
-                    sat_timefeats.transpose(1, 2),       # -> [B, F=3, T=24]  (interp 要求 [N, C, L])
-                    size=48,
-                    mode="linear",
-                    align_corners=True,                  # 头尾对齐 -> 保留首末时刻原值
-                ).transpose(1, 2)
-
-            sat_timefeats_48_hd = self.time_mlp(sat_timefeats_48)
-            sat_compressed = sat_compressed + sat_timefeats_48_hd
-            
-            # print('sat_patch_tokens: ', sat_patch_tokens.shape, sat_compressed.shape)
-            sat_mask = torch.ones(B, sat_compressed.shape[1], device=pv.device, dtype=pv.dtype)
-
-        if sat_valid_mask is not None:
-            if sat_valid_mask.dim() != 1 or sat_valid_mask.shape[0] != B:
-                raise ValueError(f"sat_valid_mask expected [B], got {sat_valid_mask.shape}")
-            sat_valid_mask = sat_valid_mask.to(device=pv.device, dtype=pv.dtype).unsqueeze(1)
-            sat_compressed = sat_compressed * sat_valid_mask.unsqueeze(2)
-            sat_mask = sat_mask * sat_valid_mask
-
-        # sky images encoder
-        if skimg_tensor is None or skimg_tensor.max() == 0:
-            sky_compressed = torch.zeros(B, 48, 64, device=pv.device, dtype=pv.dtype) + self.sky_mod_embed
-            sky_mask = torch.zeros(B, 48, device=pv.device, dtype=pv.dtype)
-        else:
-            B_sky, T_sky, C_sky, H_sky, W_sky = skimg_tensor.shape
-            if C_sky != 3:
-                raise ValueError(f"skimg_tensor expected 3 channels, got {C_sky}")
-            skimg_timefeats = skimg_timefeats[:, :, [2, 3, 8]]
-            if H_sky != 224 or W_sky != 224:
-                sky_hr = nn.functional.interpolate(
-                    skimg_tensor.reshape(B_sky * T_sky, C_sky, H_sky, W_sky),
-                    size=(224, 224),
-                    mode="bilinear",
-                    align_corners=False,).view(B_sky, T_sky, 3, 224, 224)
-            else:
-                sky_hr = skimg_tensor
-
-            sky_patch_tokens = patchify_spatiotemporal_sky_images(
-                sky_hr,
-                self.sky_patch_embed,
-                timefeats=skimg_timefeats[:, :, -1].unsqueeze(2),
-            )
-            sky_patch_tokens = self.sky_alt_attn(sky_patch_tokens)
-            sky_start = skimg_timefeats[:, 0, -1]   # [B]
-            sky_end   = skimg_timefeats[:, -1, -1]  # [B]
-            sky_steps = torch.linspace(0, 1, 48, device=sky_patch_tokens.device)
-            sky_query_times = sky_start[:, None] + (sky_end - sky_start)[:, None] * sky_steps  # [B, 48]
-            sky_compressed = self.sky_two_stage_compressor(sky_patch_tokens, sky_query_times) + self.sky_mod_embed  # [B,P=48,D=64]
-
-            sky_timefeats_48 = F.interpolate(
-                    skimg_timefeats.transpose(1, 2),       # -> [B, F=3, T=30]
-                    size=48,
-                    mode="linear",
-                    align_corners=True,                  # 头尾对齐 -> 保留首末时刻原值
-                ).transpose(1, 2)
-
-            sky_timefeats_48_hd = self.time_mlp(sky_timefeats_48)
-            sky_compressed = sky_compressed + sky_timefeats_48_hd
-
-            sky_mask = torch.ones(B, 48, device=pv.device, dtype=pv.dtype)
-
-        if skimg_valid_mask is not None:
-            if skimg_valid_mask.dim() != 1 or skimg_valid_mask.shape[0] != B:
-                raise ValueError(f"skimg_valid_mask expected [B], got {skimg_valid_mask.shape}")
-            skimg_valid_mask = skimg_valid_mask.to(device=pv.device, dtype=pv.dtype).unsqueeze(1)
-            sky_compressed = sky_compressed * skimg_valid_mask.unsqueeze(2)
-            sky_mask = sky_mask * skimg_valid_mask
-
-        hist_mem_compressed = torch.cat([KV_hist_mem_compressed, sat_compressed, sky_compressed], dim=1)
-        key_value_mask = torch.cat([pv_mask, sat_mask, sky_mask], dim=1)
-
-        forecast_pv_features = self.cross_attention_pv(query=forecast_query, key=hist_mem_compressed, value=hist_mem_compressed, key_value_mask=key_value_mask)
-
-        pv_feats = self.pv_feats_head(forecast_pv_features)
-        pv = self.fc(pv_feats)
-
-        return pv.squeeze(-1)
 
 

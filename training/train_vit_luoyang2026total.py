@@ -40,6 +40,8 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 from dataloader.luoyang_2026total_zarr import PVDataset, collate_batched
 from models.models import pv_forecasting_model_vit_imgs
 
+# For point tasks, keep index mapping only as legacy fallback when target has multiple steps.
+# If dataloader already outputs a single future point (pv_output_len=1), we always supervise index 0.
 TASK_TO_INDEX = {"15m": 0, "4h": 15, "48h": None}
 OPTIONAL_MODALITY_KEYS = (
     "sat_tensor",
@@ -194,23 +196,30 @@ def _task_loss_and_vectors(
     target_pv: torch.Tensor,
     criterion: nn.Module,
     task: str,
-) -> tuple[torch.Tensor, np.ndarray, np.ndarray]:
+) -> tuple[torch.Tensor, np.ndarray, np.ndarray, int | None]:
     idx = TASK_TO_INDEX[task]
     if idx is None:
         loss = criterion(pv_pred, target_pv)
         pred_np = pv_pred.detach().cpu().float().numpy().reshape(-1)
         tgt_np = target_pv.detach().cpu().float().numpy().reshape(-1)
+        used_idx = None
     else:
-        # For 15m/4h tasks, supervise only the current task point.
-        if pv_pred.ndim == 2 and pv_pred.shape[1] > idx:
-            pred_pt = pv_pred[:, idx]
+        # For point tasks (15m/4h), supervise the point that dataloader actually outputs.
+        # When target has a single step, this is always index 0 regardless of task name.
+        t_out = int(target_pv.shape[1]) if target_pv.ndim >= 2 else 1
+        if t_out <= 1:
+            used_idx = 0
+        else:
+            used_idx = int(min(max(idx, 0), t_out - 1))
+        if pv_pred.ndim == 2 and pv_pred.shape[1] > used_idx:
+            pred_pt = pv_pred[:, used_idx]
         else:
             pred_pt = pv_pred.reshape(-1)
-        tgt_pt = target_pv[:, idx]
+        tgt_pt = target_pv[:, used_idx]
         loss = criterion(pred_pt, tgt_pt)
         pred_np = pred_pt.detach().cpu().float().numpy()
         tgt_np = tgt_pt.detach().cpu().float().numpy()
-    return loss, pred_np, tgt_np
+    return loss, pred_np, tgt_np, used_idx
 
 
 def _mae_rmse(pred: np.ndarray, tgt: np.ndarray) -> tuple[float, float]:
@@ -249,7 +258,7 @@ def train_one_epoch_task(
         kt_pred = forward_vit(model, d)
 
         pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
-        loss, _, _ = _task_loss_and_vectors(pv_pred, d["target_pv"], criterion, task)
+        loss, _, _, _ = _task_loss_and_vectors(pv_pred, d["target_pv"], criterion, task)
         loss.backward()
         optimizer.step()
         if ema is not None:
@@ -298,7 +307,6 @@ def evaluate_task(
     pred_list: list[np.ndarray] = []
     tgt_list: list[np.ndarray] = []
     ts_list: list[np.ndarray] = []
-    task_idx = TASK_TO_INDEX[task]
     interval_ns = (
         int(pv_output_interval_min) * 60 * 1_000_000_000
         if pv_output_interval_min is not None
@@ -310,7 +318,7 @@ def evaluate_task(
             bsz = int(d["device_id"].size(0))
             kt_pred = forward_vit(model, d)
             pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
-            loss, pred_np, tgt_np = _task_loss_and_vectors(pv_pred, d["target_pv"], criterion, task)
+            loss, pred_np, tgt_np, used_idx = _task_loss_and_vectors(pv_pred, d["target_pv"], criterion, task)
             total_loss += float(loss.item()) * bsz
             total_samples += bsz
             pred_list.append(pred_np)
@@ -324,13 +332,13 @@ def evaluate_task(
                         "Batch missing required 'anchor_time_utc_ns' for prediction timestamp export"
                     )
                 anchor_ns = anchor_raw.detach().cpu().numpy().astype(np.int64, copy=False)  # [B]
-                if task_idx is None:
+                if used_idx is None:
                     t_out = int(d["target_pv"].shape[1])
                     offsets = (np.arange(t_out, dtype=np.int64) + 1) * np.int64(interval_ns)
                     ts_ns = anchor_ns[:, None] + offsets[None, :]
                     ts_list.append(ts_ns.reshape(-1).astype("datetime64[ns]"))
                 else:
-                    ts_ns = anchor_ns + np.int64(task_idx + 1) * np.int64(interval_ns)
+                    ts_ns = anchor_ns + np.int64(used_idx + 1) * np.int64(interval_ns)
                     ts_list.append(ts_ns.astype("datetime64[ns]"))
 
     pred = np.concatenate(pred_list, axis=0) if pred_list else np.array([], dtype=np.float32)
