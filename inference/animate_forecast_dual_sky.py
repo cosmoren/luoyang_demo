@@ -1,10 +1,10 @@
 """
-Animate a rolling 15-min next-step nowcast with dual sky panels (Folsom, CA).
+Animate a rolling 15-min next-step nowcast with sky + cumulative-error bars (Folsom, CA).
 
 Layout (one frame):
 
     +------------------------+------------------------+
-    |  Sky at T (issue time) |  Sky at T+15 (target)  |
+    |  Sky at issue time     |  Cumulative error bars |
     +------------------------+------------------------+
     |              GHI nowcast (full width)            |
     +--------------------------------------------------+
@@ -16,7 +16,9 @@ For each display time T on a 15-min local grid:
     take output step 0  ==> the +15 min step  ==> prediction at T
 
 Top-left shows the fisheye sky when the nowcast is issued (T).
-Top-right shows the fisheye sky at the predicted time (T + 15 min).
+Top-right shows vertical bars for each model's cumulative error vs GT
+(root-sum-of-squares: sqrt(sum err^2) over all frames from day start
+through the current frame; always non-decreasing).
 Bottom panel plots ground truth (black) plus one-or-more model predictions
 (red / blue / green) vs hour-of-day (local). X-axis ticks are placed at every
 integer hour within the visible daylight window so times are easy to read.
@@ -93,10 +95,13 @@ from inference.animate_forecast import (  # noqa: E402
     _utc_naive_to_local_hour,
 )
 
-# Dual-sky layout: two sky panels on top, full-width plot below.
+# Layout: sky (left) + cumulative-error bars (right) on top, full-width GHI plot below.
 _FIG_W_INCHES = 10.0
 _FIG_H_INCHES = 7.0
 _FRAME_DPI = 110
+# Headroom above the day's peak cumulative RSS so bars never pin the ceiling.
+_RSS_YLIM_HEADROOM = 1.15
+_RSS_YLIM_FLOOR = 1.0
 
 
 def _integer_hour_ticks(xlim: tuple[float, float]) -> tuple[list[float], list[str]]:
@@ -113,6 +118,32 @@ def _integer_hour_ticks(xlim: tuple[float, float]) -> tuple[list[float], list[st
     return ticks, labels
 
 
+def _cumulative_rss(pred: np.ndarray, gt: np.ndarray) -> np.ndarray:
+    """Cumulative root-sum-of-squares of ``pred`` vs ``gt`` through each frame.
+
+    At index ``i``, the value is ``sqrt(sum((pred[:i+1] - gt[:i+1])**2))``
+    over finite pairs only. Always non-decreasing (grows as error accumulates,
+    stays flat on non-finite frames). Units are W/m²-ish (sqrt of sum of
+    squared W/m² errors), not classic mean RMSE. Starts at 0 when no finite
+    pairs exist yet.
+    """
+    pred_a = np.asarray(pred, dtype=np.float64)
+    gt_a = np.asarray(gt, dtype=np.float64)
+    err2 = (pred_a - gt_a) ** 2
+    finite = np.isfinite(err2)
+    # Zero out non-finite so they contribute nothing to the running sum.
+    err2_clean = np.where(finite, err2, 0.0)
+    return np.sqrt(np.cumsum(err2_clean))
+
+
+def _short_bar_label(label: str, max_chars: int = 22) -> str:
+    """Compact x-tick label for the cumulative-error bar panel."""
+    text = str(label).strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1] + "…"
+
+
 def _render_one_frame_dual_sky(
     *,
     t_utc: pd.Timestamp,
@@ -121,7 +152,8 @@ def _render_one_frame_dual_sky(
     preds: list[tuple[np.ndarray, str, str]],
     cursor_idx: int,
     sky_img_t: np.ndarray | None,
-    sky_img_t_plus_15: np.ndarray | None,
+    error_bars: list[tuple[float, str, str]],
+    error_ymax: float,
     date_local_str: str,
     ymin: float,
     ymax: float,
@@ -129,7 +161,11 @@ def _render_one_frame_dual_sky(
     title_plot: str,
     gt_label: str = "Ground truth",
 ) -> np.ndarray:
-    """Render one dual-sky frame and return as ``[H, W, 3]`` uint8."""
+    """Render one frame (sky | cumulative-error bars | GHI) and return as ``[H, W, 3]`` uint8.
+
+    ``error_bars`` is a list of ``(cum_rss, color, label)`` for the current frame.
+    ``error_ymax`` is the shared bar-panel y-limit (√Σ(err²), W/m²-ish).
+    """
     import matplotlib
 
     matplotlib.use("Agg")
@@ -144,39 +180,99 @@ def _render_one_frame_dual_sky(
         figure=fig,
         height_ratios=[1.0, 1.1],
         hspace=0.28,
-        wspace=0.12,
+        wspace=0.18,
     )
     ax_sky_t = fig.add_subplot(gs[0, 0])
-    ax_sky_tp = fig.add_subplot(gs[0, 1])
+    ax_err = fig.add_subplot(gs[0, 1])
     ax_plot = fig.add_subplot(gs[1, :])
 
     t_local = pd.Timestamp(t_utc).tz_localize("UTC").tz_convert(_LOCAL_TZ)
-    t_plus_15 = pd.Timestamp(t_utc) + pd.Timedelta(minutes=15)
-    t_plus_local = t_plus_15.tz_localize("UTC").tz_convert(_LOCAL_TZ)
 
-    for ax, img, title in (
-        (ax_sky_t, sky_img_t, f"Sky at T  {t_local.strftime('%H:%M')} local"),
-        (ax_sky_tp, sky_img_t_plus_15, f"Sky at T+15  {t_plus_local.strftime('%H:%M')} local"),
-    ):
-        ax.set_facecolor("white")
-        if img is None:
-            ax.text(
-                0.5,
-                0.5,
-                "(no sky image)",
-                ha="center",
-                va="center",
-                transform=ax.transAxes,
-                color="#555",
-            )
-        else:
-            ax.imshow(img, interpolation="nearest")
-        ax.set_xticks([])
-        ax.set_yticks([])
-        for s in ax.spines.values():
+    # --- Top-left: sky at T ---
+    ax_sky_t.set_facecolor("white")
+    if sky_img_t is None:
+        ax_sky_t.text(
+            0.5,
+            0.5,
+            "(no sky image)",
+            ha="center",
+            va="center",
+            transform=ax_sky_t.transAxes,
+            color="#555",
+        )
+    else:
+        ax_sky_t.imshow(sky_img_t, interpolation="nearest")
+    ax_sky_t.set_xticks([])
+    ax_sky_t.set_yticks([])
+    for s in ax_sky_t.spines.values():
+        s.set_visible(False)
+    ax_sky_t.set_title(
+        f"Folsom  {date_local_str}  Sky at  {t_local.strftime('%H:%M')} local",
+        fontsize=10,
+    )
+
+    # --- Top-right: cumulative error bars (root-sum-of-squares) ---
+    ax_err.set_facecolor("white")
+    n_bars = len(error_bars)
+    if n_bars == 0:
+        ax_err.text(
+            0.5,
+            0.5,
+            "(no models)",
+            ha="center",
+            va="center",
+            transform=ax_err.transAxes,
+            color="#555",
+        )
+        ax_err.set_xticks([])
+        ax_err.set_yticks([])
+        for s in ax_err.spines.values():
             s.set_visible(False)
-        ax.set_title(f"Folsom  {date_local_str}  {title}", fontsize=10)
+    else:
+        xs = np.arange(n_bars, dtype=np.float64)
+        heights = [float(v) for v, _c, _l in error_bars]
+        colors = [c for _v, c, _l in error_bars]
+        labels = [_short_bar_label(l) for _v, _c, l in error_bars]
+        bar_width = 0.55 if n_bars >= 2 else 0.45
+        ax_err.bar(
+            xs,
+            heights,
+            width=bar_width,
+            color=colors,
+            edgecolor="none",
+            align="center",
+        )
+        # Value labels just above each bar (or inside if near the ceiling).
+        for x, h, color in zip(xs, heights, colors):
+            y_text = h + 0.02 * error_ymax
+            va = "bottom"
+            if y_text > 0.92 * error_ymax:
+                y_text = max(h - 0.03 * error_ymax, 0.02 * error_ymax)
+                va = "top"
+                text_color = "white"
+            else:
+                text_color = color
+            ax_err.text(
+                x,
+                y_text,
+                f"{h:.1f}",
+                ha="center",
+                va=va,
+                fontsize=9,
+                fontweight="bold",
+                color=text_color,
+            )
+        ax_err.set_xlim(-0.6, n_bars - 0.4)
+        ax_err.set_ylim(0.0, error_ymax)
+        ax_err.set_xticks(xs)
+        ax_err.set_xticklabels(labels, fontsize=8)
+        ax_err.set_ylabel("√Σ(err²) (W/m²)", fontsize=9)
+        ax_err.grid(True, color="#dddddd", linewidth=0.6, axis="y")
+        for s in ("top", "right"):
+            ax_err.spines[s].set_visible(False)
+    ax_err.set_title("Cumulative error (rmse)", fontsize=10)
 
+    # --- Bottom: GHI nowcast ---
     ax_plot.set_facecolor("white")
     if cursor_idx + 1 > 0:
         sl = slice(0, cursor_idx + 1)
@@ -224,7 +320,7 @@ def _render_one_frame_dual_sky(
     for s in ("top", "right"):
         ax_plot.spines[s].set_visible(False)
 
-    fig.subplots_adjust(left=0.06, right=0.98, top=0.94, bottom=0.08, hspace=0.32, wspace=0.10)
+    fig.subplots_adjust(left=0.06, right=0.98, top=0.94, bottom=0.08, hspace=0.32, wspace=0.16)
     fig.canvas.draw()
     rgba = np.asarray(fig.canvas.buffer_rgba())
     arr = rgba[..., :3].copy()
@@ -519,7 +615,7 @@ def main() -> int:
         meta = dict(
             date_local=args.date,
             run_label=run_label,
-            layout="dual_sky",
+            layout="sky_cum_error_bars",
             dataset_config=str(args.dataset_config),
             horizon_step_used=0,
             pv_output_len_at_inference=int(_FORCE_PV_OUTPUT_LEN),
@@ -624,7 +720,7 @@ def main() -> int:
         float(np.ceil(hours_local[-1] + xlim_pad)),
     )
 
-    title_plot = f"Our approach (1-step ViT nowcast) — {args.date}"
+    title_plot = f"Our approach — {args.date}"
 
     preds_for_render: list[tuple[np.ndarray, str, str]] = [
         (pred_kw, _MAIN_COLOR, label_main),
@@ -634,6 +730,21 @@ def main() -> int:
     if pred_third_kw is not None:
         preds_for_render.append((pred_third_kw, _THIRD_COLOR, label_third))
 
+    # Precompute cumulative RSS for each model; y-axis uses day-max + headroom.
+    cum_rss_series: list[tuple[np.ndarray, str, str]] = [
+        (_cumulative_rss(values, gt_kw), color, label)
+        for values, color, label in preds_for_render
+    ]
+    peak_cum_rss = 0.0
+    for series, _color, _label in cum_rss_series:
+        if series.size:
+            peak_cum_rss = max(peak_cum_rss, float(np.nanmax(series)))
+    error_ymax = max(_RSS_YLIM_FLOOR, _RSS_YLIM_HEADROOM * peak_cum_rss)
+    print(
+        f"[dual_sky] cum. RSS peak={peak_cum_rss:.2f} W/m²  "
+        f"bar_ylim={error_ymax:.2f} W/m²"
+    )
+
     if args.keep_frames:
         frames_dir.mkdir(parents=True, exist_ok=True)
 
@@ -641,7 +752,10 @@ def main() -> int:
     for i, t in enumerate(grid_utc):
         t_ts = pd.Timestamp(t)
         sky_t = _read_sky_image_for_time(sky_ds, t_ts)
-        sky_tp = _read_sky_image_for_time(sky_ds, t_ts + pd.Timedelta(minutes=15))
+        error_bars = [
+            (float(series[i]), color, label)
+            for series, color, label in cum_rss_series
+        ]
         frame = _render_one_frame_dual_sky(
             t_utc=t_ts,
             hours_local=hours_local,
@@ -649,7 +763,8 @@ def main() -> int:
             preds=preds_for_render,
             cursor_idx=i,
             sky_img_t=sky_t,
-            sky_img_t_plus_15=sky_tp,
+            error_bars=error_bars,
+            error_ymax=error_ymax,
             date_local_str=args.date,
             ymin=ymin,
             ymax=ymax,
@@ -671,13 +786,15 @@ def main() -> int:
     print("\n[dual_sky] === SUMMARY ===")
     print(f"  date_local      : {args.date}")
     print(f"  run_label       : {run_label}")
-    print(f"  layout          : dual_sky (T | T+15 top, GHI bottom)")
+    print(f"  layout          : sky | cum. error bars (RSS, top), GHI (bottom)")
     print(f"  x_axis_ticks    : every integer hour in [{xlim[0]:.0f}, {xlim[1]:.0f}]")
     print(f"  frames          : {len(frames)} @ {args.fps:g} fps")
     print(f"  gif             : {gif_path}  ({gif_size_mb:.2f} MB)")
     print(f"  npz             : {npz_path}")
     print(f"  peak_gt_kw      : {float(np.nanmax(gt_kw)):.2f}")
     print(f"  peak_pred_main  : {float(np.nanmax(pred_kw)):.2f}")
+    for series, _color, label in cum_rss_series:
+        print(f"  final_cum_rss   : {float(series[-1]):.2f} W/m²  ({label})")
 
     return 0
 
