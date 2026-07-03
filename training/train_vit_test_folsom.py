@@ -83,10 +83,10 @@ from models.models import (  # noqa: E402
 _FOLSOM_NWP_TEMPERATURE_INDEX = _FOLSOM_NWP_FEATURE_COLS.index("temperature")
 # ``pv_forecasting_model_vit_imgs`` reads ``nwp_tensor[:, :, 0]`` as shortwave-like and ``[:, :, 2]`` as Kelvin temp.
 _VIT_IMGS_NWP_TEMPERATURE_SLOT = 2
-# Folsom forecast horizon: first 16 output steps (~4 h at 15 min; Folsom uses 15 min output).
-# Capped at 16 (~4 h) to mirror Luoyang; the dataset's ``pv_output_len`` is set to 16 so the
-# model output, loss, and masked RMSE/MAE all cover the same 4 h forecast window.
-_LOSS_METRIC_HORIZON = 16
+# Folsom forecast horizon for loss / val metrics: first output step only (t0+15 min at 15 min cadence).
+# Must match ``sampling.pv_output_len`` in ``conf_folsom.yaml`` so model output, loss, and
+# masked RMSE/MAE all cover the same single-step forecast window.
+_LOSS_METRIC_HORIZON = 1
 
 # Special token in ``--nwp-features`` that toggles the per-step invalid-mask channel
 # (``nwp_tensor[:, :, -1]``); not a real NWP feature so kept out of the features list.
@@ -455,7 +455,7 @@ def evaluate(
     print(
         f"First-{_LOSS_METRIC_HORIZON}-step metrics (masked GHI; pred zeroed at night): "
         f"MAE={mae_wm2:.4f} W/m²  RMSE={rmse_wm2:.4f} W/m²  "
-        f"(~4 h horizon at 15 min)"
+        f"(t0+15 min at 15 min cadence)"
     )
     return mean_loss, rmse_wm2, mae_wm2
 
