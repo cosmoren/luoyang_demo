@@ -1,6 +1,6 @@
 training:
   epochs: 20
-  lr: 5e-4
+  lr: 1e-4
   batch_size: 64
   save_every: 5
   # dataset holds large in-memory caches; each worker forks a full copy,
@@ -9,14 +9,14 @@ training:
   # LR warmup epochs. 0 = no warmup (recommended for finetune);
   # use a few epochs (e.g. 3-5) when training from scratch.
   # CLI --warmup-epochs overrides this value.
-  warmup_epochs: 5
+  warmup_epochs: 0
   # Huber loss delta; larger values behave closer to MSE, smaller to MAE.
   # CLI --huber-delta overrides this value.
-  huber_delta: 35.0
+  huber_delta: 2000
   # null = run every batch in an epoch
   train_max_batches_per_epoch: null
   # freeze TabM head during training/finetune.
   # true  = lock pv_tabm_head (typical finetune with --init-checkpoint)
   # false = train everything (typical training from scratch)
   # CLI --freeze-tabm / --no-freeze-tabm overrides this value.
-  freeze_tabm: false
+  freeze_tabm: true

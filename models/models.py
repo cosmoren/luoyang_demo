@@ -701,10 +701,10 @@ class pv_forecasting_model_vit_imgs(nn.Module):
             n_num_features=2336,
             cat_cardinalities=None,
             d_out=1,
-            n_blocks=2,
-            d_block=64,
+            n_blocks=3,
+            d_block=512,
             dropout=dropout,
-            k=1,
+            k=32,
             arch_type="tabm",
             start_scaling_init="normal",
         )
@@ -805,14 +805,9 @@ class pv_forecasting_model_vit_imgs(nn.Module):
 
         self.pv_tabm_preoutput_features = None
         tabm_out = self.pv_tabm_head(x_num=x_num, x_cat=None)  # [B, K, 1]
-        # self.pv_tabm_preoutput_features is captured by hook on self.pv_tabm_head.output
-        if self.pv_tabm_preoutput_features is None:
-            raise RuntimeError("pv_tabm_preoutput_features hook capture failed.")
-        tabm_summary_feature = self.pv_tabm_preoutput_features  # [B,1,64]
-        tabm_summary_token = tabm_summary_feature + self.tabm_mod_embed
         kt_tabm = tabm_out.mean(dim=1)  # [B, 1]
 
-        return kt_tabm  # [B, 1] — keep dim so pv_pred = kt * target_p_cs * p_mean is [B, 1]
+        # return kt_tabm  # [B, 1] — keep dim so pv_pred = kt * target_p_cs * p_mean is [B, 1]
 
         # Forecast queries: Luoyang total variant only uses two NWP channels:
         # ssrd (idx=0) and t2m (idx=2), where nwp_tensor layout is
@@ -935,6 +930,7 @@ class pv_forecasting_model_vit_imgs(nn.Module):
 
             sky_timefeats_48_hd = self.time_mlp(sky_timefeats_48)
             sky_compressed = sky_compressed + sky_timefeats_48_hd
+            sky_compressed = torch.nan_to_num(sky_compressed, nan=0.0, posinf=0.0, neginf=0.0)
 
             sky_mask = torch.ones(B, 48, device=pv.device, dtype=pv.dtype)
 
@@ -945,14 +941,21 @@ class pv_forecasting_model_vit_imgs(nn.Module):
             sky_compressed = sky_compressed * skimg_valid_mask.unsqueeze(2)
             sky_mask = sky_mask * skimg_valid_mask
 
-        tabm_mask = torch.ones(B, tabm_summary_token.shape[1], device=pv.device, dtype=pv.dtype)
+        # tabm_mask = torch.ones(B, tabm_summary_token.shape[1], device=pv.device, dtype=pv.dtype)
         hist_mem_compressed = torch.cat(
-            [tabm_summary_token, sat_compressed, sky_compressed], dim=1
+            [sat_compressed, sky_compressed], dim=1
         )
-        key_value_mask = torch.cat([tabm_mask, sat_mask, sky_mask], dim=1)
+        key_value_mask = torch.cat([sat_mask, sky_mask], dim=1)
 
-
-        forecast_pv_features = self.cross_attention_pv(query=forecast_query[:,2:3,:], key=hist_mem_compressed, value=hist_mem_compressed, key_value_mask=key_value_mask)
+        # Per-sample handling of all-masked rows: an all-masked row makes the
+        # attention softmax all -inf → NaN for that sample. Give those rows a
+        # dummy all-valid mask to keep the math finite, then zero their
+        # residual so samples without sat/sky contribute delta_kt = 0.
+        row_has_valid = (key_value_mask.sum(dim=1, keepdim=True) > 0).to(pv.dtype)  # [B,1]
+        safe_mask = torch.where(
+            row_has_valid.bool(), key_value_mask, torch.ones_like(key_value_mask)
+        )
+        forecast_pv_features = self.cross_attention_pv(query=forecast_query[:,-1:,:], key=hist_mem_compressed, value=hist_mem_compressed, key_value_mask=safe_mask)
 
         # Inverter features (embeddings)
         inverter_features = self.inverter_embedding(device_id).unsqueeze(1).repeat(1, forecast_pv_features.shape[1], 1)
@@ -960,9 +963,9 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         # Fuse and predict
         fused = torch.cat([forecast_pv_features, inverter_features], dim=2)
         pv_feats = self.pv_feats_head(fused)
-        delta_kt= self.fc(pv_feats)
+        delta_kt = self.fc(pv_feats) * row_has_valid.unsqueeze(2)  # [B,1,1]
 
-        kt = kt_tabm + delta_kt
+        kt = kt_tabm.unsqueeze(1) + delta_kt # [B,1,1]
 
         return kt.squeeze(-1)
 

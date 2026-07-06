@@ -1,9 +1,9 @@
 paths:
-  data_dir: "/home/hw1/datasets/luoyang_2026_SPMF"
+  data_dir: "/shared_work/yuan/datasets/luoyang_2026_SPMF"
   pv_path: pv
   pv_total_path: pv_total.csv
   sky_image_path: luoyangASI_skimg_zarr
-  sat_path: luoyang_sat_zarr1
+  sat_path: luoyang_sat_zarr
   nwp_path: NWP
 
 sampling:

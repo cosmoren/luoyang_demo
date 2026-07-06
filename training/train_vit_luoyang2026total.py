@@ -183,6 +183,18 @@ class ModelEMA:
     def state_dict(self) -> dict[str, torch.Tensor]:
         return self.shadow
 
+    def full_state_dict(self, model: nn.Module) -> dict[str, torch.Tensor]:
+        """Complete state dict for checkpointing: model state with EMA weights overlaid.
+
+        The shadow alone only holds floating-point entries, so saving it directly
+        produces a state dict that fails strict ``load_state_dict`` (missing
+        non-float buffers such as BatchNorm ``num_batches_tracked``).
+        """
+        sd = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        for k, v in self.shadow.items():
+            sd[k] = v.detach().clone().to(sd[k].dtype)
+        return sd
+
 
 @dataclass
 class TaskMetrics:
@@ -259,6 +271,16 @@ def train_one_epoch_task(
 
         pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
         loss, _, _, _ = _task_loss_and_vectors(pv_pred, d["target_pv"], criterion, task)
+        if torch.isnan(loss) and not getattr(train_one_epoch_task, "_nan_reported", False):
+            train_one_epoch_task._nan_reported = True
+            print(
+                f"\n[NaN-debug] batch={batch_idx} "
+                f"kt_pred={torch.isnan(kt_pred).any().item()} "
+                f"target_p_cs={torch.isnan(d['target_p_cs']).any().item()} "
+                f"p_mean={torch.isnan(d['p_mean']).any().item()} "
+                f"target_pv={torch.isnan(d['target_pv']).any().item()} "
+                f"sky_valid={float(d['skimg_valid_mask'].sum().item()) if isinstance(d.get('skimg_valid_mask'), torch.Tensor) else 'NA'}"
+            )
         loss.backward()
         optimizer.step()
         if ema is not None:
@@ -276,7 +298,7 @@ def train_one_epoch_task(
         sys.stdout.write(
             f"\r[train] iter {done}/{total_iters} "
             f"({100.0 * done / max(total_iters, 1):5.1f}%) "
-            f"loss={float(loss.item()):.4f} "
+            f"avg_loss={total_loss / max(total_samples, 1):.4f} "
             f"eta={eta_sec:6.1f}s"
         )
         sys.stdout.flush()
@@ -312,8 +334,10 @@ def evaluate_task(
         if pv_output_interval_min is not None
         else None
     )
+    total_batches = len(loader)
+    t0 = time.time()
     with torch.no_grad():
-        for batch in loader:
+        for batch_idx, batch in enumerate(loader):
             d = _batch_to_device(batch, device)
             bsz = int(d["device_id"].size(0))
             kt_pred = forward_vit(model, d)
@@ -321,6 +345,17 @@ def evaluate_task(
             loss, pred_np, tgt_np, used_idx = _task_loss_and_vectors(pv_pred, d["target_pv"], criterion, task)
             total_loss += float(loss.item()) * bsz
             total_samples += bsz
+            done = batch_idx + 1
+            elapsed = max(time.time() - t0, 1e-6)
+            eta_sec = max(total_batches - done, 0) / max(done / elapsed, 1e-6)
+            avg_loss = total_loss / max(total_samples, 1)
+            sys.stdout.write(
+                f"\r[eval]  iter {done}/{total_batches} "
+                f"({100.0 * done / max(total_batches, 1):5.1f}%) "
+                f"avg_loss={avg_loss:.4f} "
+                f"eta={eta_sec:6.1f}s"
+            )
+            sys.stdout.flush()
             pred_list.append(pred_np)
             tgt_list.append(tgt_np)
             if collect_records:
@@ -439,11 +474,17 @@ def _build_parser(h: dict, config_default: str, dataset_default: str) -> argpars
         default=None if mb is None else int(mb),
     )
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--warmup-epochs", type=int, default=5)
+    parser.add_argument("--warmup-epochs", type=int, default=int(h.get("warmup_epochs", 0)))
     parser.add_argument("--lr-min", type=float, default=1e-6)
+    parser.add_argument("--huber-delta", type=float, default=float(h.get("huber_delta", 35.0)))
     parser.add_argument("--checkpoint_dir", type=str, default=None)
     parser.add_argument("--init-checkpoint", type=str, default=None)
     parser.add_argument("--resume-checkpoint", type=str, default=None)
+    # TabM freeze switch. Default comes from the training config (training.freeze_tabm);
+    # CLI flags override the config value.
+    parser.add_argument("--freeze-tabm", dest="freeze_tabm", action="store_true")
+    parser.add_argument("--no-freeze-tabm", dest="freeze_tabm", action="store_false")
+    parser.set_defaults(freeze_tabm=bool(h.get("freeze_tabm", False)))
     parser.add_argument("--use-ema", dest="use_ema", action="store_true")
     parser.add_argument("--no-ema", dest="use_ema", action="store_false")
     parser.set_defaults(use_ema=False)
@@ -521,7 +562,8 @@ def main() -> None:
     print(
         f"[startup] task={args.task} config={args.config} dataset_config={args.dataset_config} "
         f"epochs={args.epochs} batch_size={args.batch_size} "
-        f"nwp_dropout={args.nwp_dropout_prob} nwp_history_dropout={args.nwp_history_dropout_prob}"
+        f"nwp_dropout={args.nwp_dropout_prob} nwp_history_dropout={args.nwp_history_dropout_prob} "
+        f"freeze_tabm={args.freeze_tabm} huber_delta={args.huber_delta}"
     )
     if args.init_checkpoint and args.resume_checkpoint:
         raise ValueError("Use only one of --init-checkpoint or --resume-checkpoint.")
@@ -554,7 +596,7 @@ def main() -> None:
         warmup_epochs=args.warmup_epochs,
         lr_min=args.lr_min,
     )
-    criterion = nn.HuberLoss(delta=35.0)
+    criterion = nn.HuberLoss(delta=args.huber_delta)
     ema: ModelEMA | None = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
     print(
         f"EMA: {'enabled' if args.use_ema else 'disabled'}"
@@ -585,6 +627,19 @@ def main() -> None:
         ckpt = torch.load(init_path, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"])
         print(f"Initialized model weights from {init_path}")
+
+    if args.freeze_tabm:
+        if not (args.resume_checkpoint or args.init_checkpoint):
+            print(
+                "[startup] WARNING: freeze_tabm=True without init/resume checkpoint; "
+                "TabM will stay at random init and never train."
+            )
+        for param in model.pv_tabm_head.parameters():
+            param.requires_grad = False
+        n_frozen = sum(p.numel() for p in model.pv_tabm_head.parameters())
+        print(f"[startup] TabM frozen: {n_frozen:,} params locked (requires_grad=False)")
+    else:
+        print("[startup] TabM trainable (freeze_tabm=False)")
 
     persistent = args.num_workers > 0
     print(
@@ -685,7 +740,7 @@ def main() -> None:
 
         if val_metrics.rmse < best_val_rmse:
             best_val_rmse = val_metrics.rmse
-            best_state = ema.state_dict() if ema_active else model.state_dict()
+            best_state = ema.full_state_dict(model) if ema_active else model.state_dict()
             torch.save(
                 {
                     "epoch": epoch,
@@ -703,7 +758,7 @@ def main() -> None:
             )
 
     final_path = checkpoint_dir / f"pv_forecast_vit_final_{suffix}.pt"
-    final_state = ema.state_dict() if ema is not None else model.state_dict()
+    final_state = ema.full_state_dict(model) if ema is not None else model.state_dict()
     torch.save(
         {
             "epoch": args.epochs,
@@ -718,8 +773,13 @@ def main() -> None:
     )
     print(f"Saved final checkpoint to {final_path}")
 
-    if best_ckpt_path.is_file():
-        ckpt = torch.load(best_ckpt_path, map_location=device)
+    # Evaluate both the best-val and final checkpoints on the test set,
+    # exporting one prediction CSV per checkpoint.
+    for tag, ckpt_path in (("best", best_ckpt_path), ("final", final_path)):
+        if not ckpt_path.is_file():
+            print(f"No {ckpt_path.name} on disk; skip {tag} test evaluation.")
+            continue
+        ckpt = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"])
         test_metrics, test_records = evaluate_task(
             model,
@@ -731,10 +791,10 @@ def main() -> None:
             pv_output_interval_min=test_dataset.pv_output_interval_min,
         )
         print(
-            f"Best checkpoint ({best_ckpt_path.name}, epoch={ckpt.get('epoch', '?')}): "
+            f"{tag.capitalize()} checkpoint ({ckpt_path.name}, epoch={ckpt.get('epoch', '?')}): "
             f"test_loss={test_metrics.loss:.6f}, test_rmse={test_metrics.rmse:.6f}, test_mae={test_metrics.mae:.6f}"
         )
-        pred_path = checkpoint_dir / f"pv_forecast_vit_test_predictions_{suffix}.csv"
+        pred_path = checkpoint_dir / f"pv_forecast_vit_test_predictions_{suffix}_{tag}.csv"
         ts_utc = pd.to_datetime(test_records["timestamp_utc"], utc=True)
         ts_bj = ts_utc.tz_convert("Asia/Shanghai")
         range_end_bj = pd.Timestamp("2026-06-11 23:55:00", tz="Asia/Shanghai")
@@ -764,13 +824,11 @@ def main() -> None:
             bj_min = "N/A"
             bj_max = "N/A"
         print(
-            f"Saved test predictions to {pred_path} "
+            f"Saved {tag} test predictions to {pred_path} "
             f"(rows={len(pred_df)}, task={args.task}, bj_range=[{bj_min} -> {bj_max}])"
         )
-        writer.add_scalar("metric/test_rmse", test_metrics.rmse, args.epochs)
-        writer.add_scalar("metric/test_mae", test_metrics.mae, args.epochs)
-    else:
-        print(f"No {best_ckpt_path.name} on disk; skip best-checkpoint test evaluation.")
+        writer.add_scalar(f"metric/test_rmse_{tag}", test_metrics.rmse, args.epochs)
+        writer.add_scalar(f"metric/test_mae_{tag}", test_metrics.mae, args.epochs)
     writer.close()
 
 
