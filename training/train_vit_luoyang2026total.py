@@ -38,7 +38,14 @@ _DEFAULT_DATASET_CONF_NAME = "conf_luoyang_2026.yaml"
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from dataloader.luoyang_2026total_zarr import PVDataset, collate_batched
-from models.models import pv_forecasting_model_vit_imgs
+import inspect
+import models.models as _models_module
+
+_MODEL_REGISTRY: dict[str, type] = {
+    name: cls
+    for name, cls in inspect.getmembers(_models_module, inspect.isclass)
+    if issubclass(cls, torch.nn.Module) and cls.__module__ == _models_module.__name__
+}
 
 # For point tasks, keep index mapping only as legacy fallback when target has multiple steps.
 # If dataloader already outputs a single future point (pv_output_len=1), we always supervise index 0.
@@ -493,6 +500,13 @@ def _build_parser(h: dict, config_default: str, dataset_default: str) -> argpars
     parser.add_argument("--max-files", type=int, default=None)
     parser.add_argument("--nwp-dropout-prob", type=float, default=0.0)
     parser.add_argument("--nwp-history-dropout-prob", type=float, default=0.0)
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="pv_forecasting_model_vit_imgs",
+        choices=list(_MODEL_REGISTRY),
+        help="Model class name to instantiate",
+    )
     return parser
 
 
@@ -578,8 +592,9 @@ def main() -> None:
     dev_dn_list = train_dataset.devDn_list
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[startup] Initializing model/optimizer on device={device}...")
-    model = pv_forecasting_model_vit_imgs(
+    model_cls = _MODEL_REGISTRY[args.model]
+    print(f"[startup] Initializing model/optimizer on device={device}, model={args.model}...")
+    model = model_cls(
         dev_dn_list=dev_dn_list,
         nwp_dropout_prob=args.nwp_dropout_prob,
         nwp_history_dropout_prob=args.nwp_history_dropout_prob,
@@ -625,7 +640,11 @@ def main() -> None:
         if not init_path.is_file():
             raise FileNotFoundError(f"init checkpoint not found: {init_path}")
         ckpt = torch.load(init_path, map_location=device)
-        model.load_state_dict(ckpt["model_state_dict"])
+        missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        if missing:
+            print(f"[init_checkpoint] missing keys (will use current init): {missing}")
+        if unexpected:
+            print(f"[init_checkpoint] unexpected keys (ignored): {unexpected}")
         print(f"Initialized model weights from {init_path}")
 
     if args.freeze_tabm:

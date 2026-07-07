@@ -1,7 +1,7 @@
 training:
-  epochs: 20
+  epochs: 5
   lr: 1e-4
-  batch_size: 64
+  batch_size: 32
   save_every: 5
   # dataset holds large in-memory caches; each worker forks a full copy,
   # so num_workers > 0 can easily OOM the node. Keep 0 unless memory allows.

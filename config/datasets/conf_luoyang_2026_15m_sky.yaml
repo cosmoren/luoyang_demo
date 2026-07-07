@@ -1,9 +1,9 @@
 paths:
-  data_dir: "/shared_work/yuan/datasets/luoyang_2026_SPMF"
+  data_dir: "/home/hw1/datasets/luoyang_2026_SPMF"
   pv_path: pv
   pv_total_path: pv_total.csv
   sky_image_path: luoyangASI_skimg_zarr
-  sat_path: luoyang_sat_zarr
+  sat_path: luoyang_sat_zarr1
   nwp_path: NWP
 
 sampling:
@@ -14,7 +14,7 @@ sampling:
   pv_output_interval_min: 15
   pv_output_len: 1
   test_anchor_stride_min: 5
-  val_anchor_stride_min: 5
+  val_anchor_stride_min: 30
   test_collect_time_match_tolerance_min: 0
   skyimg_window_size: 30
   skyimg_time_resolution_min: 1
@@ -23,5 +23,5 @@ sampling:
 
 split_policy:
   test_start_bj: "2026-05-11 00:00:00"
-  train_fraction: 0.85
-  val_fraction: 0.15
+  train_fraction: 0.2
+  val_fraction: 0.8
