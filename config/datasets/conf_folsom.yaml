@@ -13,7 +13,7 @@ paths:
   nwp_path: NWP
 
 sampling:
-  train_epoch_len: 20000 # number of anchors per training epoch
+  train_epoch_len: 25000 # number of anchors per training epoch
   csv_interval_min: 1
   pv_input_interval_min: 5
   pv_input_len: 576

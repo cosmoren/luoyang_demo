@@ -547,7 +547,7 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--warmup-epochs",
         type=int,
-        default=5,
+        default=4,
         help="Linear LR warmup in epoch units before cosine decay (0 = no warmup).",
     )
     parser.add_argument(
