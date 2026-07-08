@@ -231,9 +231,8 @@ def _build_folsom_dataset_for_inference(
     sky_zarr: Path,
     dataset_config: str = _DEFAULT_DATASET_CONFIG,
     ray_map: bool | None = None,
-    sun_mask: bool | None = None,
-    sky_disc_mask: str | None = None,
-    sky_disc_mask_radius_px: float | None = None,
+    sun_mask: str | None = None,
+    sky_mask: str | None = None,
 ) -> tuple[Any, dict[str, str]]:
     """Construct a FolsomIrradianceDataset with the given pv_output_len override.
 
@@ -250,9 +249,7 @@ def _build_folsom_dataset_for_inference(
     from training.train_vit_test_folsom import (
         _dataset_kwargs,
         _load_yaml,
-        _resolve_sky_channels,
-        _resolve_sky_disc_mask_mode,
-        _resolve_sky_disc_mask_radius_px,
+        _sky_knob_overrides,
     )
 
     sky_zarr = Path(sky_zarr).expanduser().resolve()
@@ -260,19 +257,10 @@ def _build_folsom_dataset_for_inference(
     if not sky_zarr.is_dir():
         raise FileNotFoundError(f"model sky zarr not found: {sky_zarr}")
 
-    sky_channels_override = _resolve_sky_channels(dataset_config, ray_map, sun_mask)
-    sky_disc_mask_mode_override = _resolve_sky_disc_mask_mode(
-        dataset_config, sky_disc_mask
-    )
-    sky_disc_mask_radius_px_override = _resolve_sky_disc_mask_radius_px(
-        dataset_config, sky_disc_mask_radius_px
-    )
     ds_kwargs = _dataset_kwargs(
         dataset_config,
         "train",
-        sky_channels_override=sky_channels_override,
-        sky_disc_mask_mode_override=sky_disc_mask_mode_override,
-        sky_disc_mask_radius_px_override=sky_disc_mask_radius_px_override,
+        **_sky_knob_overrides(dataset_config, ray_map, sun_mask, sky_mask),
     )
     ds_kwargs["pv_output_len"] = int(pv_output_len)
     ds_kwargs["skyimg_dir"] = str(sky_zarr)
@@ -383,7 +371,7 @@ def _run_model_on_anchors(
             f"Dataset sky_in_channels={getattr(ds, 'sky_in_channels', 3)} but "
             f"checkpoint {checkpoint_path.name} expects {sky_in_channels}. "
             f"Rebuild the dataset with matching --ray-map / --sun-mask / "
-            f"--sky-disc-mask flags for this checkpoint."
+            f"--sky-mask flags for this checkpoint."
         )
 
     model = pv_forecasting_model_vit_imgs(
@@ -752,31 +740,25 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--ray-map-third",
         dest="ray_map_third",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=None,
         help="Build the third-model dataset with fisheye ray_map sky channels.",
     )
     p.add_argument(
         "--sun-mask-third",
         dest="sun_mask_third",
-        action="store_true",
-        default=None,
-        help="Build the third-model dataset with per-frame sun_mask sky channel.",
-    )
-    p.add_argument(
-        "--sky-disc-mask-third",
         type=str,
         default=None,
-        choices=[
-            "none",
-            "valid_disc",
-            "tight_disc",
-            "sun_halo",
-            "sun_only",
-            "manual_loose",
-            "manual_tight",
-        ],
-        help="Sky-disc gating mode for the third-model dataset (matches training).",
+        choices=["none", "sun_only", "sun_halo"],
+        help="Sun_mask mode for the third-model dataset: none|sun_only|sun_halo.",
+    )
+    p.add_argument(
+        "--sky-mask-third",
+        dest="sky_mask_third",
+        type=str,
+        default=None,
+        choices=["none", "loose", "tight", "valid_disc"],
+        help="RGB sky-disc gating mode for the third-model dataset (matches training).",
     )
     p.add_argument(
         "--label-gt",
@@ -1057,31 +1039,31 @@ def main() -> int:
                 int(ds.sky_in_channels) != need_sky_ch
                 or args.ray_map_third is not None
                 or args.sun_mask_third is not None
-                or args.sky_disc_mask_third is not None
+                or args.sky_mask_third is not None
             ):
                 ray_map_third = args.ray_map_third
                 sun_mask_third = args.sun_mask_third
                 if ray_map_third is None and sun_mask_third is None:
                     if need_sky_ch == 4:
-                        sun_mask_third = True
+                        sun_mask_third = "sun_halo"
                     elif need_sky_ch == 6:
                         ray_map_third = True
                     elif need_sky_ch == 7:
                         ray_map_third = True
-                        sun_mask_third = True
+                        sun_mask_third = "sun_halo"
                 ds_third, _ = _build_folsom_dataset_for_inference(
                     _FORCE_PV_OUTPUT_LEN,
                     sky_zarr=sky_zarr_path,
                     dataset_config=str(args.dataset_config),
                     ray_map=ray_map_third,
                     sun_mask=sun_mask_third,
-                    sky_disc_mask=args.sky_disc_mask_third,
+                    sky_mask=args.sky_mask_third,
                 )
                 if int(ds_third.sky_in_channels) != need_sky_ch:
                     raise RuntimeError(
                         f"Third checkpoint expects sky_in_channels={need_sky_ch} but "
                         f"built dataset has {ds_third.sky_in_channels}. Pass matching "
-                        f"--ray-map-third / --sun-mask-third / --sky-disc-mask-third."
+                        f"--ray-map-third / --sun-mask-third / --sky-mask-third."
                     )
                 print(
                     f"[animate] third-model dataset sky_channels="

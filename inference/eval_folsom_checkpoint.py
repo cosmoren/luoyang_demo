@@ -21,10 +21,10 @@ Example invocations (run after activating the training env; metrics only, no NPZ
       --checkpoint checkpoints_folsom_pv/folsom_pv_forecast_vit_best_gpu0.pt \\
       --output-dir inference_results/eval_best_gpu0
 
-  # Sky-branch extras must match training (CLI > YAML):
+  # Sky-branch knobs must match training (CLI > YAML):
   python inference/eval_folsom_checkpoint.py \\
       --checkpoint .../folsom_pv_forecast_vit_best_gpu0.pt \\
-      --ray-map --sun-mask --sun-mask-radius-deg 20
+      --ray-map --sun-mask sun_halo --sky-mask valid_disc
 """
 
 from __future__ import annotations
@@ -60,12 +60,9 @@ from training.train_vit_test_folsom import (  # noqa: E402
     _load_yaml,
     _parse_nwp_features,
     _resolve_named_config,
-    _resolve_sky_channels,
-    _resolve_sky_disc_mask_mode,
-    _resolve_sky_disc_mask_radius_px,
-    _resolve_sun_mask_radius_deg,
     _resolve_use_satellite,
     _seed_worker,
+    _sky_knob_overrides,
     evaluate,
     resolve_nwp_features_from_ckpt,
 )
@@ -242,45 +239,27 @@ def _build_parser(h: dict) -> argparse.ArgumentParser:
     parser.add_argument(
         "--ray-map",
         dest="ray_map",
-        action="store_true",
-        help="Add fisheye ray_map sky channels (overrides YAML sky_channels when set).",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Add fisheye ray_map sky channels (CLI > YAML sampling.ray_map > false).",
     )
     parser.add_argument(
         "--sun-mask",
         dest="sun_mask",
-        action="store_true",
-        help="Add per-frame sun_mask sky channel (overrides YAML sky_channels when set).",
-    )
-    parser.set_defaults(ray_map=None, sun_mask=None)
-    parser.add_argument(
-        "--sun-mask-radius-deg",
-        type=float,
-        default=None,
-        metavar="DEG",
-        help="Sun-mask disc radius in degrees (CLI > YAML > dataloader default).",
-    )
-    parser.add_argument(
-        "--sky-disc-mask",
         type=str,
         default=None,
-        choices=[
-            "none",
-            "valid_disc",
-            "tight_disc",
-            "sun_halo",
-            "sun_only",
-            "manual_loose",
-            "manual_tight",
-        ],
+        choices=["none", "sun_only", "sun_halo"],
         metavar="MODE",
-        help="Sky-disc gating mode (CLI > YAML > none).",
+        help="Sun_mask channel: none|sun_only|sun_halo (CLI > YAML sampling.sun_mask > none).",
     )
     parser.add_argument(
-        "--sky-disc-mask-radius-px",
-        type=float,
+        "--sky-mask",
+        dest="sky_mask",
+        type=str,
         default=None,
-        metavar="PX",
-        help="Disc radius in pixels at 224×224 for the active sky-disc mask mode.",
+        choices=["none", "loose", "tight", "valid_disc"],
+        metavar="MODE",
+        help="RGB sky-disc gating: none|loose|tight|valid_disc (CLI > YAML sampling.sky_mask > none).",
     )
     return parser
 
@@ -308,22 +287,9 @@ def main() -> None:
 
     dataset_cfg = args.dataset_config
     use_satellite = _resolve_use_satellite(dataset_cfg, args.use_satellite)
-    sky_channels_override = _resolve_sky_channels(dataset_cfg, args.ray_map, args.sun_mask)
-    sun_mask_radius_deg_override = _resolve_sun_mask_radius_deg(
-        dataset_cfg, args.sun_mask_radius_deg
-    )
-    sky_disc_mask_mode_override = _resolve_sky_disc_mask_mode(
-        dataset_cfg, args.sky_disc_mask
-    )
-    sky_disc_mask_radius_px_override = _resolve_sky_disc_mask_radius_px(
-        dataset_cfg, args.sky_disc_mask_radius_px
-    )
     _ds_kw = dict(
         use_satellite_override=use_satellite,
-        sky_channels_override=sky_channels_override,
-        sun_mask_radius_deg_override=sun_mask_radius_deg_override,
-        sky_disc_mask_mode_override=sky_disc_mask_mode_override,
-        sky_disc_mask_radius_px_override=sky_disc_mask_radius_px_override,
+        **_sky_knob_overrides(dataset_cfg, args.ray_map, args.sun_mask, args.sky_mask),
     )
 
     ds_kwargs = _dataset_kwargs(dataset_cfg, "test", **_ds_kw)

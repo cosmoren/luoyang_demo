@@ -351,28 +351,22 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--ray-map-third",
         dest="ray_map_third",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=None,
     )
     p.add_argument(
         "--sun-mask-third",
         dest="sun_mask_third",
-        action="store_true",
-        default=None,
-    )
-    p.add_argument(
-        "--sky-disc-mask-third",
         type=str,
         default=None,
-        choices=[
-            "none",
-            "valid_disc",
-            "tight_disc",
-            "sun_halo",
-            "sun_only",
-            "manual_loose",
-            "manual_tight",
-        ],
+        choices=["none", "sun_only", "sun_halo"],
+    )
+    p.add_argument(
+        "--sky-mask-third",
+        dest="sky_mask_third",
+        type=str,
+        default=None,
+        choices=["none", "loose", "tight", "valid_disc"],
     )
     p.add_argument("--label-gt", type=str, default="GT")
     p.add_argument("--stride-min", type=int, default=15)
@@ -538,25 +532,25 @@ def main() -> int:
                 int(ds.sky_in_channels) != need_sky_ch
                 or args.ray_map_third is not None
                 or args.sun_mask_third is not None
-                or args.sky_disc_mask_third is not None
+                or args.sky_mask_third is not None
             ):
                 ray_map_third = args.ray_map_third
                 sun_mask_third = args.sun_mask_third
                 if ray_map_third is None and sun_mask_third is None:
                     if need_sky_ch == 4:
-                        sun_mask_third = True
+                        sun_mask_third = "sun_halo"
                     elif need_sky_ch == 6:
                         ray_map_third = True
                     elif need_sky_ch == 7:
                         ray_map_third = True
-                        sun_mask_third = True
+                        sun_mask_third = "sun_halo"
                 ds_third, _ = _build_folsom_dataset_for_inference(
                     _FORCE_PV_OUTPUT_LEN,
                     sky_zarr=sky_zarr_path,
                     dataset_config=str(args.dataset_config),
                     ray_map=ray_map_third,
                     sun_mask=sun_mask_third,
-                    sky_disc_mask=args.sky_disc_mask_third,
+                    sky_mask=args.sky_mask_third,
                 )
                 if int(ds_third.sky_in_channels) != need_sky_ch:
                     raise RuntimeError(

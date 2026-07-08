@@ -43,8 +43,10 @@ resolves per-frame ``.npy`` shards under ``<data_dir>/<paths.sat_path>/YYYY/MM/`
 emits real tensors. The model accepts both: ``models/models.py`` zero-paths the sat arm
 when ``sat_tensor is None`` (or its max is 0).
 
-Sky imagery: ``paths.sky_format`` is ``jpg`` (default; ``YYYYMMDDHHMMSS.jpg`` under ``paths.sky_image_path``)
-or ``zarr`` (``xr.open_zarr`` on that path; see ``config/datasets/conf_folsom.yaml``). Naive CSV times are read as **UTC**.
+Sky imagery: auto-detected from the resolved ``paths.sky_image_path`` folder — ``jpg`` when it holds
+``YYYYMMDDHHMMSS.jpg`` files, ``zarr`` when it is a Zarr store (``.zarr`` suffix or Zarr metadata /
+``images`` / ``time_utc`` subgroups). Set ``paths.sky_format`` explicitly to override. Naive CSV times
+are read as **UTC**.
 """
 
 import argparse
@@ -88,10 +90,11 @@ from SPMF_preprocessing.fisheye_calib.sky_disc_mask import (
 )
 
 # Sky-branch channel-selection abstraction (Folsom only, for now). The dataset YAML
-# may set ``sampling.sky_channels`` to a list of feature names; the resulting
-# ``skimg_tensor`` concatenates each feature along the channel dim in list order.
-# Default (key absent or ``["rgb"]``) is byte-identical to the historical 3-channel
-# behavior.
+# exposes 3 knobs under ``sampling:`` (``ray_map`` / ``sun_mask`` / ``sky_mask``); see
+# ``sky_knobs_to_internal``, which translates them into the internal ``sky_channels``
+# list. The resulting ``skimg_tensor`` concatenates each feature along the channel dim
+# in canonical order (rgb, ray_map, sun_mask). Default (all knobs off) is byte-identical
+# to the historical 3-channel behavior.
 #
 # Fisheye geometry conventions (training + inference share the same rules):
 #   * Training RGB: raw, unflipped Folsom JPGs resized to ``skyimg_spatial_size`` (224).
@@ -156,6 +159,95 @@ def _normalize_sky_channels(raw: Any) -> tuple[str, ...]:
 
 def _sky_in_channels(channels: tuple[str, ...]) -> int:
     return int(sum(_SKY_CHANNEL_WIDTHS[c] for c in channels))
+
+
+# Public sky-branch config surface (3 knobs, replacing the raw ``sky_channels`` /
+# ``sky_disc_mask_mode`` / ``sun_mask_radius_deg`` / ``sky_disc_mask_radius_px`` keys):
+#   * ``ray_map``  (bool)                      -> add the ray_map channel (3ch)
+#   * ``sun_mask`` (none|sun_only|sun_halo)    -> add the sun_mask channel (1ch) + radius preset
+#   * ``sky_mask`` (none|loose|tight|valid_disc) -> RGB sky-disc gating mode
+# ``sky_knobs_to_internal`` translates these into the constructor's internal
+# ``sky_channels`` / ``sun_mask_radius_deg`` / ``sky_disc_mask_mode`` representation.
+_SUN_MASK_MODES: tuple[str, ...] = ("none", "sun_only", "sun_halo")
+# Angular radius presets (degrees) for the sun_mask channel per ``sun_mask`` mode.
+# ``sun_halo`` keeps the historical wide default; ``sun_only`` is a tight disc.
+_SUN_MASK_RADIUS_DEG_PRESETS: dict[str, float] = {
+    "sun_only": 10.0,
+    "sun_halo": _DEFAULT_SUN_MASK_RADIUS_DEG,
+}
+_SKY_MASK_MODES: tuple[str, ...] = ("none", "loose", "tight", "valid_disc")
+_SKY_MASK_TO_DISC_MODE: dict[str, str] = {
+    "none": "none",
+    "loose": "manual_loose",
+    "tight": "manual_tight",
+    "valid_disc": "valid_disc",
+}
+
+
+def normalize_ray_map(raw: Any) -> bool:
+    """Validate + canonicalize the ``ray_map`` knob to a bool (default ``False``)."""
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        v = raw.strip().lower()
+        if v in ("true", "1", "yes", "on"):
+            return True
+        if v in ("false", "0", "no", "off"):
+            return False
+    raise ValueError(f"ray_map must be a boolean, got {raw!r}")
+
+
+def normalize_sun_mask(raw: Any) -> str:
+    """Validate + canonicalize the ``sun_mask`` knob (default ``'none'``)."""
+    if raw is None:
+        return "none"
+    mode = str(raw).strip()
+    if mode not in _SUN_MASK_MODES:
+        raise ValueError(
+            f"sun_mask must be one of {list(_SUN_MASK_MODES)}, got {raw!r}"
+        )
+    return mode
+
+
+def normalize_sky_mask(raw: Any) -> str:
+    """Validate + canonicalize the ``sky_mask`` knob (default ``'none'``)."""
+    if raw is None:
+        return "none"
+    mode = str(raw).strip()
+    if mode not in _SKY_MASK_MODES:
+        raise ValueError(
+            f"sky_mask must be one of {list(_SKY_MASK_MODES)}, got {raw!r}"
+        )
+    return mode
+
+
+def sky_knobs_to_internal(
+    ray_map: Any,
+    sun_mask: Any,
+    sky_mask: Any,
+) -> tuple[tuple[str, ...], float | None, str]:
+    """Translate the 3 public sky knobs into the internal constructor representation.
+
+    Returns ``(sky_channels, sun_mask_radius_deg, sky_disc_mask_mode)``:
+      * ``sky_channels`` = ``("rgb",)`` + ``("ray_map",)`` if ``ray_map`` +
+        ``("sun_mask",)`` if ``sun_mask != 'none'`` (canonical order preserved).
+      * ``sun_mask_radius_deg`` = preset for the mode (``None`` when ``sun_mask`` is
+        ``'none'`` — the channel is absent so the radius is unused).
+      * ``sky_disc_mask_mode`` = mapping of ``sky_mask`` onto the existing modes.
+    """
+    ray_map_on = normalize_ray_map(ray_map)
+    sun_mask_mode = normalize_sun_mask(sun_mask)
+    sky_mask_mode = normalize_sky_mask(sky_mask)
+    channels: list[str] = [_SKY_CHANNEL_RGB]
+    if ray_map_on:
+        channels.append(_SKY_CHANNEL_RAY_MAP)
+    if sun_mask_mode != "none":
+        channels.append(_SKY_CHANNEL_SUN_MASK)
+    sun_mask_radius_deg = _SUN_MASK_RADIUS_DEG_PRESETS.get(sun_mask_mode)
+    sky_disc_mask_mode = _SKY_MASK_TO_DISC_MODE[sky_mask_mode]
+    return tuple(channels), sun_mask_radius_deg, sky_disc_mask_mode
 
 # Default dataset YAML for Folsom under the new ``config/datasets/`` layout. Used only by the
 # smoke CLI as a convenience default; ``FolsomIrradianceDataset`` itself takes ``config_path``
@@ -233,9 +325,8 @@ _FOLSOM_TARGET_MASK_NIGHT_THRESHOLD_P_CS = 0.02
 # ViT input/output scaling for ``kt`` (W/m^2-ish; see ``forward_vit`` docstring in the
 # trainer). Single source of truth so trainer / eval / inference stay in lockstep.
 _FOLSOM_KT_INPUT_SCALE = 4000.0
-# Huber loss delta in W/m^2, sized for the PV-target residual scale (~3% of 1000 W/m^2
-# peak, rounded to 30). Shared by trainer + eval Huber sites.
-_FOLSOM_HUBER_DELTA = 30.0
+# Huber loss delta in W/m^2 for PV-target residuals. Shared by trainer + eval Huber sites.
+_FOLSOM_HUBER_DELTA = 700.0
 
 
 def _compute_folsom_p_cs(
@@ -334,6 +425,80 @@ def _folsom_progress(msg: str) -> None:
     print(f"[Folsom] {msg}", file=sys.stderr, flush=True)
 
 
+def _folsom_path_has_zarr_markers(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    if (path / ".zgroup").is_file() or (path / ".zarray").is_file():
+        return True
+    if (path / "zarr.json").is_file():
+        return True
+    return False
+
+
+def _folsom_sky_path_looks_like_zarr(sky_path: Path) -> bool:
+    sky_path = sky_path.resolve()
+    if sky_path.name.lower().endswith(".zarr"):
+        return True
+    if _folsom_path_has_zarr_markers(sky_path):
+        return True
+    for sub in ("images", "time_utc"):
+        if _folsom_path_has_zarr_markers(sky_path / sub):
+            return True
+    return False
+
+
+def _folsom_sky_path_has_jpg(sky_path: Path) -> bool:
+    if not sky_path.is_dir():
+        return False
+    for p in sky_path.iterdir():
+        if p.is_file() and p.suffix.lower() == ".jpg":
+            return True
+    return False
+
+
+def _detect_folsom_sky_format(
+    sky_path: Path,
+    *,
+    config_path: Path | None = None,
+) -> str:
+    """
+    Infer ``jpg`` vs ``zarr`` from the resolved sky folder when ``paths.sky_format`` is omitted.
+    """
+    sky_path = sky_path.resolve()
+    cfg_hint = f" (config: {config_path})" if config_path else ""
+
+    is_zarr = _folsom_sky_path_looks_like_zarr(sky_path)
+    has_jpg = _folsom_sky_path_has_jpg(sky_path)
+
+    if is_zarr and has_jpg:
+        raise ValueError(
+            f"Could not auto-detect sky format under {sky_path}{cfg_hint}: "
+            "directory looks like both Zarr and JPEG. "
+            "Set paths.sky_format explicitly to 'jpg' or 'zarr'."
+        )
+    if is_zarr:
+        return "zarr"
+    if has_jpg:
+        return "jpg"
+
+    if not sky_path.exists():
+        raise FileNotFoundError(
+            f"Sky image path not found: {sky_path}{cfg_hint}. "
+            "Create the directory with JPEG or Zarr data, or set paths.sky_format explicitly."
+        )
+    if not sky_path.is_dir():
+        raise ValueError(
+            f"Sky image path is not a directory: {sky_path}{cfg_hint}. "
+            "Expected a folder of YYYYMMDDHHMMSS.jpg files or a Zarr store; "
+            "set paths.sky_format explicitly if using a non-standard layout."
+        )
+    raise ValueError(
+        f"Could not auto-detect sky format under {sky_path}{cfg_hint}: "
+        "no Zarr metadata (.zgroup/.zarray/zarr.json or images/time_utc subgroups) "
+        "and no *.jpg files found. Populate the folder or set paths.sky_format to 'jpg' or 'zarr'."
+    )
+
+
 def _count_newlines(path: Path) -> int:
     """Count lines in file (including header) using buffered binary read."""
     n = 0
@@ -422,7 +587,15 @@ def _resolve_folsom_csv_path(conf: dict, project_root: Path | None = None) -> Pa
 
 
 def _resolve_folsom_nwp_csv_path(conf: dict, project_root: Path | None = None) -> Path:
-    """Resolve ``paths.folsom_nwp_merged_csv`` from config."""
+    """Resolve the Folsom NWP merged CSV from config.
+
+    When ``paths.folsom_nwp_merged_csv`` is set it is used verbatim (relative to
+    ``data_dir`` unless absolute). When absent/empty, the ``paths.nwp_path`` folder
+    is globbed: a file literally named ``nwp_merged_averaged.csv`` is preferred, else
+    the sole ``*.csv`` in the folder is used. Raises ``FileNotFoundError`` when no CSV
+    can be located (the caller treats this as "no NWP"); raises ``RuntimeError`` when
+    the folder is ambiguous (several CSVs, none named ``nwp_merged_averaged.csv``).
+    """
     root = project_root if project_root is not None else _PROJECT_ROOT
     paths = conf.get("paths") or {}
     if paths.get("data_dir") is None or not str(paths.get("data_dir", "")).strip():
@@ -434,13 +607,35 @@ def _resolve_folsom_nwp_csv_path(conf: dict, project_root: Path | None = None) -
         data_dir = data_dir.resolve()
 
     rel = paths.get("folsom_nwp_merged_csv")
-    if rel is None or not str(rel).strip():
-        raise KeyError("conf paths.folsom_nwp_merged_csv is required for Folsom")
-    rel_p = Path(str(rel).strip())
-    p = rel_p.resolve() if rel_p.is_absolute() else (data_dir / rel_p).resolve()
-    if not p.is_file():
-        raise FileNotFoundError(f"Folsom NWP merged CSV not found: {p}")
-    return p
+    if rel is not None and str(rel).strip():
+        rel_p = Path(str(rel).strip())
+        p = rel_p.resolve() if rel_p.is_absolute() else (data_dir / rel_p).resolve()
+        if not p.is_file():
+            raise FileNotFoundError(f"Folsom NWP merged CSV not found: {p}")
+        return p
+
+    nwp_rel = paths.get("nwp_path")
+    if nwp_rel is None or not str(nwp_rel).strip():
+        raise FileNotFoundError(
+            "Folsom NWP not configured: set paths.nwp_path (folder) or paths.folsom_nwp_merged_csv (file)"
+        )
+    nwp_p = Path(str(nwp_rel).strip())
+    nwp_dir = nwp_p.resolve() if nwp_p.is_absolute() else (data_dir / nwp_p).resolve()
+    if not nwp_dir.is_dir():
+        raise FileNotFoundError(f"Folsom NWP folder not found: {nwp_dir}")
+    csvs = sorted(nwp_dir.glob("*.csv"))
+    if not csvs:
+        raise FileNotFoundError(f"No NWP CSV found in {nwp_dir}")
+    preferred = [c for c in csvs if c.name == "nwp_merged_averaged.csv"]
+    if preferred:
+        return preferred[0].resolve()
+    if len(csvs) == 1:
+        return csvs[0].resolve()
+    names = ", ".join(c.name for c in csvs)
+    raise RuntimeError(
+        f"Folsom NWP folder {nwp_dir} has multiple CSVs and none named 'nwp_merged_averaged.csv': {names}. "
+        "Set paths.folsom_nwp_merged_csv to disambiguate."
+    )
 
 
 def _normalize_col(name: str) -> str:
@@ -486,7 +681,7 @@ def load_folsom_conf(path: Path | str) -> dict:
 
     Caller must supply the path explicitly; this module never reads a hardcoded canonical
     config file. The expected schema mirrors ``config/datasets/conf_luoyang.yaml``:
-    ``paths.{data_dir, pv_path, sky_image_path, sat_path, sky_format, ...}`` plus a ``sampling:``
+    ``paths.{data_dir, pv_path, sky_image_path, sat_path, ...}`` plus a ``sampling:``
     section with the PVDataset-style window / stride / image-shape fields.
     """
     if path is None:
@@ -572,20 +767,22 @@ class FolsomIrradianceDataset(Dataset):
 
     ``pv_dir`` must contain exactly one irradiance CSV (time + GHI/DNI/DHI columns; column names
     auto-detected from the header). The optional NWP merged CSV is resolved from
-    ``paths.folsom_nwp_merged_csv`` in the per-instance ``config_path``; site coordinates come
+    ``paths.folsom_nwp_merged_csv`` if set, else globbed from the ``paths.nwp_path`` folder, in
+    the per-instance ``config_path``; site coordinates come
     from ``<paths.data_dir>/info.yaml`` (``site.latitude`` / ``site.longitude``), matching
     :class:`dataloader.luoyang_mem.PVDataset`.
 
-    Splits: rows are partitioned in fixed proportions ``66% train / 18% val / 18% test``.
-    ``pv_train_time_fraction`` is kept for call-site parity but **not** used. Train
+    Splits: rows are partitioned chronologically by ``train_split`` / ``val_split`` /
+    ``test_split`` (defaults ``0.66`` / ``0.18`` / ``0.16``). ``pv_train_time_fraction`` is
+    kept for call-site parity but **not** used. Train
     samples a random valid anchor per ``__getitem__`` (epoch length defaults to
     ``_DEFAULT_FOLSOM_TRAIN_EPOCH_LEN``; settable via ``self._train_epoch_len``); val/test use the
     respective ``*_anchor_stride_min`` strides over their bands.
 
     ``skyimg_window_size`` is the count of sky frames ending at the last input timestep (anchor),
-    spaced by ``skyimg_time_resolution_min`` (oldest first in ``skimg_tensor``). With
-    ``paths.sky_format: zarr``, frames are read from a Zarr ``images(time_utc, ...)`` store; with
-    ``jpg``, from timestamped JPEG files. All timestamps are UTC.
+    spaced by ``skyimg_time_resolution_min`` (oldest first in ``skimg_tensor``). Sky format is
+    auto-detected from ``skyimg_dir`` (Zarr store vs JPEG folder) unless ``paths.sky_format`` is set.
+    All timestamps are UTC.
     """
 
     def __init__(
@@ -602,6 +799,9 @@ class FolsomIrradianceDataset(Dataset):
         pv_output_interval_min: int,
         pv_output_len: int,
         pv_train_time_fraction: float,
+        train_split: float = 0.66,
+        val_split: float = 0.18,
+        test_split: float = 0.16,
         test_anchor_stride_min: int,
         val_anchor_stride_min: int,
         test_collect_time_match_tolerance_min: int,
@@ -649,6 +849,22 @@ class FolsomIrradianceDataset(Dataset):
         if not (0.0 < tf < 1.0):
             raise ValueError("pv_train_time_fraction must be strictly between 0 and 1")
         self._pv_train_time_fraction = tf
+
+        self._train_split = float(train_split)
+        self._val_split = float(val_split)
+        self._test_split = float(test_split)
+        for name, frac in (
+            ("train_split", self._train_split),
+            ("val_split", self._val_split),
+            ("test_split", self._test_split),
+        ):
+            if not (0.0 < frac < 1.0):
+                raise ValueError(f"{name} must be strictly between 0 and 1 (got {frac!r})")
+        split_sum = self._train_split + self._val_split + self._test_split
+        if abs(split_sum - 1.0) >= 1e-6:
+            raise ValueError(
+                f"train_split + val_split + test_split must sum to 1.0 (got {split_sum:.6f})"
+            )
 
         if skyimg_time_resolution_min <= 0:
             raise ValueError("skyimg_time_resolution_min must be positive")
@@ -734,8 +950,9 @@ class FolsomIrradianceDataset(Dataset):
         # Site + NWP from the per-instance dataset YAML (``self._config_path``):
         #   * lat/lon → ``<paths.data_dir>/info.yaml`` (site.latitude / site.longitude),
         #     matching :class:`dataloader.luoyang_mem.PVDataset`.
-        #   * NWP merged CSV → ``paths.folsom_nwp_merged_csv`` (relative to ``data_dir``
-        #     unless absolute); missing/unreadable falls back to None (zero NWP at runtime).
+        #   * NWP merged CSV → ``paths.folsom_nwp_merged_csv`` if set, else globbed from
+        #     the ``paths.nwp_path`` folder (relative to ``data_dir`` unless absolute);
+        #     missing/unreadable falls back to None (zero NWP at runtime).
         with self._config_path.open() as f:
             conf = yaml.safe_load(f) or {}
         paths = get_resolved_paths(conf, _PROJECT_ROOT)
@@ -763,23 +980,32 @@ class FolsomIrradianceDataset(Dataset):
         self.latitude = float(lat)
         self.longitude = float(lon)
 
-        raw_sf = paths_cfg.get("sky_format", "jpg")
-        sky_fmt = str(raw_sf).strip().lower()
-        if sky_fmt not in ("jpg", "zarr"):
-            raise ValueError(
-                f"paths.sky_format must be 'jpg' or 'zarr' (got {raw_sf!r}) in {self._config_path}"
+        raw_sf = paths_cfg.get("sky_format")
+        if raw_sf is not None and str(raw_sf).strip() != "":
+            sky_fmt = str(raw_sf).strip().lower()
+            if sky_fmt not in ("jpg", "zarr"):
+                raise ValueError(
+                    f"paths.sky_format must be 'jpg' or 'zarr' (got {raw_sf!r}) in {self._config_path}"
+                )
+            self._sky_format = sky_fmt
+        else:
+            self._sky_format = _detect_folsom_sky_format(
+                self._skyimg_dir, config_path=self._config_path
             )
-        self._sky_format = sky_fmt
+            _folsom_progress(
+                f"sky format auto-detected: {self._sky_format!r} ({self._skyimg_dir})"
+            )
 
         self._nwp_feature_cols = tuple(_FOLSOM_NWP_FEATURE_COLS)
-        nwp_rel = paths_cfg.get("folsom_nwp_merged_csv")
+        # Explicit ``paths.folsom_nwp_merged_csv`` (backward compatible) else glob
+        # ``paths.nwp_path`` for the merged CSV. A missing folder / no CSV is tolerated
+        # (falls back to zero NWP + invalid mask below); an ambiguous folder is not.
         self._nwp_merged_df = None
-        if nwp_rel is not None and str(nwp_rel).strip() != "":
-            try:
-                nwp_csv = _resolve_folsom_nwp_csv_path(conf)
-                self._nwp_merged_df = _load_folsom_nwp_merged_csv(nwp_csv)
-            except (FileNotFoundError, KeyError):
-                self._nwp_merged_df = None
+        try:
+            nwp_csv = _resolve_folsom_nwp_csv_path(conf)
+            self._nwp_merged_df = _load_folsom_nwp_merged_csv(nwp_csv)
+        except (FileNotFoundError, KeyError):
+            self._nwp_merged_df = None
 
         # API parity with PVDataset: trainer reads ``train_dataset.devDn_list`` to size the
         # device-id embedding. Folsom is a single-sensor station, so a length-1 list is fine
@@ -805,7 +1031,7 @@ class FolsomIrradianceDataset(Dataset):
             self._csv_path = self.sample_files[0].resolve()
         _folsom_progress(f"dataset split={split!r}: preparing {self._csv_path.name} ...")
 
-        # Sky: JPEG directory index, or Zarr store (``paths.sky_format``).
+        # Sky: JPEG directory index or Zarr store (auto-detected or ``paths.sky_format`` override).
         self._sky_gap_threshold = pd.Timedelta(minutes=5)
         self._sky_anchor_max_lag = pd.Timedelta(minutes=5)
         if self._sky_format == "zarr":
@@ -887,12 +1113,14 @@ class FolsomIrradianceDataset(Dataset):
         self._x_tail_1d = (-(lx - 1) * sx + np.arange(lx, dtype=np.intp) * sx).astype(np.intp, copy=False)
         self._y_off_1d = (sy + np.arange(ly, dtype=np.intp) * sy).astype(np.intp, copy=False)
 
-        # Fixed 66% / 18% / 18% train/val/test split.
-        split_train_end = int(n * 0.66)
-        split_val_end = int(n * 0.84)
+        # Chronological train/val/test split from config (train_split / val_split / test_split).
+        split_train_end = int(n * self._train_split)
+        split_val_end = int(n * (self._train_split + self._val_split))
         if not (0 < split_train_end < split_val_end < n):
             raise ValueError(
-                f"fixed 66%/18%/18% row split invalid for n={n}: "
+                f"row split invalid for n={n} "
+                f"(train_split={self._train_split}, val_split={self._val_split}, "
+                f"test_split={self._test_split}): "
                 f"split_train_end={split_train_end}, split_val_end={split_val_end}"
             )
         min_row = self._anchors - (lx - 1) * sx
@@ -902,18 +1130,18 @@ class FolsomIrradianceDataset(Dataset):
         self._test_anchor_mask = min_row >= split_val_end
         if self.split == "train" and not bool(self._train_anchor_mask.any()):
             raise RuntimeError(
-                f"split=train: no anchor fits entirely in the first {split_train_end} rows (66% of n={n}); "
-                "shorten windows or check data length"
+                f"split=train: no anchor fits entirely in the first {split_train_end} rows "
+                f"(train_split={self._train_split} of n={n}); shorten windows or check data length"
             )
         if self.split == "val" and not bool(self._val_anchor_mask.any()):
             raise RuntimeError(
                 f"split=val: no anchor fits entirely in rows [{split_train_end}, {split_val_end}) "
-                f"(18% val band); adjust window lengths or stride"
+                f"(val_split={self._val_split}); adjust window lengths or stride"
             )
         if self.split == "test" and not bool(self._test_anchor_mask.any()):
             raise RuntimeError(
-                f"split=test: no anchor fits entirely from row {split_val_end} onward (last 18%); "
-                "adjust window lengths"
+                f"split=test: no anchor fits entirely from row {split_val_end} onward "
+                f"(test_split={self._test_split}); adjust window lengths"
             )
 
         train_positions = np.nonzero(self._train_anchor_mask)[0]
@@ -1733,10 +1961,11 @@ def build_folsom_irradiance_datasets_from_conf(
     Build train/test :class:`FolsomIrradianceDataset` from a Folsom dataset YAML (new schema:
     ``config/datasets/conf_folsom.yaml``).
 
-    Reads ``paths.{data_dir, pv_path, sky_image_path, sat_path, sky_format}`` and the ``sampling:`` section
+    Reads ``paths.{data_dir, pv_path, sky_image_path, sat_path}`` and the ``sampling:`` section
     (PVDataset-style window / stride / image-shape fields). Lat/lon comes from
     ``<paths.data_dir>/info.yaml`` and the optional NWP merged CSV from
-    ``paths.folsom_nwp_merged_csv`` — both read inside the dataset constructor.
+    ``paths.folsom_nwp_merged_csv`` (or globbed from ``paths.nwp_path`` when unset) — both read
+    inside the dataset constructor.
 
     A ``conf_path`` is required (it is also forwarded to the dataset as ``config_path``); pass
     ``conf`` if you've already loaded the YAML to avoid re-reading it. ``train_epoch_len`` is
@@ -1775,10 +2004,13 @@ def build_folsom_irradiance_datasets_from_conf(
         pv_input_len=int(_req_s("pv_input_len")),
         pv_output_interval_min=int(_req_s("pv_output_interval_min")),
         pv_output_len=int(_req_s("pv_output_len")),
-        pv_train_time_fraction=float(_req_s("pv_train_time_fraction")),
+        pv_train_time_fraction=float(sampling_cfg.get("pv_train_time_fraction", 0.7)),
+        train_split=float(sampling_cfg.get("train_split", 0.66)),
+        val_split=float(sampling_cfg.get("val_split", 0.18)),
+        test_split=float(sampling_cfg.get("test_split", 0.16)),
         test_anchor_stride_min=int(_req_s("test_anchor_stride_min")),
         val_anchor_stride_min=int(_req_s("val_anchor_stride_min")),
-        test_collect_time_match_tolerance_min=int(_req_s("test_collect_time_match_tolerance_min")),
+        test_collect_time_match_tolerance_min=int(sampling_cfg.get("test_collect_time_match_tolerance_min", 0)),
         skyimg_window_size=sky_w,
         skyimg_time_resolution_min=int(_req_s("skyimg_time_resolution_min")),
         skyimg_spatial_size=int(_req_s("skyimg_spatial_size")),
@@ -1786,10 +2018,17 @@ def build_folsom_irradiance_datasets_from_conf(
         satimg_time_resolution_min=int(_req_s("satimg_time_resolution_min")),
         satimg_npy_shape_hwc=tuple(int(x) for x in shwc),
         use_satellite=bool(sampling_cfg.get("use_satellite", False)),
-        sky_channels=sampling_cfg.get("sky_channels"),
-        sun_mask_radius_deg=sampling_cfg.get("sun_mask_radius_deg"),
-        sky_disc_mask_mode=sampling_cfg.get("sky_disc_mask_mode"),
-        sky_disc_mask_radius_px=sampling_cfg.get("sky_disc_mask_radius_px"),
+    )
+    sky_channels, sun_mask_radius_deg, sky_disc_mask_mode = sky_knobs_to_internal(
+        sampling_cfg.get("ray_map"),
+        sampling_cfg.get("sun_mask"),
+        sampling_cfg.get("sky_mask"),
+    )
+    kwargs.update(
+        sky_channels=sky_channels,
+        sun_mask_radius_deg=sun_mask_radius_deg,
+        sky_disc_mask_mode=sky_disc_mask_mode,
+        sky_disc_mask_radius_px=None,
     )
     train_ds = FolsomIrradianceDataset(split="train", **kwargs)
     test_ds = FolsomIrradianceDataset(split="test", **kwargs)
@@ -1805,6 +2044,10 @@ __all__ = [
     "build_folsom_irradiance_datasets_from_conf",
     "load_folsom_conf",
     "run_smoke_cli",
+    "sky_knobs_to_internal",
+    "normalize_ray_map",
+    "normalize_sun_mask",
+    "normalize_sky_mask",
 ]
 
 
@@ -1893,7 +2136,8 @@ def _validate_smoke_anchor_train(ds: FolsomIrradianceDataset, anchor: int) -> No
     r = anchor - amin
     if not bool(ds._train_anchor_mask[r]):
         raise ValueError(
-            f"anchor_row={anchor} falls outside the train time band (fixed 66% train / 18% val / 18% test). "
+            f"anchor_row={anchor} falls outside the train time band "
+            f"(train_split={ds._train_split}, val_split={ds._val_split}, test_split={ds._test_split}). "
             "Smoke uses the train dataset only: pick an earlier calendar time."
         )
 
@@ -1966,8 +2210,8 @@ def run_smoke_cli(argv: list[str] | None = None) -> int:
         print(f"Failed to load Folsom data from {args.conf.resolve()}:\n  {e}", file=sys.stderr)
         print(
             "Fix paths.data_dir, paths.pv_path (folder with the irradiance CSV), "
-            "paths.sky_image_path, paths.sat_path (placeholder), paths.folsom_nwp_merged_csv "
-            "in that YAML, and ensure <data_dir>/info.yaml provides site.latitude / "
+            "paths.sky_image_path, paths.sat_path (placeholder), paths.nwp_path (folder with the "
+            "merged NWP CSV) in that YAML, and ensure <data_dir>/info.yaml provides site.latitude / "
             "site.longitude so files exist on disk.",
             file=sys.stderr,
         )
