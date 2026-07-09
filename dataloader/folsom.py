@@ -25,7 +25,8 @@ Training usage (same two-step pattern as ``dataloader.luoyang``):
 - ``forecast_timefeats``: ``[B, T_out, 9]`` (same on forecast timesteps)
 - ``target_ghi``, ``target_dni``, ``target_dhi``: ``[B, T_out]``
 - ``target_mask``: ``[B, T_out]`` (valid **GHI** forecast timesteps; DNI/DHI validity does not affect this mask)
-- ``skimg_tensor``: ``[B, T_sky, 3, H, W]`` with ``H=W=skyimg_spatial_size``
+- ``skimg_tensor``: ``[B, T_sky, C_sky, H, W]`` where ``C_sky`` = ``sky_in_channels``
+  (default 3 = RGB only; optionally +ray_map +sun_mask +sky_mask) and ``H=W=skyimg_spatial_size``
 - ``skimg_timefeats``: ``[B, T_sky, feat_dim]``
 - ``nwp_tensor``: ``[B, T_out, C_nwp]`` (zeros + invalid mask if NWP file missing)
 
@@ -83,9 +84,13 @@ from config_utils import get_resolved_paths
 from dataloader.luoyang_mem import list_csv_files
 from modules.solar_encoder import compute_solar_features, delta_time_encoder, solar_features_encoder
 from SPMF_preprocessing.fisheye_calib import fisheye_sunmask
+from SPMF_preprocessing.fisheye_calib.fisheye_sunmask import (
+    DEFAULT_SUN_MASK_SIGMA_DEG,
+    DEFAULT_SUN_MASK_SIGMA_PX,
+)
 from SPMF_preprocessing.fisheye_calib.fisheye_raymap import compute_ray_map
 from SPMF_preprocessing.fisheye_calib.sky_disc_mask import (
-    apply_sky_disc_mask,
+    compute_sky_disc_mask,
     normalize_sky_disc_mask_mode,
 )
 
@@ -93,8 +98,8 @@ from SPMF_preprocessing.fisheye_calib.sky_disc_mask import (
 # exposes 3 knobs under ``sampling:`` (``ray_map`` / ``sun_mask`` / ``sky_mask``); see
 # ``sky_knobs_to_internal``, which translates them into the internal ``sky_channels``
 # list. The resulting ``skimg_tensor`` concatenates each feature along the channel dim
-# in canonical order (rgb, ray_map, sun_mask). Default (all knobs off) is byte-identical
-# to the historical 3-channel behavior.
+# in canonical order (rgb, ray_map, sun_mask, sky_mask). Default (all knobs off) is
+# byte-identical to the historical 3-channel behavior.
 #
 # Fisheye geometry conventions (training + inference share the same rules):
 #   * Training RGB: raw, unflipped Folsom JPGs resized to ``skyimg_spatial_size`` (224).
@@ -105,15 +110,17 @@ from SPMF_preprocessing.fisheye_calib.sky_disc_mask import (
 #     does not enter.
 #   * sun_mask: ``fisheye_sunmask.compute_sun_mask`` — project in flip space, mirror u to
 #     raw via ``u_raw = (native-1) - u_flip``, Euclidean disc ``R = f_s * deg2rad(radius)``.
-#   * sky_disc_mask: ``sky_disc_mask.apply_sky_disc_mask`` — zeros RGB outside a Euclidean
-#     disc (optical center or sun-centered modes); ray_map / sun_mask channels unaffected.
+#   * sky_mask: ``sky_disc_mask.compute_sky_disc_mask`` — optional ``[T, 1, H, W]`` float32
+#     0/1 keep-region channel appended when ``sky_mask`` knob != none; RGB is left unchanged.
 _SKY_CHANNEL_RGB = "rgb"
 _SKY_CHANNEL_RAY_MAP = "ray_map"
 _SKY_CHANNEL_SUN_MASK = "sun_mask"
+_SKY_CHANNEL_SKY_MASK = "sky_mask"
 _SKY_CHANNEL_WIDTHS: dict[str, int] = {
     _SKY_CHANNEL_RGB: 3,
     _SKY_CHANNEL_RAY_MAP: 3,
     _SKY_CHANNEL_SUN_MASK: 1,
+    _SKY_CHANNEL_SKY_MASK: 1,
 }
 _DEFAULT_SKY_CHANNELS: tuple[str, ...] = (_SKY_CHANNEL_RGB,)
 
@@ -165,16 +172,24 @@ def _sky_in_channels(channels: tuple[str, ...]) -> int:
 # ``sky_disc_mask_mode`` / ``sun_mask_radius_deg`` / ``sky_disc_mask_radius_px`` keys):
 #   * ``ray_map``  (bool)                      -> add the ray_map channel (3ch)
 #   * ``sun_mask`` (none|sun_only|sun_halo)    -> add the sun_mask channel (1ch) + radius preset
-#   * ``sky_mask`` (none|loose|tight|valid_disc) -> RGB sky-disc gating mode
+#   * ``sky_mask`` (none|loose|tight|valid_disc) -> optional sky_mask channel (1ch) +
+#     internal disc mode for mask computation (RGB left unmodified)
 # ``sky_knobs_to_internal`` translates these into the constructor's internal
 # ``sky_channels`` / ``sun_mask_radius_deg`` / ``sky_disc_mask_mode`` representation.
-_SUN_MASK_MODES: tuple[str, ...] = ("none", "sun_only", "sun_halo")
+_SUN_MASK_MODES: tuple[str, ...] = (
+    "none",
+    "sun_only",
+    "sun_halo",
+    "gaussian_pixel",
+    "gaussian_angular",
+)
 # Angular radius presets (degrees) for the sun_mask channel per ``sun_mask`` mode.
 # ``sun_halo`` keeps the historical wide default; ``sun_only`` is a tight disc.
 _SUN_MASK_RADIUS_DEG_PRESETS: dict[str, float] = {
     "sun_only": 10.0,
     "sun_halo": _DEFAULT_SUN_MASK_RADIUS_DEG,
 }
+_SUN_MASK_HARD_MODES: frozenset[str] = frozenset({"sun_only", "sun_halo"})
 _SKY_MASK_MODES: tuple[str, ...] = ("none", "loose", "tight", "valid_disc")
 _SKY_MASK_TO_DISC_MODE: dict[str, str] = {
     "none": "none",
@@ -223,19 +238,48 @@ def normalize_sky_mask(raw: Any) -> str:
     return mode
 
 
+def resolve_sun_mask_sigmas(
+    sampling_cfg: dict | None = None,
+    *,
+    sigma_px_override: float | None = None,
+    sigma_deg_override: float | None = None,
+) -> tuple[float, float]:
+    """Read ``sun_mask_sigma_px`` / ``sun_mask_sigma_deg`` from sampling config."""
+    cfg = sampling_cfg or {}
+    sigma_px = (
+        float(sigma_px_override)
+        if sigma_px_override is not None
+        else float(cfg.get("sun_mask_sigma_px", DEFAULT_SUN_MASK_SIGMA_PX))
+    )
+    sigma_deg = (
+        float(sigma_deg_override)
+        if sigma_deg_override is not None
+        else float(cfg.get("sun_mask_sigma_deg", DEFAULT_SUN_MASK_SIGMA_DEG))
+    )
+    if not (sigma_px > 0.0):
+        raise ValueError(f"sun_mask_sigma_px must be > 0 (got {sigma_px!r})")
+    if not (sigma_deg > 0.0):
+        raise ValueError(f"sun_mask_sigma_deg must be > 0 (got {sigma_deg!r})")
+    return sigma_px, sigma_deg
+
+
 def sky_knobs_to_internal(
     ray_map: Any,
     sun_mask: Any,
     sky_mask: Any,
-) -> tuple[tuple[str, ...], float | None, str]:
+) -> tuple[tuple[str, ...], float | None, str, str]:
     """Translate the 3 public sky knobs into the internal constructor representation.
 
-    Returns ``(sky_channels, sun_mask_radius_deg, sky_disc_mask_mode)``:
+    Returns ``(sky_channels, sun_mask_radius_deg, sky_disc_mask_mode, sun_mask_mode)``:
       * ``sky_channels`` = ``("rgb",)`` + ``("ray_map",)`` if ``ray_map`` +
-        ``("sun_mask",)`` if ``sun_mask != 'none'`` (canonical order preserved).
-      * ``sun_mask_radius_deg`` = preset for the mode (``None`` when ``sun_mask`` is
-        ``'none'`` — the channel is absent so the radius is unused).
-      * ``sky_disc_mask_mode`` = mapping of ``sky_mask`` onto the existing modes.
+        ``("sun_mask",)`` if ``sun_mask != 'none'`` + ``("sky_mask",)`` if
+        ``sky_mask != 'none'`` (canonical order preserved).
+      * ``sun_mask_radius_deg`` = preset for hard-disc modes (``None`` when
+        ``sun_mask`` is ``'none'`` or a Gaussian mode — the channel is absent or
+        the radius is unused).
+      * ``sky_disc_mask_mode`` = internal disc mode for ``sky_mask`` channel computation
+        (``'none'`` when the knob is off).
+      * ``sun_mask_mode`` = canonical ``sun_mask`` knob value.
     """
     ray_map_on = normalize_ray_map(ray_map)
     sun_mask_mode = normalize_sun_mask(sun_mask)
@@ -245,9 +289,11 @@ def sky_knobs_to_internal(
         channels.append(_SKY_CHANNEL_RAY_MAP)
     if sun_mask_mode != "none":
         channels.append(_SKY_CHANNEL_SUN_MASK)
+    if sky_mask_mode != "none":
+        channels.append(_SKY_CHANNEL_SKY_MASK)
     sun_mask_radius_deg = _SUN_MASK_RADIUS_DEG_PRESETS.get(sun_mask_mode)
     sky_disc_mask_mode = _SKY_MASK_TO_DISC_MODE[sky_mask_mode]
-    return tuple(channels), sun_mask_radius_deg, sky_disc_mask_mode
+    return tuple(channels), sun_mask_radius_deg, sky_disc_mask_mode, sun_mask_mode
 
 # Default dataset YAML for Folsom under the new ``config/datasets/`` layout. Used only by the
 # smoke CLI as a convenience default; ``FolsomIrradianceDataset`` itself takes ``config_path``
@@ -813,7 +859,10 @@ class FolsomIrradianceDataset(Dataset):
         satimg_npy_shape_hwc: tuple[int, int, int],
         use_satellite: bool = False,
         sky_channels: list[str] | tuple[str, ...] | None = None,
+        sun_mask_mode: str | None = None,
         sun_mask_radius_deg: float | None = None,
+        sun_mask_sigma_px: float | None = None,
+        sun_mask_sigma_deg: float | None = None,
         sky_disc_mask_mode: str | None = None,
         sky_disc_mask_radius_px: float | None = None,
     ):
@@ -886,21 +935,33 @@ class FolsomIrradianceDataset(Dataset):
         self._ray_map_cache: torch.Tensor | None = None
         self._sky_valid_cache: torch.Tensor | None = None
         self._fisheye_fit: dict | None = None
-        radius = (
-            _DEFAULT_SUN_MASK_RADIUS_DEG
-            if sun_mask_radius_deg is None
-            else float(sun_mask_radius_deg)
+        self.sun_mask_mode: str = normalize_sun_mask(sun_mask_mode)
+        if self.sun_mask_mode in _SUN_MASK_HARD_MODES:
+            radius = (
+                _SUN_MASK_RADIUS_DEG_PRESETS[self.sun_mask_mode]
+                if sun_mask_radius_deg is None
+                else float(sun_mask_radius_deg)
+            )
+            if not (radius > 0.0):
+                raise ValueError(
+                    f"sun_mask_radius_deg must be > 0 (got {sun_mask_radius_deg!r})"
+                )
+            if radius >= 90.0:
+                raise ValueError(
+                    f"sun_mask_radius_deg must be < 90 (got {sun_mask_radius_deg!r}); "
+                    "a half-sky disc is almost certainly a config mistake"
+                )
+            self.sun_mask_radius_deg: float = radius
+        else:
+            self.sun_mask_radius_deg = float(
+                sun_mask_radius_deg or _DEFAULT_SUN_MASK_RADIUS_DEG
+            )
+        sigma_px, sigma_deg = resolve_sun_mask_sigmas(
+            sigma_px_override=sun_mask_sigma_px,
+            sigma_deg_override=sun_mask_sigma_deg,
         )
-        if not (radius > 0.0):
-            raise ValueError(
-                f"sun_mask_radius_deg must be > 0 (got {sun_mask_radius_deg!r})"
-            )
-        if radius >= 90.0:
-            raise ValueError(
-                f"sun_mask_radius_deg must be < 90 (got {sun_mask_radius_deg!r}); "
-                "a half-sky disc is almost certainly a config mistake"
-            )
-        self.sun_mask_radius_deg: float = radius
+        self.sun_mask_sigma_px: float = sigma_px
+        self.sun_mask_sigma_deg: float = sigma_deg
 
         self.sky_disc_mask_mode: str = normalize_sky_disc_mask_mode(sky_disc_mask_mode)
         if sky_disc_mask_radius_px is not None:
@@ -1510,26 +1571,37 @@ class FolsomIrradianceDataset(Dataset):
             image_size=self._skyimg_spatial_size,
             radius_deg=self.sun_mask_radius_deg,
             fit=self._get_fisheye_fit(),
+            mode=self.sun_mask_mode,
+            sigma_px=self.sun_mask_sigma_px,
+            sigma_deg=self.sun_mask_sigma_deg,
         )
         mask_t = torch.from_numpy(np.ascontiguousarray(mask_np, dtype=np.float32))
         return mask_t.unsqueeze(1).contiguous()  # [T, 1, H, W]
 
-    def _apply_sky_disc_mask(
+    def _compute_sky_disc_mask_for_frames(
         self,
-        rgb_frames: torch.Tensor,
         frame_timestamps: list[pd.Timestamp],
+        t_dim: int,
+        h_dim: int,
+        w_dim: int,
     ) -> torch.Tensor:
-        """Zero RGB outside the configured sky disc; ``none`` is a no-op."""
+        """Per-frame ``[T, 1, H, W]`` float32 sky-disc keep mask (0/1)."""
         if self.sky_disc_mask_mode == "none":
-            return rgb_frames
-        return apply_sky_disc_mask(
-            rgb_frames,
+            raise ValueError(
+                "_compute_sky_disc_mask_for_frames called but sky_disc_mask_mode is 'none'"
+            )
+        return compute_sky_disc_mask(
+            t_dim,
+            h_dim,
+            w_dim,
             self.sky_disc_mask_mode,
             fit=self._get_fisheye_fit(),
             frame_timestamps=frame_timestamps,
             latitude=self.latitude,
             longitude=self.longitude,
             radius_px_override=self.sky_disc_mask_radius_px,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
         )
 
     def _build_sky_channels(
@@ -1580,6 +1652,19 @@ class FolsomIrradianceDataset(Dataset):
                         f"sky frame spatial size {(h_dim, w_dim)}"
                     )
                 parts.append(sun_mask)
+            elif name == _SKY_CHANNEL_SKY_MASK:
+                if frame_timestamps is None:
+                    raise ValueError(
+                        "_build_sky_channels: 'sky_mask' requires frame_timestamps "
+                        "(per-frame UTC pd.Timestamps for disc mask computation)"
+                    )
+                disc_mask = self._compute_sky_disc_mask_for_frames(
+                    list(frame_timestamps), t_dim, h_dim, w_dim
+                )
+                # Black/padding frames from _black_sky_tensor() are all-zero RGB.
+                valid = rgb_frames.abs().amax(dim=(1, 2, 3)) > 0
+                disc_mask = disc_mask * valid.view(t_dim, 1, 1, 1).to(disc_mask.dtype)
+                parts.append(disc_mask)
             else:
                 raise ValueError(f"sky_channels: unknown feature {name!r}")
         out = torch.cat(parts, dim=1).contiguous()
@@ -1823,7 +1908,6 @@ class FolsomIrradianceDataset(Dataset):
         if self._sky_format == "zarr":
             nominal = self._nominal_sky_frame_times(t_x_end)
             rgb_frames = self._stack_sky_from_zarr(t_x_end)
-            rgb_frames = self._apply_sky_disc_mask(rgb_frames, nominal)
             skimg_tensor = self._build_sky_channels(rgb_frames, nominal)
             skimg_solar_features = compute_solar_features(nominal, self.latitude, self.longitude)
             skimg_tf = solar_features_encoder(skimg_solar_features)
@@ -1839,7 +1923,6 @@ class FolsomIrradianceDataset(Dataset):
             skimg_dtf = delta_time_encoder(skimg_timestamps, time0)
             skimg_timefeats = torch.cat([skimg_tf, skimg_dtf.unsqueeze(1)], dim=1)
             rgb_frames = self._stack_sky_frames(skimg_paths)
-            rgb_frames = self._apply_sky_disc_mask(rgb_frames, skimg_timestamps)
             skimg_tensor = self._build_sky_channels(rgb_frames, skimg_timestamps)
             skimg_timestamps = [
                 (None if p is None else pd.Timestamp(t).strftime("%Y%m%d%H%M%S"))
@@ -2019,14 +2102,18 @@ def build_folsom_irradiance_datasets_from_conf(
         satimg_npy_shape_hwc=tuple(int(x) for x in shwc),
         use_satellite=bool(sampling_cfg.get("use_satellite", False)),
     )
-    sky_channels, sun_mask_radius_deg, sky_disc_mask_mode = sky_knobs_to_internal(
+    sky_channels, sun_mask_radius_deg, sky_disc_mask_mode, sun_mask_mode = sky_knobs_to_internal(
         sampling_cfg.get("ray_map"),
         sampling_cfg.get("sun_mask"),
         sampling_cfg.get("sky_mask"),
     )
+    sigma_px, sigma_deg = resolve_sun_mask_sigmas(sampling_cfg)
     kwargs.update(
         sky_channels=sky_channels,
+        sun_mask_mode=sun_mask_mode,
         sun_mask_radius_deg=sun_mask_radius_deg,
+        sun_mask_sigma_px=sigma_px,
+        sun_mask_sigma_deg=sigma_deg,
         sky_disc_mask_mode=sky_disc_mask_mode,
         sky_disc_mask_radius_px=None,
     )
@@ -2048,6 +2135,7 @@ __all__ = [
     "normalize_ray_map",
     "normalize_sun_mask",
     "normalize_sky_mask",
+    "resolve_sun_mask_sigmas",
 ]
 
 

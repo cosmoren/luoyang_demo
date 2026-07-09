@@ -29,7 +29,7 @@ Training hyperparameters: ``config/train/conf_train.yaml`` (``--config``). Datas
 Sky-branch config: 3 knobs (default rgb-only) via CLI flags or ``sampling:`` YAML keys;
 precedence CLI > YAML > default::
 
-  # ray_map: bool (default false); sun_mask: none|sun_only|sun_halo (default none);
+  # ray_map: bool (default false); sun_mask: none|sun_only|sun_halo|gaussian_pixel|gaussian_angular
   # sky_mask: none|loose|tight|valid_disc (default none)
   python training/train_vit_test_folsom.py --sun-mask sun_halo
   python training/train_vit_test_folsom.py --ray-map
@@ -71,6 +71,7 @@ from dataloader.folsom import (  # noqa: E402
     normalize_ray_map,
     normalize_sky_mask,
     normalize_sun_mask,
+    resolve_sun_mask_sigmas,
     sky_knobs_to_internal,
 )
 from dataloader.luoyang_zarr import collate_batched  # noqa: E402
@@ -690,12 +691,37 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
         dest="sun_mask",
         type=str,
         default=None,
-        choices=["none", "sun_only", "sun_halo"],
+        choices=[
+            "none",
+            "sun_only",
+            "sun_halo",
+            "gaussian_pixel",
+            "gaussian_angular",
+        ],
         metavar="MODE",
         help=(
-            "Sun_mask channel (1ch): 'none' omits it, 'sun_only' a tight disc (10 deg), "
-            "'sun_halo' the wide disc (30 deg). Precedence: this flag > sampling.sun_mask "
-            "in the dataset YAML > none."
+            "Sun_mask channel (1ch): 'none' omits it; 'sun_only'/'sun_halo' hard discs "
+            "(10/30 deg); 'gaussian_pixel'/'gaussian_angular' soft Gaussians (sigma from "
+            "sampling.sun_mask_sigma_px / sun_mask_sigma_deg, defaults 15 px / 10 deg). "
+            "Precedence: this flag > sampling.sun_mask in the dataset YAML > none."
+        ),
+    )
+    parser.add_argument(
+        "--sun-mask-sigma-px",
+        dest="sun_mask_sigma_px",
+        type=float,
+        default=None,
+        help=(
+            "Override sampling.sun_mask_sigma_px for gaussian_pixel (default 15 when unset)."
+        ),
+    )
+    parser.add_argument(
+        "--sun-mask-sigma-deg",
+        dest="sun_mask_sigma_deg",
+        type=float,
+        default=None,
+        help=(
+            "Override sampling.sun_mask_sigma_deg for gaussian_angular (default 10 when unset)."
         ),
     )
     parser.add_argument(
@@ -706,10 +732,10 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
         choices=["none", "loose", "tight", "valid_disc"],
         metavar="MODE",
         help=(
-            "RGB sky-disc gating: keep pixels inside a disc, zero RGB outside. 'none' "
-            "disables gating; 'loose'/'tight' use the hand-drawn masks; 'valid_disc' the "
-            "optical-center disc. Precedence: this flag > sampling.sky_mask in YAML > none. "
-            "Does not affect ray_map or sun_mask channels."
+            "Append optional sky_mask channel (1ch float 0/1 keep-region disc). 'none' "
+            "omits it; 'loose'/'tight' use hand-drawn masks; 'valid_disc' the optical-center "
+            "disc. RGB is left unmodified. Precedence: this flag > sampling.sky_mask in "
+            "YAML > none."
         ),
     )
     parser.add_argument(
@@ -732,7 +758,10 @@ def _dataset_kwargs(
     split: str,
     use_satellite_override: bool | None = None,
     sky_channels_override: tuple[str, ...] | None = None,
+    sun_mask_mode_override: str | None = None,
     sun_mask_radius_deg_override: float | None = None,
+    sun_mask_sigma_px_override: float | None = None,
+    sun_mask_sigma_deg_override: float | None = None,
     sky_disc_mask_mode_override: str | None = None,
     sky_disc_mask_radius_px_override: float | None = None,
 ) -> dict:
@@ -774,19 +803,27 @@ def _dataset_kwargs(
 
     if sky_channels_override is not None:
         sky_channels = list(sky_channels_override)
+        sun_mask_mode = normalize_sun_mask(sun_mask_mode_override)
         sun_mask_radius_deg = sun_mask_radius_deg_override
         sky_disc_mask_mode = sky_disc_mask_mode_override
         sky_disc_mask_radius_px = sky_disc_mask_radius_px_override
     else:
-        _sc, _smr, _sdm = sky_knobs_to_internal(
+        _sc, _smr, _sdm, _smm = sky_knobs_to_internal(
             sampling_cfg.get("ray_map"),
             sampling_cfg.get("sun_mask"),
             sampling_cfg.get("sky_mask"),
         )
         sky_channels = list(_sc)
+        sun_mask_mode = _smm
         sun_mask_radius_deg = _smr
         sky_disc_mask_mode = _sdm
         sky_disc_mask_radius_px = None
+
+    sigma_px, sigma_deg = resolve_sun_mask_sigmas(
+        sampling_cfg,
+        sigma_px_override=sun_mask_sigma_px_override,
+        sigma_deg_override=sun_mask_sigma_deg_override,
+    )
 
     return dict(
         config_path=str(cfg_path),
@@ -814,7 +851,10 @@ def _dataset_kwargs(
         satimg_npy_shape_hwc=tuple(int(x) for x in shwc),
         use_satellite=use_satellite,
         sky_channels=sky_channels,
+        sun_mask_mode=sun_mask_mode,
         sun_mask_radius_deg=sun_mask_radius_deg,
+        sun_mask_sigma_px=sigma_px,
+        sun_mask_sigma_deg=sigma_deg,
         sky_disc_mask_mode=sky_disc_mask_mode,
         sky_disc_mask_radius_px=sky_disc_mask_radius_px,
     )
@@ -855,6 +895,8 @@ def _sky_knob_overrides(
     cli_ray_map: bool | None,
     cli_sun_mask: str | None,
     cli_sky_mask: str | None,
+    cli_sun_mask_sigma_px: float | None = None,
+    cli_sun_mask_sigma_deg: float | None = None,
 ) -> dict:
     """Resolve the 3 sky knobs (CLI > YAML > default) and translate to dataset overrides.
 
@@ -864,12 +906,15 @@ def _sky_knob_overrides(
     ray_map = _resolve_ray_map(dataset_config_name, cli_ray_map)
     sun_mask = _resolve_sun_mask(dataset_config_name, cli_sun_mask)
     sky_mask = _resolve_sky_mask(dataset_config_name, cli_sky_mask)
-    sky_channels, sun_mask_radius_deg, sky_disc_mask_mode = sky_knobs_to_internal(
+    sky_channels, sun_mask_radius_deg, sky_disc_mask_mode, sun_mask_mode = sky_knobs_to_internal(
         ray_map, sun_mask, sky_mask
     )
     return dict(
         sky_channels_override=sky_channels,
+        sun_mask_mode_override=sun_mask_mode,
         sun_mask_radius_deg_override=sun_mask_radius_deg,
+        sun_mask_sigma_px_override=cli_sun_mask_sigma_px,
+        sun_mask_sigma_deg_override=cli_sun_mask_sigma_deg,
         sky_disc_mask_mode_override=sky_disc_mask_mode,
         sky_disc_mask_radius_px_override=None,
     )
@@ -1069,7 +1114,14 @@ def main() -> None:
     use_satellite = _resolve_use_satellite(dataset_cfg, args.use_satellite)
     _ds_kw = dict(
         use_satellite_override=use_satellite,
-        **_sky_knob_overrides(dataset_cfg, args.ray_map, args.sun_mask, args.sky_mask),
+        **_sky_knob_overrides(
+            dataset_cfg,
+            args.ray_map,
+            args.sun_mask,
+            args.sky_mask,
+            args.sun_mask_sigma_px,
+            args.sun_mask_sigma_deg,
+        ),
     )
     train_dataset = FolsomIrradianceDataset(
         **_dataset_kwargs(dataset_cfg, "train", **_ds_kw)
@@ -1092,8 +1144,9 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # ``sky_in_channels`` is the dataset-side source of truth for sky-branch input
-    # width (rgb=3, +ray_map=+3, +sun_mask=+1). Configured via ``--ray-map`` /
-    # ``--sun-mask`` CLI flags or ``sampling.ray_map`` / ``sampling.sun_mask`` in the YAML.
+    # width (rgb=3, +ray_map=+3, +sun_mask=+1, +sky_mask=+1). Configured via
+    # ``--ray-map`` / ``--sun-mask`` / ``--sky-mask`` CLI flags or the matching
+    # ``sampling.*`` keys in the dataset YAML.
     sky_in_channels = int(getattr(train_dataset, "sky_in_channels", 3))
     model = pv_forecasting_model_vit_imgs(
         dev_dn_list=dev_dn_list,
