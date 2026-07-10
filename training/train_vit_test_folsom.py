@@ -1187,9 +1187,9 @@ def main() -> None:
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_batched,
-        num_workers=nw,
+        num_workers=0,
         pin_memory=pin,
-        persistent_workers=nw > 0,
+        persistent_workers=False,
         worker_init_fn=_seed_worker,
     )
     test_loader = DataLoader(
@@ -1197,9 +1197,9 @@ def main() -> None:
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_batched,
-        num_workers=nw,
+        num_workers=0,
         pin_memory=pin,
-        persistent_workers=nw > 0,
+        persistent_workers=False,
         worker_init_fn=_seed_worker,
     )
 
