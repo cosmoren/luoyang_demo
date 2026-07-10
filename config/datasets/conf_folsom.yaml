@@ -6,7 +6,9 @@ site:
   name: Folsom
 
 paths:
-  data_dir: "/home/kyber/projects/digital energy/folsom_ds/processed/full"
+  # Server layout (verified): flat under folsom_ds/ — info.yaml, irradiance/, NWP/, sky.zarr/
+  # (no processed/full on server; that is the local laptop layout only)
+  data_dir: "/shared_work/erfan/folsom_ds"
   pv_path: irradiance
   sky_image_path: sky.zarr # sky for jpg | sky.zarr for zarr
   sat_path: sat_goes_gridsat

@@ -11,8 +11,10 @@ Modes (radii in px at 224×224 unless overridden):
   * ``tight_disc``   — disc at optical center, radius 80
   * ``sun_halo``     — disc at projected sun per frame, radius 50
   * ``sun_only``     — disc at projected sun per frame, radius 30
-  * ``manual_loose`` — keep region inside hand-drawn loose red ring (224² mask)
-  * ``manual_tight`` — keep region inside hand-drawn tight red ring (224² mask)
+  * ``manual_loose`` — keep region inside hand-drawn loose red ring (224² mask;
+    annotation PNGs under ``fisheye_calib/manual_sky_masks/``)
+  * ``manual_tight`` — keep region inside hand-drawn tight red ring (224² mask;
+    annotation PNGs under ``fisheye_calib/manual_sky_masks/``)
 """
 
 from __future__ import annotations
@@ -50,8 +52,8 @@ _OPTICAL_CENTER_MODES: frozenset[str] = frozenset({"valid_disc", "tight_disc"})
 _SUN_CENTER_MODES: frozenset[str] = frozenset({"sun_halo", "sun_only"})
 _MANUAL_MASK_MODES: frozenset[str] = frozenset({"manual_loose", "manual_tight"})
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_MANUAL_MASK_PLAYGROUND_DIR = _PROJECT_ROOT / "playground" / "2026-06-25_manual_sky_masks"
+_THIS_DIR = Path(__file__).resolve().parent
+_MANUAL_MASK_DIR = _THIS_DIR / "manual_sky_masks"
 _MANUAL_ANNOTATION_FILES: dict[str, str] = {
     "manual_loose": "loose.png",
     "manual_tight": "tight.png",
@@ -131,8 +133,8 @@ def _manual_mask_paths(mode: str) -> tuple[Path, Path]:
     if mode not in _MANUAL_MASK_MODES:
         raise ValueError(f"_manual_mask_paths: not a manual mode: {mode!r}")
     stem = mode  # manual_loose -> manual_loose_keep.npy
-    annotation = _MANUAL_MASK_PLAYGROUND_DIR / "inputs" / _MANUAL_ANNOTATION_FILES[mode]
-    keep_npy = _MANUAL_MASK_PLAYGROUND_DIR / "outputs" / f"{stem}_keep.npy"
+    annotation = _MANUAL_MASK_DIR / "inputs" / _MANUAL_ANNOTATION_FILES[mode]
+    keep_npy = _MANUAL_MASK_DIR / "outputs" / f"{stem}_keep.npy"
     return annotation, keep_npy
 
 
