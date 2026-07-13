@@ -10,7 +10,7 @@ paths:
   # (no processed/full on server; that is the local laptop layout only)
   data_dir: "/home/kyber/projects/digital energy/folsom_ds/processed/full"
   pv_path: irradiance
-  sky_image_path: sky.zarr # sky for jpg | sky.zarr for zarr
+  sky_image_path: "/home/kyber/projects/digital energy/folsom_ds/processed2/sky" # pre-resized 224 JPGs; use sky.zarr under data_dir for zarr
   sat_path: sat_goes_gridsat
   nwp_path: NWP
 

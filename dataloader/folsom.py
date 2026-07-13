@@ -75,6 +75,10 @@ except ImportError:  # pragma: no cover - optional until sky_format=zarr
 
 # One open handle per Zarr path (train/val/test share the same store path in typical runs).
 _ZARR_SKY_DS_CACHE: dict[str, Any] = {}
+# Parsed sky timeline per Zarr path. Built once: reparsing ~0.8M timestamps on every
+# ``_stack_sky_from_zarr`` call permanently grew process RSS (~80–100 KB/sample).
+# Value: (time_dim_name, DatetimeIndex naive UTC, int64 ns array for searchsorted).
+_ZARR_SKY_TIME_CACHE: dict[str, tuple[str, pd.DatetimeIndex, np.ndarray]] = {}
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -89,7 +93,7 @@ from SPMF_preprocessing.fisheye_calib.fisheye_sunmask import (
     DEFAULT_SUN_MASK_SIGMA_PX,
 )
 from SPMF_preprocessing.fisheye_calib.fisheye_raymap import compute_ray_map
-from SPMF_preprocessing.fisheye_calib.sky_disc_mask import (
+from SPMF_preprocessing.fisheye_calib.fisheye_skymask import (
     compute_sky_disc_mask,
     normalize_sky_disc_mask_mode,
 )
@@ -102,15 +106,16 @@ from SPMF_preprocessing.fisheye_calib.sky_disc_mask import (
 # byte-identical to the historical 3-channel behavior.
 #
 # Fisheye geometry conventions (training + inference share the same rules):
-#   * Training RGB: raw, unflipped Folsom JPGs resized to ``skyimg_spatial_size`` (224).
-#   * Calibration: (cx, cy, f, alpha0) fitted at native 1536 in horizontally flipped-u
+#   * Training RGB: raw, unflipped Folsom JPGs assumed already ``skyimg_spatial_size`` (224).
+#   * Calibration: (cx, cy, f, alpha0) fitted at native 224 in horizontally flipped-u
 #     space; see ``SPMF_preprocessing/fisheye_calib/`` and ``folsom_fisheye_fit.csv``.
+#     ``load_fisheye_fit("folsom", native_size=224)`` must match CSV space.
 #   * ray_map: ``fisheye_raymap.compute_ray_map`` — image-axis unit vectors; cx mirrored
 #     to raw (``cx_raw = (native-1) - cx_fit``), ``(N-1)/(native-1)`` scaling; alpha0
 #     does not enter.
 #   * sun_mask: ``fisheye_sunmask.compute_sun_mask`` — project in flip space, mirror u to
 #     raw via ``u_raw = (native-1) - u_flip``, Euclidean disc ``R = f_s * deg2rad(radius)``.
-#   * sky_mask: ``sky_disc_mask.compute_sky_disc_mask`` — optional ``[T, 1, H, W]`` float32
+#   * sky_mask: ``fisheye_skymask.compute_sky_disc_mask`` — optional ``[T, 1, H, W]`` float32
 #     0/1 keep-region channel appended when ``sky_mask`` knob != none; RGB is left unchanged.
 _SKY_CHANNEL_RGB = "rgb"
 _SKY_CHANNEL_RAY_MAP = "ray_map"
@@ -404,6 +409,19 @@ def _folsom_parse_zarr_utc_naive(raw: Any) -> pd.DatetimeIndex:
     ).tz_convert("UTC").tz_localize(None)
 
 
+def _folsom_get_cached_zarr_sky_times(ds: Any, zkey: str) -> tuple[str, pd.DatetimeIndex, np.ndarray]:
+    """Return ``(time_dim, z_times, z_times_ns)`` for ``ds``, parsing the full timeline at most once per path."""
+    cached = _ZARR_SKY_TIME_CACHE.get(zkey)
+    if cached is not None:
+        return cached
+    img = ds["images"]
+    time_dim, raw_t = _folsom_sky_zarr_time_dim_and_values(ds, img)
+    z_times = _folsom_parse_zarr_utc_naive(raw_t)
+    z_ns = z_times.asi8.astype(np.int64, copy=True)
+    _ZARR_SKY_TIME_CACHE[zkey] = (time_dim, z_times, z_ns)
+    return _ZARR_SKY_TIME_CACHE[zkey]
+
+
 def _folsom_sky_zarr_time_dim_and_values(ds: Any, img: Any) -> tuple[str, np.ndarray]:
     """
     Return ``(time_dim_name_on_images, time_values_raw)`` so ``len(values) == images.sizes[dim]``.
@@ -457,6 +475,13 @@ def _folsom_sky_zarr_len_time_utc(ds: Any) -> int:
 
 def _folsom_sky_zarr_count_in_time_range(ds: Any, t0: Any, t1: Any) -> int:
     """Count Zarr timesteps with naive UTC in ``[t0, t1]`` inclusive."""
+    # Prefer the parsed timeline cache when this ``ds`` is already keyed (avoids re-parse).
+    for zkey, (_time_dim, _z_times, z_ns) in _ZARR_SKY_TIME_CACHE.items():
+        if _ZARR_SKY_DS_CACHE.get(zkey) is ds:
+            a0, a1 = int(pd.Timestamp(t0).value), int(pd.Timestamp(t1).value)
+            lo = int(np.searchsorted(z_ns, a0, side="left"))
+            hi = int(np.searchsorted(z_ns, a1, side="right"))
+            return max(0, hi - lo)
     img = ds["images"]
     _, raw = _folsom_sky_zarr_time_dim_and_values(ds, img)
     zt = _folsom_parse_zarr_utc_naive(raw)
@@ -1108,15 +1133,25 @@ class FolsomIrradianceDataset(Dataset):
             if zkey not in _ZARR_SKY_DS_CACHE:
                 _ZARR_SKY_DS_CACHE[zkey] = xr.open_zarr(zp)
             self._skyimg_ds = _ZARR_SKY_DS_CACHE[zkey]
+            self._sky_zarr_key = zkey
             self._validate_sky_zarr_schema(self._skyimg_ds)
+            (
+                self._sky_zarr_time_dim,
+                self._sky_zarr_times,
+                self._sky_zarr_times_ns,
+            ) = _folsom_get_cached_zarr_sky_times(self._skyimg_ds, zkey)
             self._sky_times, self._sky_paths, self._sky_times_ns = [], [], []
             try:
-                nt = _folsom_sky_zarr_len_time_utc(self._skyimg_ds)
+                nt = int(self._sky_zarr_times_ns.shape[0])
             except Exception:
                 nt = 0
             _folsom_progress(f"sky Zarr: {zp}  (time steps ≈ {nt:,})")
         else:
             self._skyimg_ds = None
+            self._sky_zarr_key = ""
+            self._sky_zarr_time_dim = ""
+            self._sky_zarr_times = None
+            self._sky_zarr_times_ns = None
             cache_key = f"{self._skyimg_dir}|jpg"
             cached = _SKY_INDEX_CACHE.get(cache_key)
             if cached is None:
@@ -1381,6 +1416,9 @@ class FolsomIrradianceDataset(Dataset):
         works for ``sky_xr_120.zarr``-style stores with a separate ``time_utc`` array), then
         nearest-neighbour per nominal step (90 s tolerance). If the newest kept row is too far
         before the anchor (``_sky_anchor_max_lag``), returns black frames (same spirit as JPEG).
+
+        The full Zarr timeline is parsed once (see ``_ZARR_SKY_TIME_CACHE``); per-sample window
+        lookup uses ``searchsorted`` on cached int64 ns — not a fresh ``DatetimeIndex`` build.
         """
         w = self.skyimg_window_size
         nominal = self._nominal_sky_frame_times(t_end_wall)
@@ -1389,15 +1427,23 @@ class FolsomIrradianceDataset(Dataset):
             return black
         ds = self._skyimg_ds
         img = ds["images"]
-        time_dim, raw_t = _folsom_sky_zarr_time_dim_and_values(ds, img)
-        z_times = _folsom_parse_zarr_utc_naive(raw_t)
-        t_lo, t_hi = pd.Timestamp(nominal[0]), pd.Timestamp(nominal[-1])
-        mask = (z_times >= t_lo) & (z_times <= t_hi)
-        idx = np.nonzero(np.asarray(mask, dtype=bool))[0]
-        if idx.size == 0:
+        time_dim = self._sky_zarr_time_dim
+        z_times = self._sky_zarr_times
+        z_ns_full = self._sky_zarr_times_ns
+        if time_dim is None or z_times is None or z_ns_full is None or not time_dim:
+            # Fallback for partially-initialized callers (should not happen in normal train path).
+            zkey = getattr(self, "_sky_zarr_key", "") or ""
+            time_dim, z_times, z_ns_full = _folsom_get_cached_zarr_sky_times(ds, zkey or "_anon")
+
+        t_lo_ns = int(pd.Timestamp(nominal[0]).value)
+        t_hi_ns = int(pd.Timestamp(nominal[-1]).value)
+        lo = int(np.searchsorted(z_ns_full, t_lo_ns, side="left"))
+        hi = int(np.searchsorted(z_ns_full, t_hi_ns, side="right"))
+        if hi <= lo:
             return black
+        idx = np.arange(lo, hi, dtype=np.int64)
         sub = img.isel({time_dim: idx})
-        z_sub = z_times[idx]
+        z_sub = z_times[lo:hi]
         z_np = np.asarray(sub.values, dtype=np.float32)
         ta = int(sub.get_axis_num(time_dim))
         if ta != 0:
@@ -1410,7 +1456,7 @@ class FolsomIrradianceDataset(Dataset):
         newest = z_sub[-1]
         if t_end - newest > self._sky_anchor_max_lag:
             return black
-        z_ns = z_sub.asi8.astype(np.int64)
+        z_ns = z_ns_full[lo:hi]
         max_delta = int(pd.Timedelta(seconds=90).value)
         frames: list[torch.Tensor] = []
         for want in nominal:
@@ -1424,17 +1470,14 @@ class FolsomIrradianceDataset(Dataset):
         return torch.stack(frames, dim=0)
 
     def _load_sky_tensor(self, path: Path) -> torch.Tensor:
-        """Return ``[3, s, s]`` float32 in ``[0, 1]`` from a raw (unflipped) Folsom JPG."""
+        """Return ``[3, H, W]`` float32 in ``[0, 1]`` from a raw (unflipped) Folsom JPG.
+
+        JPGs are assumed already at ``skyimg_spatial_size`` (no resize).
+        """
         try:
             if path.is_file():
-                try:
-                    resample = Image.Resampling.LANCZOS
-                except AttributeError:
-                    resample = Image.LANCZOS
-                s = self._skyimg_spatial_size
                 with Image.open(path) as im:
                     im = im.convert("RGB")
-                    im = im.resize((s, s), resample)
                     arr = np.asarray(im, dtype=np.uint8).copy()
                 t = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
                 return t.to(torch.float32) / 255.0
@@ -1504,7 +1547,9 @@ class FolsomIrradianceDataset(Dataset):
         mask). The CSV is read at most once per dataset instance.
         """
         if self._fisheye_fit is None:
-            self._fisheye_fit = fisheye_sunmask.load_fisheye_fit("folsom")
+            self._fisheye_fit = fisheye_sunmask.load_fisheye_fit(
+                "folsom", native_size=224
+            )
         return self._fisheye_fit
 
     def _build_ray_and_valid_cache(self) -> None:
