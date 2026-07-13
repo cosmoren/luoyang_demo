@@ -234,22 +234,24 @@ def _gpu_id_for_checkpoint() -> int:
 
 
 def _batch_to_device(batch: dict, device: torch.device) -> dict:
+    # Diagnostic memory run: keep H2D sync (non_blocking=False) so transfers are not
+    # overlapped with host work / pinned-buffer staging.
     out = {
-        "device_id": batch["dev_idx"].to(device),
-        "pv": batch["pv"].to(device),
-        "pv_mask": batch["pv_mask"].to(device),
-        "pv_timefeats": batch["pv_timefeats"].to(device),
-        "forecast_timefeats": batch["forecast_timefeats"].to(device),
-        "kt": batch["kt"].to(device),
-        "kt_mask": batch["kt_mask"].to(device),
-        "p_mean": batch["p_mean"].to(device),
-        "target_pv": batch["target_pv"].to(device),
-        "target_mask": batch["target_mask"].to(device),
-        "target_p_cs": batch["target_p_cs"].to(device),
+        "device_id": batch["dev_idx"].to(device, non_blocking=False),
+        "pv": batch["pv"].to(device, non_blocking=False),
+        "pv_mask": batch["pv_mask"].to(device, non_blocking=False),
+        "pv_timefeats": batch["pv_timefeats"].to(device, non_blocking=False),
+        "forecast_timefeats": batch["forecast_timefeats"].to(device, non_blocking=False),
+        "kt": batch["kt"].to(device, non_blocking=False),
+        "kt_mask": batch["kt_mask"].to(device, non_blocking=False),
+        "p_mean": batch["p_mean"].to(device, non_blocking=False),
+        "target_pv": batch["target_pv"].to(device, non_blocking=False),
+        "target_mask": batch["target_mask"].to(device, non_blocking=False),
+        "target_p_cs": batch["target_p_cs"].to(device, non_blocking=False),
     }
     for key in ("sat_tensor", "sat_timefeats", "skimg_tensor", "skimg_timefeats", "nwp_tensor"):
         v = batch.get(key)
-        out[key] = None if v is None else v.to(device)
+        out[key] = None if v is None else v.to(device, non_blocking=False)
     return out
 
 
@@ -1170,16 +1172,16 @@ def main() -> None:
     criterion = nn.HuberLoss(delta=_FOLSOM_HUBER_DELTA)
     ema: ModelEMA | None = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
 
-    nw = int(args.num_workers)
-    pin = torch.cuda.is_available()
+    # Diagnostic memory run: force single-process, no pinned H2D staging, no
+    # persistent workers / prefetch. Overrides CLI ``--num_workers`` and CUDA pin.
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_batched,
-        num_workers=nw,
-        pin_memory=pin,
-        persistent_workers=nw > 0,
+        num_workers=0,
+        pin_memory=False,
+        persistent_workers=False,
         worker_init_fn=_seed_worker,
     )
     val_loader = DataLoader(
@@ -1188,7 +1190,7 @@ def main() -> None:
         shuffle=False,
         collate_fn=collate_batched,
         num_workers=0,
-        pin_memory=pin,
+        pin_memory=False,
         persistent_workers=False,
         worker_init_fn=_seed_worker,
     )
@@ -1198,7 +1200,7 @@ def main() -> None:
         shuffle=False,
         collate_fn=collate_batched,
         num_workers=0,
-        pin_memory=pin,
+        pin_memory=False,
         persistent_workers=False,
         worker_init_fn=_seed_worker,
     )
