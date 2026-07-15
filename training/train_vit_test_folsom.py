@@ -1172,16 +1172,15 @@ def main() -> None:
     criterion = nn.HuberLoss(delta=_FOLSOM_HUBER_DELTA)
     ema: ModelEMA | None = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
 
-    # Diagnostic memory run: force single-process, no pinned H2D staging, no
-    # persistent workers / prefetch. Overrides CLI ``--num_workers`` and CUDA pin.
+    nw = int(args.num_workers)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_batched,
-        num_workers=0,
-        pin_memory=False,
-        persistent_workers=False,
+        num_workers=nw,
+        pin_memory=True,
+        persistent_workers=(nw > 0),
         worker_init_fn=_seed_worker,
     )
     val_loader = DataLoader(
@@ -1189,9 +1188,9 @@ def main() -> None:
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_batched,
-        num_workers=0,
-        pin_memory=False,
-        persistent_workers=False,
+        num_workers=nw,
+        pin_memory=True,
+        persistent_workers=(nw > 0),
         worker_init_fn=_seed_worker,
     )
     test_loader = DataLoader(
@@ -1199,9 +1198,9 @@ def main() -> None:
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_batched,
-        num_workers=0,
-        pin_memory=False,
-        persistent_workers=False,
+        num_workers=nw,
+        pin_memory=True,
+        persistent_workers=(nw > 0),
         worker_init_fn=_seed_worker,
     )
 

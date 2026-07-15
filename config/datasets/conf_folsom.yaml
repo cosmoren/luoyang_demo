@@ -6,16 +6,14 @@ site:
   name: Folsom
 
 paths:
-  # Server layout (verified): flat under folsom_ds/ — info.yaml, irradiance/, NWP/, sky.zarr/
-  # (no processed/full on server; that is the local laptop layout only)
   data_dir: "/home/kyber/projects/digital energy/folsom_ds/processed/full"
   pv_path: irradiance
-  sky_image_path: "/home/kyber/projects/digital energy/folsom_ds/processed2/sky" # pre-resized 224 JPGs; use sky.zarr under data_dir for zarr
+  sky_image_path: "sky.zarr" 
   sat_path: sat_goes_gridsat
   nwp_path: NWP
 
 sampling:
-  train_epoch_len: 25000 # number of anchors per training epoch
+  train_epoch_len: 50000 # number of anchors per training epoch
   csv_interval_min: 1
   pv_input_interval_min: 5
   pv_input_len: 576
