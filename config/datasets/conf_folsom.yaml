@@ -23,8 +23,8 @@ sampling:
   train_split: 0.66 
   val_split: 0.17
   test_split: 0.17
-  test_anchor_stride_min: 100
-  val_anchor_stride_min: 250
+  test_anchor_stride_min: 50
+  val_anchor_stride_min: 90
   skyimg_window_size: 30
   skyimg_time_resolution_min: 1
   skyimg_spatial_size: 224

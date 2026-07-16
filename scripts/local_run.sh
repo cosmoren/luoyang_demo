@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# 1) Knobs
+# =============================================================================
+RUN_ROOT="runs/folsom_channel_ablation"
+REPEAT=2
+GPUS=(0 1)
+FREE_MEM_MIB=2048
+POLL_SEC=30
+CONDA_ENV="luoyang"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${PROJECT_ROOT}"
+
+BASE_CMD=(python training/train_vit_test_folsom.py)
+
+# =============================================================================
+# 2) Experiments — edit name|flags (one per line)
+#    Queue order: seed-outer (all exps @ seed 1, then seed 2, ...)
+# =============================================================================
+EXPERIMENTS=(
+  "baseline|--zero-sky --no-ray-map --sun-mask none --sky-mask none"
+  "sky_rgb|--no-ray-map --sun-mask none --sky-mask none"
+  "ray_map|--ray-map --sun-mask none --sky-mask none"
+  "valid_disk|--no-ray-map --sun-mask none --sky-mask valid_disc"
+  "manual_tight|--no-ray-map --sun-mask none --sky-mask tight"
+  "sun_halo|--no-ray-map --sun-mask sun_halo --sky-mask none"
+  "gaussian_angular|--no-ray-map --sun-mask gaussian_angular --sky-mask none"
+)
+
+# =============================================================================
+# 3) Launcher (usually leave alone)
+# =============================================================================
+_conda_activate() {
+  if ! command -v conda >/dev/null 2>&1; then
+    for candidate in \
+      "${HOME}/miniconda3/etc/profile.d/conda.sh" \
+      "${HOME}/anaconda3/etc/profile.d/conda.sh" \
+      "/opt/conda/etc/profile.d/conda.sh"; do
+      if [[ -f "${candidate}" ]]; then
+        # shellcheck source=/dev/null
+        source "${candidate}"
+        break
+      fi
+    done
+  fi
+  # shellcheck disable=SC1091
+  eval "$(conda shell.bash hook 2>/dev/null)" || true
+  conda activate "${CONDA_ENV}"
+}
+
+_gpu_used_mib() {
+  local gpu_id=$1
+  nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "${gpu_id}" \
+    | tr -d ' '
+}
+
+_gpu_has_train_proc() {
+  local gpu_id=$1
+  local pids
+  pids="$(nvidia-smi -i "${gpu_id}" --query-compute-apps=pid --format=csv,noheader 2>/dev/null \
+    | tr -d ' ' | grep -v '^$' || true)"
+  [[ -z "${pids}" ]] && return 1
+  local pid
+  for pid in ${pids}; do
+    if [[ -r "/proc/${pid}/cmdline" ]]; then
+      local cmd
+      cmd="$(tr '\0' ' ' <"/proc/${pid}/cmdline")"
+      if [[ "${cmd}" == *python* ]] || [[ "${cmd}" == *train* ]]; then
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+_gpu_is_free() {
+  local gpu_id=$1
+  local used
+  used="$(_gpu_used_mib "${gpu_id}")"
+  if (( used >= FREE_MEM_MIB )); then
+    return 1
+  fi
+  if _gpu_has_train_proc "${gpu_id}"; then
+    return 1
+  fi
+  return 0
+}
+
+# gpu_id -> pid (empty = free slot we own)
+declare -A GPU_PID=()
+for g in "${GPUS[@]}"; do
+  GPU_PID["$g"]=""
+done
+
+_reap_finished() {
+  local g pid
+  for g in "${GPUS[@]}"; do
+    pid="${GPU_PID[$g]:-}"
+    if [[ -n "${pid}" ]] && ! kill -0 "${pid}" 2>/dev/null; then
+      wait "${pid}" || true
+      GPU_PID["$g"]=""
+    fi
+  done
+}
+
+_wait_for_free_gpu() {
+  while true; do
+    _reap_finished
+    local g
+    for g in "${GPUS[@]}"; do
+      if [[ -z "${GPU_PID[$g]:-}" ]] && _gpu_is_free "${g}"; then
+        echo "${g}"
+        return 0
+      fi
+    done
+    sleep "${POLL_SEC}"
+  done
+}
+
+_conda_activate
+
+JOB_PIDS=()
+for ((seed = 1; seed <= REPEAT; seed++)); do
+  for entry in "${EXPERIMENTS[@]}"; do
+    name="${entry%%|*}"
+    flags="${entry#*|}"
+    run_dir="${RUN_ROOT}/${name}/seed_${seed}"
+    mkdir -p "${run_dir}"
+
+    gpu="$(_wait_for_free_gpu)"
+
+    # shellcheck disable=SC2206
+    extra=( ${flags} )
+    cmd=(
+      env "CUDA_VISIBLE_DEVICES=${gpu}"
+      "${BASE_CMD[@]}"
+      --seed "${seed}"
+      --tb-log-dir "${run_dir}"
+      --checkpoint_dir "${run_dir}"
+      "${extra[@]}"
+    )
+
+    echo "[start] gpu=${gpu} name=${name} seed=${seed} dir=${run_dir}"
+    "${cmd[@]}" >"${run_dir}/train.out" 2>&1 &
+    pid=$!
+    GPU_PID["$gpu"]="${pid}"
+    JOB_PIDS+=("${pid}")
+  done
+done
+
+echo "[wait] ${#JOB_PIDS[@]} jobs ..."
+fail=0
+for pid in "${JOB_PIDS[@]}"; do
+  if ! wait "${pid}"; then
+    fail=1
+  fi
+done
+echo "[done]"
+exit "${fail}"
