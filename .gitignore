@@ -117,6 +117,9 @@ inference_results/
 logs/
 logs_*/
 
+# Local debug outputs (plots, temporary diagnostics, etc.)
+debug_outputs/
+
 # Cursor IDE local config
 .cursor/
 

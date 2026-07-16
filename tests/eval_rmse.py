@@ -8,7 +8,7 @@ import pandas as pd
 
 
 DEFAULT_PRED_CSV = Path(
-    "checkpoints_15m_film_finetune/pv_forecast_vit_test_predictions_task_15m_gpu1_best.csv"
+    "checkpoints_15m_dinov2_free/pv_forecast_vit_test_predictions_task_15m_gpu0_final.csv"
 )
 CAP_KW = 48629.73
 

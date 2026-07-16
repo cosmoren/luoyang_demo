@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=luoyang_2026_total_15m
-#SBATCH --partition=gb10
+#SBATCH --partition=energy
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=12:00:00
-#SBATCH --output=/shared_work/yuan/workspace/luoyang_demo/slurm/logs/train_%x_%j_15m2000.log
+#SBATCH --output=/shared_work/yuan/workspace/luoyang_demo/slurm/logs/train_%x_%j_15m.log
 set -eo pipefail
 
 # ── 任务选择：15m / 4h / 48h ─────────────────────────────────────────────────
@@ -32,7 +32,7 @@ echo "=== start $(date) ==="
 
 # ── 根据 TASK 选配置文件 ──────────────────────────────────────────────────────
 case "$TASK" in
-  15m)  DATASET_CONF=conf_luoyang_2026_15m.yaml ;;
+  15m)  DATASET_CONF=conf_luoyang_2026_15m_sky.yaml ;;
   4h)   DATASET_CONF=conf_luoyang_2026_4h.yaml  ;;
   48h)  DATASET_CONF=conf_luoyang_2026_48h.yaml ;;
   *)    echo "Unknown TASK=$TASK, use 15m / 4h / 48h"; exit 1 ;;
@@ -43,9 +43,11 @@ cd "$PROJECT_ROOT"
 "$YUAN_PY" -u training/train_vit_luoyang2026total.py \
     --task "$TASK" \
     --dataset-config "$DATASET_CONF" \
-    --config conf_train.yaml \
+    --config conf_train_finetune.yaml \
     --num_workers "$NUM_WORKERS" \
     --huber-delta 2000 \
-    --checkpoint_dir /shared_work/yuan/workspace/luoyang_demo/checkpoints_15m_2000_epochs40
+    --checkpoint_dir /shared_work/yuan/workspace/luoyang_demo/checkpoints_15m_imgs_sky_finetune_free \
+    --init-checkpoint /shared_work/yuan/workspace/luoyang_demo/checkpoints_15m_baseline/pv_forecast_vit_best_task_15m_gpu0.pt \
+    --model pv_forecasting_model_vit_imgs
 
 echo "=== done $(date) ==="

@@ -598,6 +598,8 @@ def main() -> None:
         dev_dn_list=dev_dn_list,
         nwp_dropout_prob=args.nwp_dropout_prob,
         nwp_history_dropout_prob=args.nwp_history_dropout_prob,
+        # simvp_in_frames=8,
+        # simvp_img_size=112,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -635,17 +637,24 @@ def main() -> None:
         best_val_rmse = float(ckpt.get("val_rmse", ckpt.get("val_loss", best_val_rmse)))
         print(f"Resumed from {resume_path}, start_epoch={start_epoch}, best_val_rmse={best_val_rmse:.6f}")
     elif args.init_checkpoint:
-        print(f"[startup] Loading init checkpoint: {args.init_checkpoint}")
+        print(f"[startup] Loading init checkpoint (TabM only): {args.init_checkpoint}")
         init_path = Path(args.init_checkpoint).expanduser().resolve()
         if not init_path.is_file():
             raise FileNotFoundError(f"init checkpoint not found: {init_path}")
         ckpt = torch.load(init_path, map_location=device)
-        missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        ckpt_sd = ckpt["model_state_dict"]
+        tabm_prefix = "pv_tabm_head."
+        tabm_sd = {k: v for k, v in ckpt_sd.items() if k.startswith(tabm_prefix)}
+        missing, unexpected = model.load_state_dict(tabm_sd, strict=False)
+        loaded = [k for k in tabm_sd if k not in [u for u in unexpected]]
+        print(f"[init_checkpoint] loaded {len(tabm_sd)} TabM keys from checkpoint")
         if missing:
-            print(f"[init_checkpoint] missing keys (will use current init): {missing}")
-        if unexpected:
-            print(f"[init_checkpoint] unexpected keys (ignored): {unexpected}")
-        print(f"Initialized model weights from {init_path}")
+            non_tabm_missing = [k for k in missing if not k.startswith(tabm_prefix)]
+            tabm_missing = [k for k in missing if k.startswith(tabm_prefix)]
+            if tabm_missing:
+                print(f"[init_checkpoint] TabM keys missing in checkpoint: {tabm_missing}")
+            print(f"[init_checkpoint] {len(non_tabm_missing)} non-TabM keys use fresh init (expected)")
+        print(f"Initialized TabM weights from {init_path}")
 
     if args.freeze_tabm:
         if not (args.resume_checkpoint or args.init_checkpoint):

@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=12:00:00
-#SBATCH --output=/shared_work/yuan/workspace/luoyang_demo/slurm/logs/train_%x_%j_15m2000.log
+#SBATCH --output=/shared_work/yuan/workspace/luoyang_demo/slurm/logs/train_%x_%j_15m.log
 set -eo pipefail
 
 # ── 任务选择：15m / 4h / 48h ─────────────────────────────────────────────────
@@ -28,11 +28,11 @@ NUM_WORKERS=${NUM_WORKERS:-0}
 # ── 环境信息 ─────────────────────────────────────────────────────────────────
 echo "=== job $SLURM_JOB_ID  host $(hostname)  task=$TASK ==="
 echo "=== start $(date) ==="
-"$YUAN_PY" -c "import torch; print('torch', torch.__version__, '| cuda', torch.cuda.is_available(), '|', torch.cuda.get_device_name(0))"
+"$YUAN_PY" -c "import torch; print('torch', torch.__version__, '| cuda', torch.cuda.is_available())"
 
 # ── 根据 TASK 选配置文件 ──────────────────────────────────────────────────────
 case "$TASK" in
-  15m)  DATASET_CONF=conf_luoyang_2026_15m.yaml ;;
+  15m)  DATASET_CONF=conf_luoyang_2026_15m_sky.yaml ;;
   4h)   DATASET_CONF=conf_luoyang_2026_4h.yaml  ;;
   48h)  DATASET_CONF=conf_luoyang_2026_48h.yaml ;;
   *)    echo "Unknown TASK=$TASK, use 15m / 4h / 48h"; exit 1 ;;
@@ -46,6 +46,7 @@ cd "$PROJECT_ROOT"
     --config conf_train.yaml \
     --num_workers "$NUM_WORKERS" \
     --huber-delta 2000 \
-    --checkpoint_dir /shared_work/yuan/workspace/luoyang_demo/checkpoints_15m_2000_epochs40
+    --checkpoint_dir /shared_work/yuan/workspace/luoyang_demo/checkpoints_15m_film_scratch_40epochs \
+    --model pv_forecasting_model_tabm_FiLM
 
 echo "=== done $(date) ==="

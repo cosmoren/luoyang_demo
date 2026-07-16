@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=luoyang_2026_total_15m
-#SBATCH --partition=gb10
+#SBATCH --partition=energy
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=12:00:00
-#SBATCH --output=/shared_work/yuan/workspace/luoyang_demo/slurm/logs/train_%x_%j_15m2000.log
+#SBATCH --output=/shared_work/yuan/workspace/luoyang_demo/slurm/logs/train_%x_%j_15m.log
 set -eo pipefail
 
 # ── 任务选择：15m / 4h / 48h ─────────────────────────────────────────────────
@@ -40,12 +40,41 @@ esac
 
 # ── 训练 ─────────────────────────────────────────────────────────────────────
 cd "$PROJECT_ROOT"
+
 "$YUAN_PY" -u training/train_vit_luoyang2026total.py \
     --task "$TASK" \
     --dataset-config "$DATASET_CONF" \
     --config conf_train.yaml \
     --num_workers "$NUM_WORKERS" \
     --huber-delta 2000 \
-    --checkpoint_dir /shared_work/yuan/workspace/luoyang_demo/checkpoints_15m_2000_epochs40
+    --checkpoint_dir /shared_work/yuan/workspace/luoyang_demo/checkpoints_15m_imgs_baseline2 \
+    --model pv_forecasting_model_vit_simvp
+
+"$YUAN_PY" -u training/train_vit_luoyang2026total.py \
+    --task "$TASK" \
+    --dataset-config "$DATASET_CONF" \
+    --config conf_train.yaml \
+    --num_workers "$NUM_WORKERS" \
+    --huber-delta 2000 \
+    --checkpoint_dir /shared_work/yuan/workspace/luoyang_demo/checkpoints_15m_imgs_baseline3 \
+    --model pv_forecasting_model_vit_simvp
+
+"$YUAN_PY" -u training/train_vit_luoyang2026total.py \
+    --task "$TASK" \
+    --dataset-config "$DATASET_CONF" \
+    --config conf_train.yaml \
+    --num_workers "$NUM_WORKERS" \
+    --huber-delta 2000 \
+    --checkpoint_dir /shared_work/yuan/workspace/luoyang_demo/checkpoints_15m_imgs_baseline4 \
+    --model pv_forecasting_model_vit_simvp
+
+"$YUAN_PY" -u training/train_vit_luoyang2026total.py \
+    --task "$TASK" \
+    --dataset-config "$DATASET_CONF" \
+    --config conf_train.yaml \
+    --num_workers "$NUM_WORKERS" \
+    --huber-delta 2000 \
+    --checkpoint_dir /shared_work/yuan/workspace/luoyang_demo/checkpoints_15m_imgs_baseline5 \
+    --model pv_forecasting_model_vit_simvp
 
 echo "=== done $(date) ==="

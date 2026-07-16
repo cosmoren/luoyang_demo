@@ -1,7 +1,7 @@
 training:
-  epochs: 5
-  lr: 1e-4
-  batch_size: 32
+  epochs: 10
+  lr: 2e-4
+  batch_size: 64
   save_every: 5
   # dataset holds large in-memory caches; each worker forks a full copy,
   # so num_workers > 0 can easily OOM the node. Keep 0 unless memory allows.
@@ -19,4 +19,4 @@ training:
   # true  = lock pv_tabm_head (typical finetune with --init-checkpoint)
   # false = train everything (typical training from scratch)
   # CLI --freeze-tabm / --no-freeze-tabm overrides this value.
-  freeze_tabm: true
+  freeze_tabm: false

@@ -14,6 +14,7 @@ import torch
 import xarray as xr
 import yaml
 import matplotlib.pyplot as plt
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -521,6 +522,19 @@ class PVDataset(Dataset):
         else:
             print(f"[PVDataset2026] WARNING: sky zarr dir not found: {self._skyimg_dir}")
         _log_stage("sat/sky source init")
+
+        # ASI mask: binary sky-camera valid-pixel mask, stored in the dataset root (parent of skyimg_dir).
+        _asi_mask_path = self._skyimg_dir.parent / "asi_mask.png"
+        if _asi_mask_path.exists():
+            _raw = np.array(Image.open(_asi_mask_path).convert("L"))  # grayscale uint8 H×W
+            self.asi_mask: np.ndarray = (_raw > 127).astype(np.float32)  # bool-like float32
+            print(f"[PVDataset2026] asi_mask loaded: shape={self.asi_mask.shape} "
+                  f"valid_ratio={self.asi_mask.mean():.3f}")
+
+            print(self.asi_mask.shape, self.asi_mask.sum())
+        else:
+            self.asi_mask = None
+            print(f"[PVDataset2026] WARNING: asi_mask.png not found at {_asi_mask_path}")
 
         cfg = {}
         if self._config_path.is_file():
@@ -1040,6 +1054,13 @@ class PVDataset(Dataset):
                         ],
                         dim=0,
                     )
+                # Append asi_mask as an extra channel [T, C, H, W] -> [T, C+1, H, W]
+                if self.asi_mask is not None:
+                    T = sky_tensor.shape[0]
+                    mask_channel = torch.from_numpy(self.asi_mask).to(sky_tensor.dtype)  # [H, W]
+                    mask_channel = mask_channel.unsqueeze(0).unsqueeze(0).expand(T, 1, -1, -1)  # [T,1,H,W]
+                    sky_tensor = torch.cat([sky_tensor, mask_channel], dim=1)  # [T, C+1, H, W]
+
                 skimg_valid = torch.tensor(1.0, dtype=torch.float32)
 
         return {
@@ -1485,7 +1506,8 @@ def collate_batched(batch: list[dict]) -> dict:
         "skimg_tensor",
         "skimg_timefeats",
         "skimg_valid",
-        default_tensor_shape=(30, 3, 224, 224),
+        # 4 channels: RGB + asi_mask (appended in _sat_sky_for_sample)
+        default_tensor_shape=(30, 4, 224, 224),
         default_time_shape=(30, 9),
     )
     out["skimg_tensor"] = skimg_tensor

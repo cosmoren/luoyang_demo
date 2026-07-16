@@ -7,6 +7,145 @@ import torch.nn as nn
 
 from modules.SkyCompressor import build_continuous_time_embed
 
+# DINOv2 hub model name → feature dim / patch size
+_DINOV2_SPECS: dict[str, tuple[int, int]] = {
+    "dinov2_vits14": (384, 14),
+    "dinov2_vitb14": (768, 14),
+    "dinov2_vitl14": (1024, 14),
+    "dinov2_vitg14": (1536, 14),
+}
+
+
+class SkyDINOv2PatchSpatiotemporalEmbed(nn.Module):
+    """
+    Extract sky-image patch tokens with a frozen/finetunable DINOv2 backbone.
+
+    Input ``[B, T, C, H, W]`` (C>=3; optional 4th channel used as ASI mask on RGB)
+    → RGB ImageNet-normalized → DINOv2 patch tokens → Linear project to ``embed_dim``
+    → add spatial + continuous temporal embeddings.
+
+    Output shape matches the Conv patch embedder: ``[B, T, P, D]`` with
+    ``P = (image_size / patch_size)^2`` (256 for 224 / 14).
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 64,
+        image_size: int = 224,
+        model_name: str = "dinov2_vits14",
+        freeze_backbone: bool = True,
+        pretrained: bool = True,
+        in_channels: int = 4,
+    ):
+        super().__init__()
+        if model_name not in _DINOV2_SPECS:
+            raise ValueError(
+                f"Unknown DINOv2 model {model_name!r}; choose from {sorted(_DINOV2_SPECS)}"
+            )
+        backbone_dim, patch_size = _DINOV2_SPECS[model_name]
+        if image_size % patch_size != 0:
+            raise ValueError(
+                f"image_size ({image_size}) must be divisible by DINOv2 patch_size ({patch_size})"
+            )
+
+        self.embed_dim = embed_dim
+        self.patch_size = patch_size
+        self.image_size = image_size
+        self.in_channels = in_channels
+        self.grid_h = image_size // patch_size
+        self.grid_w = image_size // patch_size
+        self.num_patches = self.grid_h * self.grid_w
+        self.backbone_dim = backbone_dim
+        self.freeze_backbone = bool(freeze_backbone)
+
+        self.backbone = torch.hub.load(
+            "facebookresearch/dinov2",
+            model_name,
+            pretrained=pretrained,
+        )
+        if self.freeze_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+            self.backbone.eval()
+
+        self.proj = nn.Linear(backbone_dim, embed_dim)
+        self.spatial_pos_embed = nn.Parameter(torch.zeros(1, 1, self.num_patches, embed_dim))
+        nn.init.trunc_normal_(self.spatial_pos_embed, std=0.02)
+
+        # ImageNet normalization expected by DINOv2
+        self.register_buffer(
+            "_img_mean",
+            torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_img_std",
+            torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # Keep backbone in eval when frozen so BN/dropout (if any) stay fixed.
+        if self.freeze_backbone:
+            self.backbone.eval()
+        return self
+
+    def _prepare_rgb(self, x: torch.Tensor) -> torch.Tensor:
+        """Take RGB (optionally mask with ASI channel), map to ImageNet-normalized [N,3,H,W]."""
+        if x.shape[1] < 3:
+            raise ValueError(f"expected at least 3 channels, got {x.shape[1]}")
+        rgb = x[:, :3]
+        if x.shape[1] >= 4:
+            # 4th channel is ASI valid mask in [0,1]; zero out invalid pixels
+            rgb = rgb * x[:, 3:4]
+        # Heuristic: raw uint8-like floats in 0..255
+        if float(rgb.detach().max()) > 1.5:
+            rgb = rgb / 255.0
+        rgb = (rgb - self._img_mean) / self._img_std
+        return rgb
+
+    def forward(self, x: torch.Tensor, timefeats: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            x: ``[B, T, C, H, W]`` with ``H=W=image_size``.
+            timefeats: ``[B, T, 1]`` delta_t per frame.
+        Returns:
+            ``[B, T, P, D]``.
+        """
+        bsz, num_frames, channels, height, width = x.shape
+        if height != self.image_size or width != self.image_size:
+            raise ValueError(f"expected H=W={self.image_size}, got {height}x{width}")
+        if channels < 3:
+            raise ValueError(f"expected at least 3 input channels, got {channels}")
+        if timefeats is None:
+            raise ValueError("timefeats is required with shape [B, T, 1]")
+
+        x_bt = x.reshape(bsz * num_frames, channels, height, width)
+        rgb = self._prepare_rgb(x_bt)
+
+        if self.freeze_backbone:
+            with torch.no_grad():
+                feats = self.backbone.forward_features(rgb)
+        else:
+            feats = self.backbone.forward_features(rgb)
+
+        patch_tokens = feats["x_norm_patchtokens"]  # [B*T, P, backbone_dim]
+        if patch_tokens.shape[1] != self.num_patches:
+            raise ValueError(
+                f"DINOv2 returned {patch_tokens.shape[1]} patches, expected {self.num_patches} "
+                f"for image_size={self.image_size}, patch_size={self.patch_size}"
+            )
+
+        tokens = self.proj(patch_tokens.to(dtype=self.proj.weight.dtype))  # [B*T, P, D]
+        tokens = tokens.view(bsz, num_frames, self.num_patches, self.embed_dim)
+        tokens = tokens + self.spatial_pos_embed
+        time_tokens = build_continuous_time_embed(
+            timefeats.squeeze(-1).to(dtype=torch.float32), self.embed_dim
+        ).to(dtype=tokens.dtype).unsqueeze(2)
+        tokens = tokens + time_tokens
+        return tokens
+
 
 class SkyPatchSpatiotemporalEmbed(nn.Module):
     """
@@ -18,7 +157,8 @@ class SkyPatchSpatiotemporalEmbed(nn.Module):
     Mirrors :class:`modules.SatEncoder.VideoPatchSpatiotemporalEmbed` for symmetry.
     """
 
-    def __init__(self, embed_dim: int = 192, patch_size: int = 16, image_size: int = 112):
+    def __init__(self, embed_dim: int = 192, patch_size: int = 16, image_size: int = 112,
+                 in_channels: int = 3):
         super().__init__()
         if image_size % patch_size != 0:
             raise ValueError(
@@ -27,11 +167,12 @@ class SkyPatchSpatiotemporalEmbed(nn.Module):
         self.embed_dim = embed_dim
         self.patch_size = patch_size
         self.image_size = image_size
+        self.in_channels = in_channels
         self.grid_h = image_size // patch_size
         self.grid_w = image_size // patch_size
         self.num_patches = self.grid_h * self.grid_w
 
-        self.patch_embed = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.patch_embed = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
         self.spatial_pos_embed = nn.Parameter(torch.zeros(1, 1, self.num_patches, embed_dim))
         nn.init.trunc_normal_(self.spatial_pos_embed, std=0.02)
 
@@ -46,8 +187,8 @@ class SkyPatchSpatiotemporalEmbed(nn.Module):
         bsz, num_frames, channels, height, width = x.shape
         if height != self.image_size or width != self.image_size:
             raise ValueError(f"expected H=W={self.image_size}, got {height}x{width}")
-        if channels != 3:
-            raise ValueError(f"expected 3 input channels, got {channels}")
+        if channels != self.in_channels:
+            raise ValueError(f"expected {self.in_channels} input channels, got {channels}")
         if timefeats is None:
             raise ValueError("timefeats is required with shape [B, T, 1]")
 
@@ -66,7 +207,7 @@ class SkyPatchSpatiotemporalEmbed(nn.Module):
 
 def patchify_spatiotemporal_sky_images(
     x: torch.Tensor,
-    embedder: SkyPatchSpatiotemporalEmbed,
+    embedder: SkyPatchSpatiotemporalEmbed | SkyDINOv2PatchSpatiotemporalEmbed,
     timefeats: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Patchify sky-image frames and add spatial/temporal embeddings."""
