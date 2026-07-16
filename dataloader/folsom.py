@@ -25,7 +25,9 @@ Training usage (same two-step pattern as ``dataloader.luoyang``):
 - ``forecast_timefeats``: ``[B, T_out, 9]`` (same on forecast timesteps)
 - ``target_ghi``, ``target_dni``, ``target_dhi``: ``[B, T_out]``
 - ``target_mask``: ``[B, T_out]`` (valid **GHI** forecast timesteps; DNI/DHI validity does not affect this mask)
-- ``skimg_tensor``: ``[B, T_sky, 3, H, W]`` with ``H=W=skyimg_spatial_size``
+- ``skimg_tensor``: ``[B, T_sky, C_sky, H, W]`` where ``C_sky`` = ``sky_in_channels``
+  (RGB, optionally +ray_map +sun_mask +sky_mask, and always +image_valid for Zarr)
+  and ``H=W=skyimg_spatial_size``
 - ``skimg_timefeats``: ``[B, T_sky, feat_dim]``
 - ``nwp_tensor``: ``[B, T_out, C_nwp]`` (zeros + invalid mask if NWP file missing)
 
@@ -43,8 +45,10 @@ resolves per-frame ``.npy`` shards under ``<data_dir>/<paths.sat_path>/YYYY/MM/`
 emits real tensors. The model accepts both: ``models/models.py`` zero-paths the sat arm
 when ``sat_tensor is None`` (or its max is 0).
 
-Sky imagery: ``paths.sky_format`` is ``jpg`` (default; ``YYYYMMDDHHMMSS.jpg`` under ``paths.sky_image_path``)
-or ``zarr`` (``xr.open_zarr`` on that path; see ``config/datasets/conf_folsom.yaml``). Naive CSV times are read as **UTC**.
+Sky imagery: auto-detected from the resolved ``paths.sky_image_path`` folder — ``jpg`` when it holds
+``YYYYMMDDHHMMSS.jpg`` files, ``zarr`` when it is a Zarr store (``.zarr`` suffix or Zarr metadata /
+``images`` / ``time_utc`` subgroups). Set ``paths.sky_format`` explicitly to override. Naive CSV times
+are read as **UTC**.
 """
 
 import argparse
@@ -72,6 +76,10 @@ except ImportError:  # pragma: no cover - optional until sky_format=zarr
 
 # One open handle per Zarr path (train/val/test share the same store path in typical runs).
 _ZARR_SKY_DS_CACHE: dict[str, Any] = {}
+# Parsed sky timeline per Zarr path. Built once: reparsing ~0.8M timestamps on every
+# ``_stack_sky_from_zarr`` call permanently grew process RSS (~80–100 KB/sample).
+# Value: (time_dim_name, DatetimeIndex naive UTC, int64 ns array for searchsorted).
+_ZARR_SKY_TIME_CACHE: dict[str, tuple[str, pd.DatetimeIndex, np.ndarray]] = {}
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -80,6 +88,222 @@ if str(_PROJECT_ROOT) not in sys.path:
 from config_utils import get_resolved_paths
 from dataloader.luoyang_mem import list_csv_files
 from modules.solar_encoder import compute_solar_features, delta_time_encoder, solar_features_encoder
+from SPMF_preprocessing.fisheye_calib import fisheye_sunmask
+from SPMF_preprocessing.fisheye_calib.fisheye_sunmask import (
+    DEFAULT_SUN_MASK_SIGMA_DEG,
+    DEFAULT_SUN_MASK_SIGMA_PX,
+)
+from SPMF_preprocessing.fisheye_calib.fisheye_raymap import compute_ray_map
+from SPMF_preprocessing.fisheye_calib.fisheye_skymask import (
+    compute_sky_disc_mask,
+    normalize_sky_disc_mask_mode,
+)
+
+# Sky-branch channel-selection abstraction (Folsom only, for now). The dataset YAML
+# exposes 3 knobs under ``sampling:`` (``ray_map`` / ``sun_mask`` / ``sky_mask``); see
+# ``sky_knobs_to_internal``, which translates them into the internal ``sky_channels``
+# list. The resulting ``skimg_tensor`` concatenates each feature along the channel dim
+# in canonical order (rgb, ray_map, sun_mask, sky_mask), followed by the always-on
+# Zarr-only image_valid channel. JPEG with all knobs off remains byte-identical to
+# the historical 3-channel behavior.
+#
+# Fisheye geometry conventions (training + inference share the same rules):
+#   * Training RGB: raw, unflipped Folsom JPGs assumed already ``skyimg_spatial_size`` (224).
+#   * Calibration: (cx, cy, f, alpha0) fitted at native 224 in horizontally flipped-u
+#     space; see ``SPMF_preprocessing/fisheye_calib/`` and ``folsom_fisheye_fit.csv``.
+#     ``load_fisheye_fit("folsom", native_size=224)`` must match CSV space.
+#   * ray_map: ``fisheye_raymap.compute_ray_map`` — image-axis unit vectors; cx mirrored
+#     to raw (``cx_raw = (native-1) - cx_fit``), ``(N-1)/(native-1)`` scaling; alpha0
+#     does not enter.
+#   * sun_mask: JPEG path uses ``fisheye_sunmask.compute_sun_mask`` (pvlib az/zen →
+#     project in flip space, mirror u to raw). Zarr path uses stored ``sun_u`` /
+#     ``sun_v`` / ``sun_valid`` via ``compute_sun_mask_from_centers`` (no recompute).
+#   * sky_mask: ``fisheye_skymask.compute_sky_disc_mask`` — optional ``[T, 1, H, W]`` float32
+#     0/1 keep-region channel appended when ``sky_mask`` knob != none; RGB is left unchanged.
+_SKY_CHANNEL_RGB = "rgb"
+_SKY_CHANNEL_RAY_MAP = "ray_map"
+_SKY_CHANNEL_SUN_MASK = "sun_mask"
+_SKY_CHANNEL_SKY_MASK = "sky_mask"
+_SKY_CHANNEL_IMAGE_VALID = "image_valid"
+_SKY_CHANNEL_WIDTHS: dict[str, int] = {
+    _SKY_CHANNEL_RGB: 3,
+    _SKY_CHANNEL_RAY_MAP: 3,
+    _SKY_CHANNEL_SUN_MASK: 1,
+    _SKY_CHANNEL_SKY_MASK: 1,
+    _SKY_CHANNEL_IMAGE_VALID: 1,
+}
+_DEFAULT_SKY_CHANNELS: tuple[str, ...] = (_SKY_CHANNEL_RGB,)
+
+# Default mask radius (degrees, converted to pixels as ``R = f_s * deg2rad(radius)``)
+# for the ``sun_mask`` channel; overridable via ``sampling.sun_mask_radius_deg``
+# in the dataset YAML. The sun's apparent radius is ~0.27°, but the bright glare
+# halo on the Folsom fisheye saturates pixels out to ~18-19° from the sun center
+# on overhead-noon clear-sky frames (empirically measured in
+# playground/2026-06-15_sunmask-bigger/measure_halo_v2.py on 2014-05-11:
+# r_max = 18.70° at 20:00Z noon, much smaller at low-sun hours).
+# 30° gives ~60% safety margin so the mask reliably covers sun+halo at all sun
+# positions; at 224x224 this is ~37 px Euclidean radius in image space.
+# See ``_compute_sun_mask_for_frames``.
+_DEFAULT_SUN_MASK_RADIUS_DEG: float = 30.0
+
+def _normalize_sky_channels(raw: Any) -> tuple[str, ...]:
+    """Validate + canonicalize a ``sky_channels`` config value to a tuple of names.
+
+    ``None`` (or missing) → default ``("rgb",)``. Otherwise the value must be a
+    non-empty sequence of unique known names from :data:`_SKY_CHANNEL_WIDTHS`.
+    """
+    if raw is None:
+        return _DEFAULT_SKY_CHANNELS
+    if isinstance(raw, str) or not hasattr(raw, "__iter__"):
+        raise TypeError(
+            f"sky_channels must be a list/tuple of feature names, got {type(raw).__name__}"
+        )
+    names = [str(x).strip() for x in raw]
+    if len(names) == 0:
+        raise ValueError("sky_channels must contain at least one feature name")
+    seen: set[str] = set()
+    for n in names:
+        if n not in _SKY_CHANNEL_WIDTHS:
+            raise ValueError(
+                f"sky_channels: unknown feature {n!r}; valid names are "
+                f"{sorted(_SKY_CHANNEL_WIDTHS)}"
+            )
+        if n in seen:
+            raise ValueError(f"sky_channels: duplicate feature {n!r}")
+        seen.add(n)
+    return tuple(names)
+
+
+def _sky_in_channels(channels: tuple[str, ...]) -> int:
+    return int(sum(_SKY_CHANNEL_WIDTHS[c] for c in channels))
+
+
+# Public sky-branch config surface (3 knobs, replacing the raw ``sky_channels`` /
+# ``sky_disc_mask_mode`` / ``sun_mask_radius_deg`` / ``sky_disc_mask_radius_px`` keys):
+#   * ``ray_map``  (bool)                      -> add the ray_map channel (3ch)
+#   * ``sun_mask`` (none|sun_only|sun_halo)    -> add the sun_mask channel (1ch) + radius preset
+#   * ``sky_mask`` (none|loose|tight|valid_disc) -> optional sky_mask channel (1ch) +
+#     internal disc mode for mask computation (RGB left unmodified)
+# ``sky_knobs_to_internal`` translates these into the constructor's internal
+# ``sky_channels`` / ``sun_mask_radius_deg`` / ``sky_disc_mask_mode`` representation.
+_SUN_MASK_MODES: tuple[str, ...] = (
+    "none",
+    "sun_only",
+    "sun_halo",
+    "gaussian_pixel",
+    "gaussian_angular",
+)
+# Angular radius presets (degrees) for the sun_mask channel per ``sun_mask`` mode.
+# ``sun_halo`` keeps the historical wide default; ``sun_only`` is a tight disc.
+_SUN_MASK_RADIUS_DEG_PRESETS: dict[str, float] = {
+    "sun_only": 10.0,
+    "sun_halo": _DEFAULT_SUN_MASK_RADIUS_DEG,
+}
+_SUN_MASK_HARD_MODES: frozenset[str] = frozenset({"sun_only", "sun_halo"})
+_SKY_MASK_MODES: tuple[str, ...] = ("none", "loose", "tight", "valid_disc")
+_SKY_MASK_TO_DISC_MODE: dict[str, str] = {
+    "none": "none",
+    "loose": "manual_loose",
+    "tight": "manual_tight",
+    "valid_disc": "valid_disc",
+}
+
+
+def normalize_ray_map(raw: Any) -> bool:
+    """Validate + canonicalize the ``ray_map`` knob to a bool (default ``False``)."""
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        v = raw.strip().lower()
+        if v in ("true", "1", "yes", "on"):
+            return True
+        if v in ("false", "0", "no", "off"):
+            return False
+    raise ValueError(f"ray_map must be a boolean, got {raw!r}")
+
+
+def normalize_sun_mask(raw: Any) -> str:
+    """Validate + canonicalize the ``sun_mask`` knob (default ``'none'``)."""
+    if raw is None:
+        return "none"
+    mode = str(raw).strip()
+    if mode not in _SUN_MASK_MODES:
+        raise ValueError(
+            f"sun_mask must be one of {list(_SUN_MASK_MODES)}, got {raw!r}"
+        )
+    return mode
+
+
+def normalize_sky_mask(raw: Any) -> str:
+    """Validate + canonicalize the ``sky_mask`` knob (default ``'none'``)."""
+    if raw is None:
+        return "none"
+    mode = str(raw).strip()
+    if mode not in _SKY_MASK_MODES:
+        raise ValueError(
+            f"sky_mask must be one of {list(_SKY_MASK_MODES)}, got {raw!r}"
+        )
+    return mode
+
+
+def resolve_sun_mask_sigmas(
+    sampling_cfg: dict | None = None,
+    *,
+    sigma_px_override: float | None = None,
+    sigma_deg_override: float | None = None,
+) -> tuple[float, float]:
+    """Read ``sun_mask_sigma_px`` / ``sun_mask_sigma_deg`` from sampling config."""
+    cfg = sampling_cfg or {}
+    sigma_px = (
+        float(sigma_px_override)
+        if sigma_px_override is not None
+        else float(cfg.get("sun_mask_sigma_px", DEFAULT_SUN_MASK_SIGMA_PX))
+    )
+    sigma_deg = (
+        float(sigma_deg_override)
+        if sigma_deg_override is not None
+        else float(cfg.get("sun_mask_sigma_deg", DEFAULT_SUN_MASK_SIGMA_DEG))
+    )
+    if not (sigma_px > 0.0):
+        raise ValueError(f"sun_mask_sigma_px must be > 0 (got {sigma_px!r})")
+    if not (sigma_deg > 0.0):
+        raise ValueError(f"sun_mask_sigma_deg must be > 0 (got {sigma_deg!r})")
+    return sigma_px, sigma_deg
+
+
+def sky_knobs_to_internal(
+    ray_map: Any,
+    sun_mask: Any,
+    sky_mask: Any,
+) -> tuple[tuple[str, ...], float | None, str, str]:
+    """Translate the 3 public sky knobs into the internal constructor representation.
+
+    Returns ``(sky_channels, sun_mask_radius_deg, sky_disc_mask_mode, sun_mask_mode)``:
+      * ``sky_channels`` = ``("rgb",)`` + ``("ray_map",)`` if ``ray_map`` +
+        ``("sun_mask",)`` if ``sun_mask != 'none'`` + ``("sky_mask",)`` if
+        ``sky_mask != 'none'`` (canonical order preserved).
+      * ``sun_mask_radius_deg`` = preset for hard-disc modes (``None`` when
+        ``sun_mask`` is ``'none'`` or a Gaussian mode — the channel is absent or
+        the radius is unused).
+      * ``sky_disc_mask_mode`` = internal disc mode for ``sky_mask`` channel computation
+        (``'none'`` when the knob is off).
+      * ``sun_mask_mode`` = canonical ``sun_mask`` knob value.
+    """
+    ray_map_on = normalize_ray_map(ray_map)
+    sun_mask_mode = normalize_sun_mask(sun_mask)
+    sky_mask_mode = normalize_sky_mask(sky_mask)
+    channels: list[str] = [_SKY_CHANNEL_RGB]
+    if ray_map_on:
+        channels.append(_SKY_CHANNEL_RAY_MAP)
+    if sun_mask_mode != "none":
+        channels.append(_SKY_CHANNEL_SUN_MASK)
+    if sky_mask_mode != "none":
+        channels.append(_SKY_CHANNEL_SKY_MASK)
+    sun_mask_radius_deg = _SUN_MASK_RADIUS_DEG_PRESETS.get(sun_mask_mode)
+    sky_disc_mask_mode = _SKY_MASK_TO_DISC_MODE[sky_mask_mode]
+    return tuple(channels), sun_mask_radius_deg, sky_disc_mask_mode, sun_mask_mode
 
 # Default dataset YAML for Folsom under the new ``config/datasets/`` layout. Used only by the
 # smoke CLI as a convenience default; ``FolsomIrradianceDataset`` itself takes ``config_path``
@@ -157,9 +381,8 @@ _FOLSOM_TARGET_MASK_NIGHT_THRESHOLD_P_CS = 0.02
 # ViT input/output scaling for ``kt`` (W/m^2-ish; see ``forward_vit`` docstring in the
 # trainer). Single source of truth so trainer / eval / inference stay in lockstep.
 _FOLSOM_KT_INPUT_SCALE = 4000.0
-# Huber loss delta in W/m^2, sized for the PV-target residual scale (~3% of 1000 W/m^2
-# peak, rounded to 30). Shared by trainer + eval Huber sites.
-_FOLSOM_HUBER_DELTA = 30.0
+# Huber loss delta in W/m^2 for PV-target residuals. Shared by trainer + eval Huber sites.
+_FOLSOM_HUBER_DELTA = 700.0
 
 
 def _compute_folsom_p_cs(
@@ -189,6 +412,19 @@ def _folsom_parse_zarr_utc_naive(raw: Any) -> pd.DatetimeIndex:
     return pd.DatetimeIndex(
         pd.to_datetime(np.asarray(raw), utc=True)
     ).tz_convert("UTC").tz_localize(None)
+
+
+def _folsom_get_cached_zarr_sky_times(ds: Any, zkey: str) -> tuple[str, pd.DatetimeIndex, np.ndarray]:
+    """Return ``(time_dim, z_times, z_times_ns)`` for ``ds``, parsing the full timeline at most once per path."""
+    cached = _ZARR_SKY_TIME_CACHE.get(zkey)
+    if cached is not None:
+        return cached
+    img = ds["images"]
+    time_dim, raw_t = _folsom_sky_zarr_time_dim_and_values(ds, img)
+    z_times = _folsom_parse_zarr_utc_naive(raw_t)
+    z_ns = z_times.asi8.astype(np.int64, copy=True)
+    _ZARR_SKY_TIME_CACHE[zkey] = (time_dim, z_times, z_ns)
+    return _ZARR_SKY_TIME_CACHE[zkey]
 
 
 def _folsom_sky_zarr_time_dim_and_values(ds: Any, img: Any) -> tuple[str, np.ndarray]:
@@ -244,6 +480,13 @@ def _folsom_sky_zarr_len_time_utc(ds: Any) -> int:
 
 def _folsom_sky_zarr_count_in_time_range(ds: Any, t0: Any, t1: Any) -> int:
     """Count Zarr timesteps with naive UTC in ``[t0, t1]`` inclusive."""
+    # Prefer the parsed timeline cache when this ``ds`` is already keyed (avoids re-parse).
+    for zkey, (_time_dim, _z_times, z_ns) in _ZARR_SKY_TIME_CACHE.items():
+        if _ZARR_SKY_DS_CACHE.get(zkey) is ds:
+            a0, a1 = int(pd.Timestamp(t0).value), int(pd.Timestamp(t1).value)
+            lo = int(np.searchsorted(z_ns, a0, side="left"))
+            hi = int(np.searchsorted(z_ns, a1, side="right"))
+            return max(0, hi - lo)
     img = ds["images"]
     _, raw = _folsom_sky_zarr_time_dim_and_values(ds, img)
     zt = _folsom_parse_zarr_utc_naive(raw)
@@ -256,6 +499,80 @@ def _folsom_progress(msg: str) -> None:
     if os.environ.get("FOLSOM_QUIET", "").strip().lower() in ("1", "true", "yes"):
         return
     print(f"[Folsom] {msg}", file=sys.stderr, flush=True)
+
+
+def _folsom_path_has_zarr_markers(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    if (path / ".zgroup").is_file() or (path / ".zarray").is_file():
+        return True
+    if (path / "zarr.json").is_file():
+        return True
+    return False
+
+
+def _folsom_sky_path_looks_like_zarr(sky_path: Path) -> bool:
+    sky_path = sky_path.resolve()
+    if sky_path.name.lower().endswith(".zarr"):
+        return True
+    if _folsom_path_has_zarr_markers(sky_path):
+        return True
+    for sub in ("images", "time_utc"):
+        if _folsom_path_has_zarr_markers(sky_path / sub):
+            return True
+    return False
+
+
+def _folsom_sky_path_has_jpg(sky_path: Path) -> bool:
+    if not sky_path.is_dir():
+        return False
+    for p in sky_path.iterdir():
+        if p.is_file() and p.suffix.lower() == ".jpg":
+            return True
+    return False
+
+
+def _detect_folsom_sky_format(
+    sky_path: Path,
+    *,
+    config_path: Path | None = None,
+) -> str:
+    """
+    Infer ``jpg`` vs ``zarr`` from the resolved sky folder when ``paths.sky_format`` is omitted.
+    """
+    sky_path = sky_path.resolve()
+    cfg_hint = f" (config: {config_path})" if config_path else ""
+
+    is_zarr = _folsom_sky_path_looks_like_zarr(sky_path)
+    has_jpg = _folsom_sky_path_has_jpg(sky_path)
+
+    if is_zarr and has_jpg:
+        raise ValueError(
+            f"Could not auto-detect sky format under {sky_path}{cfg_hint}: "
+            "directory looks like both Zarr and JPEG. "
+            "Set paths.sky_format explicitly to 'jpg' or 'zarr'."
+        )
+    if is_zarr:
+        return "zarr"
+    if has_jpg:
+        return "jpg"
+
+    if not sky_path.exists():
+        raise FileNotFoundError(
+            f"Sky image path not found: {sky_path}{cfg_hint}. "
+            "Create the directory with JPEG or Zarr data, or set paths.sky_format explicitly."
+        )
+    if not sky_path.is_dir():
+        raise ValueError(
+            f"Sky image path is not a directory: {sky_path}{cfg_hint}. "
+            "Expected a folder of YYYYMMDDHHMMSS.jpg files or a Zarr store; "
+            "set paths.sky_format explicitly if using a non-standard layout."
+        )
+    raise ValueError(
+        f"Could not auto-detect sky format under {sky_path}{cfg_hint}: "
+        "no Zarr metadata (.zgroup/.zarray/zarr.json or images/time_utc subgroups) "
+        "and no *.jpg files found. Populate the folder or set paths.sky_format to 'jpg' or 'zarr'."
+    )
 
 
 def _count_newlines(path: Path) -> int:
@@ -354,7 +671,15 @@ def _resolve_folsom_csv_path(conf: dict, project_root: Path | None = None) -> Pa
 
 
 def _resolve_folsom_nwp_csv_path(conf: dict, project_root: Path | None = None) -> Path:
-    """Resolve ``paths.folsom_nwp_merged_csv`` from config."""
+    """Resolve the Folsom NWP merged CSV from config.
+
+    When ``paths.folsom_nwp_merged_csv`` is set it is used verbatim (relative to
+    ``data_dir`` unless absolute). When absent/empty, the ``paths.nwp_path`` folder
+    is globbed: a file literally named ``nwp_merged_averaged.csv`` is preferred, else
+    the sole ``*.csv`` in the folder is used. Raises ``FileNotFoundError`` when no CSV
+    can be located (the caller treats this as "no NWP"); raises ``RuntimeError`` when
+    the folder is ambiguous (several CSVs, none named ``nwp_merged_averaged.csv``).
+    """
     root = project_root if project_root is not None else _PROJECT_ROOT
     paths = conf.get("paths") or {}
     if paths.get("data_dir") is None or not str(paths.get("data_dir", "")).strip():
@@ -366,13 +691,35 @@ def _resolve_folsom_nwp_csv_path(conf: dict, project_root: Path | None = None) -
         data_dir = data_dir.resolve()
 
     rel = paths.get("folsom_nwp_merged_csv")
-    if rel is None or not str(rel).strip():
-        raise KeyError("conf paths.folsom_nwp_merged_csv is required for Folsom")
-    rel_p = Path(str(rel).strip())
-    p = rel_p.resolve() if rel_p.is_absolute() else (data_dir / rel_p).resolve()
-    if not p.is_file():
-        raise FileNotFoundError(f"Folsom NWP merged CSV not found: {p}")
-    return p
+    if rel is not None and str(rel).strip():
+        rel_p = Path(str(rel).strip())
+        p = rel_p.resolve() if rel_p.is_absolute() else (data_dir / rel_p).resolve()
+        if not p.is_file():
+            raise FileNotFoundError(f"Folsom NWP merged CSV not found: {p}")
+        return p
+
+    nwp_rel = paths.get("nwp_path")
+    if nwp_rel is None or not str(nwp_rel).strip():
+        raise FileNotFoundError(
+            "Folsom NWP not configured: set paths.nwp_path (folder) or paths.folsom_nwp_merged_csv (file)"
+        )
+    nwp_p = Path(str(nwp_rel).strip())
+    nwp_dir = nwp_p.resolve() if nwp_p.is_absolute() else (data_dir / nwp_p).resolve()
+    if not nwp_dir.is_dir():
+        raise FileNotFoundError(f"Folsom NWP folder not found: {nwp_dir}")
+    csvs = sorted(nwp_dir.glob("*.csv"))
+    if not csvs:
+        raise FileNotFoundError(f"No NWP CSV found in {nwp_dir}")
+    preferred = [c for c in csvs if c.name == "nwp_merged_averaged.csv"]
+    if preferred:
+        return preferred[0].resolve()
+    if len(csvs) == 1:
+        return csvs[0].resolve()
+    names = ", ".join(c.name for c in csvs)
+    raise RuntimeError(
+        f"Folsom NWP folder {nwp_dir} has multiple CSVs and none named 'nwp_merged_averaged.csv': {names}. "
+        "Set paths.folsom_nwp_merged_csv to disambiguate."
+    )
 
 
 def _normalize_col(name: str) -> str:
@@ -442,7 +789,7 @@ def load_folsom_conf(path: Path | str) -> dict:
 
     Caller must supply the path explicitly; this module never reads a hardcoded canonical
     config file. The expected schema mirrors ``config/datasets/conf_luoyang.yaml``:
-    ``paths.{data_dir, pv_path, sky_image_path, sat_path, sky_format, ...}`` plus a ``sampling:``
+    ``paths.{data_dir, pv_path, sky_image_path, sat_path, ...}`` plus a ``sampling:``
     section with the PVDataset-style window / stride / image-shape fields.
     """
     if path is None:
@@ -528,20 +875,24 @@ class FolsomIrradianceDataset(Dataset):
 
     ``pv_dir`` must contain exactly one irradiance CSV (time + GHI/DNI/DHI columns; column names
     auto-detected from the header). The optional NWP merged CSV is resolved from
-    ``paths.folsom_nwp_merged_csv`` in the per-instance ``config_path``; site coordinates come
+    ``paths.folsom_nwp_merged_csv`` if set, else globbed from the ``paths.nwp_path`` folder, in
+    the per-instance ``config_path``; site coordinates come
     from ``<paths.data_dir>/info.yaml`` (``site.latitude`` / ``site.longitude``), matching
     :class:`dataloader.luoyang_mem.PVDataset`.
 
-    Splits: rows are partitioned in fixed proportions ``60% train / 10% val / 30% test`` (same as
-    PVDataset). ``pv_train_time_fraction`` is kept for call-site parity but **not** used. Train
+    Splits: rows are partitioned chronologically by ``train_split`` / ``val_split`` /
+    ``test_split`` (defaults ``0.66`` / ``0.18`` / ``0.16``). ``pv_train_time_fraction`` is
+    kept for call-site parity but **not** used. Train
     samples a random valid anchor per ``__getitem__`` (epoch length defaults to
     ``_DEFAULT_FOLSOM_TRAIN_EPOCH_LEN``; settable via ``self._train_epoch_len``); val/test use the
     respective ``*_anchor_stride_min`` strides over their bands.
 
-    ``skyimg_window_size`` is the count of sky frames ending at the last input timestep (anchor),
-    spaced by ``skyimg_time_resolution_min`` (oldest first in ``skimg_tensor``). With
-    ``paths.sky_format: zarr``, frames are read from a Zarr ``images(time_utc, ...)`` store; with
-    ``jpg``, from timestamped JPEG files. All timestamps are UTC.
+    ``skyimg_window_size`` is the count of sky frames ending at the last input timestep (anchor)
+    (oldest first in ``skimg_tensor``). Zarr mode takes the last ``N`` real frames with
+    ``time_utc <=`` anchor; JPEG mode keeps its own last-N / gap / lag rules.
+    ``skyimg_time_resolution_min`` only affects the JPEG nominal-grid helper when used and does
+    not drive Zarr selection. Sky format is auto-detected from ``skyimg_dir`` (Zarr store vs
+    JPEG folder) unless ``paths.sky_format`` is set. All timestamps are UTC.
     """
 
     def __init__(
@@ -558,6 +909,9 @@ class FolsomIrradianceDataset(Dataset):
         pv_output_interval_min: int,
         pv_output_len: int,
         pv_train_time_fraction: float,
+        train_split: float = 0.66,
+        val_split: float = 0.18,
+        test_split: float = 0.16,
         test_anchor_stride_min: int,
         val_anchor_stride_min: int,
         test_collect_time_match_tolerance_min: int,
@@ -568,6 +922,13 @@ class FolsomIrradianceDataset(Dataset):
         satimg_time_resolution_min: int,
         satimg_npy_shape_hwc: tuple[int, int, int],
         use_satellite: bool = False,
+        sky_channels: list[str] | tuple[str, ...] | None = None,
+        sun_mask_mode: str | None = None,
+        sun_mask_radius_deg: float | None = None,
+        sun_mask_sigma_px: float | None = None,
+        sun_mask_sigma_deg: float | None = None,
+        sky_disc_mask_mode: str | None = None,
+        sky_disc_mask_radius_px: float | None = None,
     ):
         self._config_path = Path(config_path).resolve()
         if not self._config_path.is_file():
@@ -602,6 +963,22 @@ class FolsomIrradianceDataset(Dataset):
             raise ValueError("pv_train_time_fraction must be strictly between 0 and 1")
         self._pv_train_time_fraction = tf
 
+        self._train_split = float(train_split)
+        self._val_split = float(val_split)
+        self._test_split = float(test_split)
+        for name, frac in (
+            ("train_split", self._train_split),
+            ("val_split", self._val_split),
+            ("test_split", self._test_split),
+        ):
+            if not (0.0 < frac < 1.0):
+                raise ValueError(f"{name} must be strictly between 0 and 1 (got {frac!r})")
+        split_sum = self._train_split + self._val_split + self._test_split
+        if abs(split_sum - 1.0) >= 1e-6:
+            raise ValueError(
+                f"train_split + val_split + test_split must sum to 1.0 (got {split_sum:.6f})"
+            )
+
         if skyimg_time_resolution_min <= 0:
             raise ValueError("skyimg_time_resolution_min must be positive")
         self._skyimg_dt_min = int(skyimg_time_resolution_min)
@@ -609,6 +986,57 @@ class FolsomIrradianceDataset(Dataset):
         if skyimg_spatial_size < 1:
             raise ValueError("skyimg_spatial_size must be >= 1")
         self._skyimg_spatial_size = int(skyimg_spatial_size)
+
+        # Sky-branch channel selection. ``sky_channels`` is a YAML-driven list of
+        # feature names; default ``("rgb",)`` keeps existing behavior (3-channel
+        # ``skimg_tensor``). The calibrated ray map + its companion validity
+        # mask are built lazily on first use and cached since
+        # ``compute_ray_map`` is a pure function of ``(H, W, fit)``. ``sun_mask``
+        # reuses the same fit cache plus per-frame solar geometry from
+        # ``compute_solar_features``.
+        self.sky_channels: tuple[str, ...] = _normalize_sky_channels(sky_channels)
+        self.sky_in_channels: int = _sky_in_channels(self.sky_channels)
+        self._ray_map_cache: torch.Tensor | None = None
+        self._sky_valid_cache: torch.Tensor | None = None
+        self._fisheye_fit: dict | None = None
+        self.sun_mask_mode: str = normalize_sun_mask(sun_mask_mode)
+        if self.sun_mask_mode in _SUN_MASK_HARD_MODES:
+            radius = (
+                _SUN_MASK_RADIUS_DEG_PRESETS[self.sun_mask_mode]
+                if sun_mask_radius_deg is None
+                else float(sun_mask_radius_deg)
+            )
+            if not (radius > 0.0):
+                raise ValueError(
+                    f"sun_mask_radius_deg must be > 0 (got {sun_mask_radius_deg!r})"
+                )
+            if radius >= 90.0:
+                raise ValueError(
+                    f"sun_mask_radius_deg must be < 90 (got {sun_mask_radius_deg!r}); "
+                    "a half-sky disc is almost certainly a config mistake"
+                )
+            self.sun_mask_radius_deg: float = radius
+        else:
+            self.sun_mask_radius_deg = float(
+                sun_mask_radius_deg or _DEFAULT_SUN_MASK_RADIUS_DEG
+            )
+        sigma_px, sigma_deg = resolve_sun_mask_sigmas(
+            sigma_px_override=sun_mask_sigma_px,
+            sigma_deg_override=sun_mask_sigma_deg,
+        )
+        self.sun_mask_sigma_px: float = sigma_px
+        self.sun_mask_sigma_deg: float = sigma_deg
+
+        self.sky_disc_mask_mode: str = normalize_sky_disc_mask_mode(sky_disc_mask_mode)
+        if sky_disc_mask_radius_px is not None:
+            r_px = float(sky_disc_mask_radius_px)
+            if not (r_px > 0.0):
+                raise ValueError(
+                    f"sky_disc_mask_radius_px must be > 0 (got {sky_disc_mask_radius_px!r})"
+                )
+            self.sky_disc_mask_radius_px: float | None = r_px
+        else:
+            self.sky_disc_mask_radius_px = None
 
         # Sat config: when ``use_satellite=True`` the loader reads per-frame .npy shards
         # under ``satimg_dir/YYYY/MM/goes15_YYYYMMDD_HHMM.npy`` (GOES-15 GridSat-CONUS,
@@ -647,8 +1075,9 @@ class FolsomIrradianceDataset(Dataset):
         # Site + NWP from the per-instance dataset YAML (``self._config_path``):
         #   * lat/lon → ``<paths.data_dir>/info.yaml`` (site.latitude / site.longitude),
         #     matching :class:`dataloader.luoyang_mem.PVDataset`.
-        #   * NWP merged CSV → ``paths.folsom_nwp_merged_csv`` (relative to ``data_dir``
-        #     unless absolute); missing/unreadable falls back to None (zero NWP at runtime).
+        #   * NWP merged CSV → ``paths.folsom_nwp_merged_csv`` if set, else globbed from
+        #     the ``paths.nwp_path`` folder (relative to ``data_dir`` unless absolute);
+        #     missing/unreadable falls back to None (zero NWP at runtime).
         with self._config_path.open() as f:
             conf = yaml.safe_load(f) or {}
         paths = get_resolved_paths(conf, _PROJECT_ROOT)
@@ -676,43 +1105,62 @@ class FolsomIrradianceDataset(Dataset):
         self.latitude = float(lat)
         self.longitude = float(lon)
 
-        raw_sf = paths_cfg.get("sky_format", "jpg")
-        sky_fmt = str(raw_sf).strip().lower()
-        if sky_fmt not in ("jpg", "zarr"):
-            raise ValueError(
-                f"paths.sky_format must be 'jpg' or 'zarr' (got {raw_sf!r}) in {self._config_path}"
+        raw_sf = paths_cfg.get("sky_format")
+        if raw_sf is not None and str(raw_sf).strip() != "":
+            sky_fmt = str(raw_sf).strip().lower()
+            if sky_fmt not in ("jpg", "zarr"):
+                raise ValueError(
+                    f"paths.sky_format must be 'jpg' or 'zarr' (got {raw_sf!r}) in {self._config_path}"
+                )
+            self._sky_format = sky_fmt
+        else:
+            self._sky_format = _detect_folsom_sky_format(
+                self._skyimg_dir, config_path=self._config_path
             )
-        self._sky_format = sky_fmt
+            _folsom_progress(
+                f"sky format auto-detected: {self._sky_format!r} ({self._skyimg_dir})"
+            )
+        if self._sky_format == "zarr":
+            if _SKY_CHANNEL_IMAGE_VALID not in self.sky_channels:
+                self.sky_channels = (*self.sky_channels, _SKY_CHANNEL_IMAGE_VALID)
+            self.sky_in_channels = _sky_in_channels(self.sky_channels)
 
         self._nwp_feature_cols = tuple(_FOLSOM_NWP_FEATURE_COLS)
-        nwp_rel = paths_cfg.get("folsom_nwp_merged_csv")
+        # Explicit ``paths.folsom_nwp_merged_csv`` (backward compatible) else glob
+        # ``paths.nwp_path`` for the merged CSV. A missing folder / no CSV is tolerated
+        # (falls back to zero NWP + invalid mask below); an ambiguous folder is not.
         self._nwp_merged_df = None
-        if nwp_rel is not None and str(nwp_rel).strip() != "":
-            try:
-                nwp_csv = _resolve_folsom_nwp_csv_path(conf)
-                self._nwp_merged_df = _load_folsom_nwp_merged_csv(nwp_csv)
-            except (FileNotFoundError, KeyError):
-                self._nwp_merged_df = None
+        try:
+            nwp_csv = _resolve_folsom_nwp_csv_path(conf)
+            self._nwp_merged_df = _load_folsom_nwp_merged_csv(nwp_csv)
+        except (FileNotFoundError, KeyError):
+            self._nwp_merged_df = None
 
         # API parity with PVDataset: trainer reads ``train_dataset.devDn_list`` to size the
         # device-id embedding. Folsom is a single-sensor station, so a length-1 list is fine
         # (paired with ``dev_idx=700`` returned by ``_build_tensors``).
         self.devDn_list = [0]
 
-        # CSV: glob ``pv_dir`` for *.csv (PVDataset convention); Folsom expects exactly one.
-        self.sample_files = list_csv_files(data_dir=pv_dir)
-        if not self.sample_files:
-            raise FileNotFoundError(f"No CSV files in {pv_dir!r}")
-        if len(self.sample_files) != 1:
-            names = ", ".join(p.name for p in self.sample_files)
-            raise RuntimeError(
-                f"Folsom dataset expects exactly one irradiance CSV under {pv_dir!r}, "
-                f"found {len(self.sample_files)}: {names}"
-            )
-        self._csv_path = self.sample_files[0].resolve()
+        # Irradiance CSV: explicit ``paths.folsom_irradiance_csv`` (preferred when multiple
+        # CSVs share ``pv_path``), else glob ``pv_dir`` for exactly one *.csv.
+        irr_rel = paths_cfg.get("folsom_irradiance_csv")
+        if irr_rel is not None and str(irr_rel).strip() != "":
+            self._csv_path = _resolve_folsom_csv_path(conf)
+            self.sample_files = [self._csv_path]
+        else:
+            self.sample_files = list_csv_files(data_dir=pv_dir)
+            if not self.sample_files:
+                raise FileNotFoundError(f"No CSV files in {pv_dir!r}")
+            if len(self.sample_files) != 1:
+                names = ", ".join(p.name for p in self.sample_files)
+                raise RuntimeError(
+                    f"Folsom dataset expects exactly one irradiance CSV under {pv_dir!r}, "
+                    f"found {len(self.sample_files)}: {names}"
+                )
+            self._csv_path = self.sample_files[0].resolve()
         _folsom_progress(f"dataset split={split!r}: preparing {self._csv_path.name} ...")
 
-        # Sky: JPEG directory index, or Zarr store (``paths.sky_format``).
+        # Sky: JPEG directory index or Zarr store (auto-detected or ``paths.sky_format`` override).
         self._sky_gap_threshold = pd.Timedelta(minutes=5)
         self._sky_anchor_max_lag = pd.Timedelta(minutes=5)
         if self._sky_format == "zarr":
@@ -728,15 +1176,25 @@ class FolsomIrradianceDataset(Dataset):
             if zkey not in _ZARR_SKY_DS_CACHE:
                 _ZARR_SKY_DS_CACHE[zkey] = xr.open_zarr(zp)
             self._skyimg_ds = _ZARR_SKY_DS_CACHE[zkey]
+            self._sky_zarr_key = zkey
             self._validate_sky_zarr_schema(self._skyimg_ds)
+            (
+                self._sky_zarr_time_dim,
+                self._sky_zarr_times,
+                self._sky_zarr_times_ns,
+            ) = _folsom_get_cached_zarr_sky_times(self._skyimg_ds, zkey)
             self._sky_times, self._sky_paths, self._sky_times_ns = [], [], []
             try:
-                nt = _folsom_sky_zarr_len_time_utc(self._skyimg_ds)
+                nt = int(self._sky_zarr_times_ns.shape[0])
             except Exception:
                 nt = 0
             _folsom_progress(f"sky Zarr: {zp}  (time steps ≈ {nt:,})")
         else:
             self._skyimg_ds = None
+            self._sky_zarr_key = ""
+            self._sky_zarr_time_dim = ""
+            self._sky_zarr_times = None
+            self._sky_zarr_times_ns = None
             cache_key = f"{self._skyimg_dir}|jpg"
             cached = _SKY_INDEX_CACHE.get(cache_key)
             if cached is None:
@@ -782,12 +1240,14 @@ class FolsomIrradianceDataset(Dataset):
         self._x_tail_1d = (-(lx - 1) * sx + np.arange(lx, dtype=np.intp) * sx).astype(np.intp, copy=False)
         self._y_off_1d = (sy + np.arange(ly, dtype=np.intp) * sy).astype(np.intp, copy=False)
 
-        # Fixed 60% / 10% / 30% train/val/test split (matches PVDataset).
-        split_train_end = int(n * 0.6)
-        split_val_end = int(n * 0.7)
+        # Chronological train/val/test split from config (train_split / val_split / test_split).
+        split_train_end = int(n * self._train_split)
+        split_val_end = int(n * (self._train_split + self._val_split))
         if not (0 < split_train_end < split_val_end < n):
             raise ValueError(
-                f"fixed 60%/10%/30% row split invalid for n={n}: "
+                f"row split invalid for n={n} "
+                f"(train_split={self._train_split}, val_split={self._val_split}, "
+                f"test_split={self._test_split}): "
                 f"split_train_end={split_train_end}, split_val_end={split_val_end}"
             )
         min_row = self._anchors - (lx - 1) * sx
@@ -797,18 +1257,18 @@ class FolsomIrradianceDataset(Dataset):
         self._test_anchor_mask = min_row >= split_val_end
         if self.split == "train" and not bool(self._train_anchor_mask.any()):
             raise RuntimeError(
-                f"split=train: no anchor fits entirely in the first {split_train_end} rows (60% of n={n}); "
-                "shorten windows or check data length"
+                f"split=train: no anchor fits entirely in the first {split_train_end} rows "
+                f"(train_split={self._train_split} of n={n}); shorten windows or check data length"
             )
         if self.split == "val" and not bool(self._val_anchor_mask.any()):
             raise RuntimeError(
                 f"split=val: no anchor fits entirely in rows [{split_train_end}, {split_val_end}) "
-                f"(10% val band); adjust window lengths or stride"
+                f"(val_split={self._val_split}); adjust window lengths or stride"
             )
         if self.split == "test" and not bool(self._test_anchor_mask.any()):
             raise RuntimeError(
-                f"split=test: no anchor fits entirely from row {split_val_end} onward (last 30%); "
-                "adjust window lengths"
+                f"split=test: no anchor fits entirely from row {split_val_end} onward "
+                f"(test_split={self._test_split}); adjust window lengths"
             )
 
         train_positions = np.nonzero(self._train_anchor_mask)[0]
@@ -930,20 +1390,57 @@ class FolsomIrradianceDataset(Dataset):
 
     def _validate_sky_zarr_schema(self, ds: Any) -> None:
         """
-        Require ``images`` plus an alignable ``time_utc`` timeline.
+        Require ``images``, ``image_valid``, and an alignable ``time_utc`` timeline.
 
         Extra arrays (e.g. ``azimuth``, ``zenith``, ``day_of_year``) are ignored; ``skimg_timefeats``
-        still comes from ``compute_solar_features`` on nominal UTC frame times.
+        come from ``compute_solar_features`` on the selected Zarr frame times (padded slots use the
+        anchor time, matching the JPEG black-frame convention).
+
+        When ``sun_mask`` is enabled, also require ``sun_u`` / ``sun_v`` / ``sun_valid``
+        (Zarr sun masks use stored centers; no silent pvlib recompute fallback).
         """
         if "images" not in ds.data_vars:
             raise KeyError(
                 "Folsom sky Zarr must define data variable ``images`` "
                 "(see config/datasets/conf_folsom.yaml)."
             )
-        _folsom_sky_zarr_time_dim_and_values(ds, ds["images"])
+        time_dim, _ = _folsom_sky_zarr_time_dim_and_values(ds, ds["images"])
+        if "image_valid" not in ds.data_vars:
+            raise KeyError(
+                "Folsom sky Zarr must define data variable ``image_valid`` "
+                "(uint8 0/1 aligned with the image timeline)."
+            )
+        image_valid = ds["image_valid"]
+        if image_valid.ndim != 1 or tuple(image_valid.dims) != (time_dim,):
+            raise ValueError(
+                "Folsom sky Zarr ``image_valid`` must be 1D on the images time "
+                f"dimension {time_dim!r}; got dims={image_valid.dims}, shape={image_valid.shape}"
+            )
+        if int(image_valid.sizes[time_dim]) != int(ds["images"].sizes[time_dim]):
+            raise ValueError(
+                "Folsom sky Zarr ``image_valid`` length must match images; "
+                f"got {int(image_valid.sizes[time_dim])} vs "
+                f"{int(ds['images'].sizes[time_dim])}"
+            )
+        if self.sun_mask_mode != "none":
+            missing = [
+                name
+                for name in ("sun_u", "sun_v", "sun_valid")
+                if name not in ds.data_vars
+            ]
+            if missing:
+                raise KeyError(
+                    f"Folsom sky Zarr with sun_mask={self.sun_mask_mode!r} requires "
+                    f"data variables {missing}; got {sorted(ds.data_vars)}. "
+                    "Rebuild the store with sun centers "
+                    "(see SPMF_preprocessing/folsom/build_sky_xarray_zarr.py)."
+                )
 
     def _nominal_sky_frame_times(self, t_end_wall: Any) -> list[pd.Timestamp]:
-        """Oldest→newest ``skyimg_window_size`` timestamps spaced by ``_skyimg_dt_min`` ending at anchor."""
+        """Oldest→newest ``skyimg_window_size`` timestamps spaced by ``_skyimg_dt_min`` ending at anchor.
+
+        Kept for call-site / JPEG-grid compatibility; Zarr selection does **not** use this grid.
+        """
         t_end = self._sky_filename_ts(t_end_wall)
         w = self.skyimg_window_size
         dt = self._skyimg_dt_min
@@ -976,68 +1473,252 @@ class FolsomIrradianceDataset(Dataset):
             t = t.clamp(0.0, 1.0)
         return self._resize_sky_chw(t)
 
-    def _stack_sky_from_zarr(self, t_end_wall: Any) -> torch.Tensor:
+    def _history_sky_zarr_frame_records(
+        self, t_end_wall: Any
+    ) -> tuple[list[pd.Timestamp], list[int | None]]:
         """
-        Stack ``[W, 3, H, W]`` from Zarr using the same nominal UTC grid as the JPEG loader.
+        Resolve the last ``N=skyimg_window_size`` Zarr frames with ``time_utc <=`` anchor.
 
-        Selects rows whose ``time_utc`` falls in ``[nominal[0], nominal[-1]]`` (index-based, so it
-        works for ``sky_xr_120.zarr``-style stores with a separate ``time_utc`` array), then
-        nearest-neighbour per nominal step (90 s tolerance). If the newest kept row is too far
-        before the anchor (``_sky_anchor_max_lag``), returns black frames (same spirit as JPEG).
+        - No nominal grid, nearest-match tolerance, or anchor-lag blackout.
+        - If fewer than ``N`` eligible frames exist, left-pad with ``None`` indices (black frames)
+          and repeat the anchor timestamp in those slots (same convention as JPEG padding).
+        - Returned lists are oldest → newest and always length ``N``.
         """
+        t_end = pd.Timestamp(t_end_wall)
+        if t_end.tzinfo is not None:
+            t_end = t_end.tz_convert("UTC").tz_localize(None)
         w = self.skyimg_window_size
-        nominal = self._nominal_sky_frame_times(t_end_wall)
-        black = torch.stack([self._black_sky_tensor()] * w, dim=0)
+        z_ns = self._sky_zarr_times_ns
+        z_times = self._sky_zarr_times
+        if z_ns is None or z_times is None or int(z_ns.shape[0]) == 0:
+            return [t_end] * w, [None] * w
+        cutoff = int(np.searchsorted(z_ns, int(t_end.value), side="right"))
+        start = max(0, cutoff - w)
+        sel_idx: list[int | None] = list(range(start, cutoff))
+        sel_times = [pd.Timestamp(z_times[i]) for i in range(start, cutoff)]
+        pad = w - len(sel_idx)
+        if pad > 0:
+            sel_times = [t_end] * pad + sel_times
+            sel_idx = [None] * pad + sel_idx
+        return sel_times, sel_idx
+
+    def _stack_sky_from_zarr(self, frame_indices: list[int | None]) -> torch.Tensor:
+        """
+        Stack ``[W, 3, H, W]`` from Zarr row indices (``None`` → black frame).
+
+        Indices come from :meth:`_history_sky_zarr_frame_records` (last ``N`` real frames at/before
+        the anchor, oldest→newest, left-padded). Contiguous real runs are loaded as one slice;
+        the full timeline is cached (see ``_ZARR_SKY_TIME_CACHE``).
+        """
+        w = len(frame_indices)
+        if w != self.skyimg_window_size:
+            raise ValueError(
+                f"_stack_sky_from_zarr expected {self.skyimg_window_size} indices, got {w}"
+            )
+        black = self._black_sky_tensor()
         if self._skyimg_ds is None:
-            return black
+            return torch.stack([black] * w, dim=0)
         ds = self._skyimg_ds
         img = ds["images"]
-        time_dim, raw_t = _folsom_sky_zarr_time_dim_and_values(ds, img)
-        z_times = _folsom_parse_zarr_utc_naive(raw_t)
-        t_lo, t_hi = pd.Timestamp(nominal[0]), pd.Timestamp(nominal[-1])
-        mask = (z_times >= t_lo) & (z_times <= t_hi)
-        idx = np.nonzero(np.asarray(mask, dtype=bool))[0]
-        if idx.size == 0:
-            return black
-        sub = img.isel({time_dim: idx})
-        z_sub = z_times[idx]
+        time_dim = self._sky_zarr_time_dim
+        if time_dim is None or not time_dim:
+            zkey = getattr(self, "_sky_zarr_key", "") or ""
+            time_dim, _, _ = _folsom_get_cached_zarr_sky_times(ds, zkey or "_anon")
+
+        real_pos = [i for i, idx in enumerate(frame_indices) if idx is not None]
+        if not real_pos:
+            return torch.stack([black] * w, dim=0)
+
+        real_idx = [int(frame_indices[i]) for i in real_pos]  # type: ignore[arg-type]
+        lo, hi = int(real_idx[0]), int(real_idx[-1]) + 1
+        # Contiguous last-N selection: load one slice then map by offset.
+        if real_idx != list(range(lo, hi)):
+            raise RuntimeError(
+                f"sky Zarr frame indices must be a contiguous run; got {real_idx[:8]}..."
+            )
+        sub = img.isel({time_dim: slice(lo, hi)})
         z_np = np.asarray(sub.values, dtype=np.float32)
         ta = int(sub.get_axis_num(time_dim))
         if ta != 0:
             z_np = np.moveaxis(z_np, ta, 0)
-        if z_np.shape[0] != len(z_sub):
+        if z_np.shape[0] != (hi - lo):
             raise RuntimeError(
-                f"sky Zarr internal mismatch: time len {len(z_sub)} vs stacked dim 0 {z_np.shape[0]}"
+                f"sky Zarr internal mismatch: expected {hi - lo} tiles, got {z_np.shape[0]}"
             )
-        t_end = pd.Timestamp(self._sky_filename_ts(nominal[-1]))
-        newest = z_sub[-1]
-        if t_end - newest > self._sky_anchor_max_lag:
-            return black
-        z_ns = z_sub.asi8.astype(np.int64)
-        max_delta = int(pd.Timedelta(seconds=90).value)
         frames: list[torch.Tensor] = []
-        for want in nominal:
-            wn = self._sky_filename_ts(want)
-            want_ns = int(wn.value)
-            j = int(np.argmin(np.abs(z_ns - want_ns)))
-            if abs(int(z_ns[j]) - want_ns) > max_delta:
-                frames.append(self._black_sky_tensor())
+        for idx in frame_indices:
+            if idx is None:
+                frames.append(black)
             else:
-                frames.append(self._tensor_from_zarr_image_tile(z_np[j]))
+                frames.append(self._tensor_from_zarr_image_tile(z_np[int(idx) - lo]))
         return torch.stack(frames, dim=0)
 
+    def _zarr_images_spatial_size(self) -> int:
+        """Square spatial size of Zarr ``images`` tiles (before runtime resize)."""
+        if self._skyimg_ds is None:
+            return int(self._skyimg_spatial_size)
+        img = self._skyimg_ds["images"]
+        sizes = getattr(img, "sizes", None)
+        if sizes is not None and "y" in sizes and "x" in sizes:
+            hy, wx = int(sizes["y"]), int(sizes["x"])
+            if hy != wx:
+                raise ValueError(
+                    f"sky Zarr images must be square; got y={hy}, x={wx}"
+                )
+            return hy
+        shp = tuple(int(x) for x in img.shape)
+        if len(shp) < 3:
+            raise ValueError(f"sky Zarr images shape too short: {shp}")
+        if shp[-1] == 3:
+            hy, wx = shp[-3], shp[-2]
+        else:
+            hy, wx = shp[-2], shp[-1]
+        if hy != wx:
+            raise ValueError(f"sky Zarr images must be square; got spatial {hy}x{wx}")
+        return int(hy)
+
+    def _load_sun_centers_from_zarr(
+        self, frame_indices: list[int | None]
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Load ``sun_u`` / ``sun_v`` / ``sun_valid`` for the same indices as sky RGB.
+
+        ``None`` padded slots → invalid (NaN centers, ``valid=False``). Centers are
+        remapped from Zarr image pixel space to ``skyimg_spatial_size`` with the same
+        ``(S-1)/(Z-1)`` convention used by fisheye projection.
+        """
+        w = len(frame_indices)
+        if w != self.skyimg_window_size:
+            raise ValueError(
+                f"_load_sun_centers_from_zarr expected {self.skyimg_window_size} "
+                f"indices, got {w}"
+            )
+        u_out = np.full(w, np.nan, dtype=np.float64)
+        v_out = np.full(w, np.nan, dtype=np.float64)
+        valid_out = np.zeros(w, dtype=bool)
+        if self._skyimg_ds is None:
+            return u_out, v_out, valid_out
+
+        ds = self._skyimg_ds
+        for name in ("sun_u", "sun_v", "sun_valid"):
+            if name not in ds.data_vars:
+                raise KeyError(
+                    f"_load_sun_centers_from_zarr: missing Zarr variable {name!r}"
+                )
+
+        real_pos = [i for i, idx in enumerate(frame_indices) if idx is not None]
+        if not real_pos:
+            return u_out, v_out, valid_out
+
+        real_idx = [int(frame_indices[i]) for i in real_pos]  # type: ignore[arg-type]
+        lo, hi = int(real_idx[0]), int(real_idx[-1]) + 1
+        if real_idx != list(range(lo, hi)):
+            raise RuntimeError(
+                f"sky Zarr sun-center indices must be a contiguous run; got {real_idx[:8]}..."
+            )
+
+        time_dim = self._sky_zarr_time_dim
+        if time_dim is None or not time_dim:
+            zkey = getattr(self, "_sky_zarr_key", "") or ""
+            time_dim, _, _ = _folsom_get_cached_zarr_sky_times(ds, zkey or "_anon")
+
+        sl = {time_dim: slice(lo, hi)}
+        u_sub = np.asarray(ds["sun_u"].isel(sl).values, dtype=np.float64).reshape(-1)
+        v_sub = np.asarray(ds["sun_v"].isel(sl).values, dtype=np.float64).reshape(-1)
+        valid_sub = np.asarray(ds["sun_valid"].isel(sl).values).reshape(-1)
+        if not (u_sub.shape[0] == v_sub.shape[0] == valid_sub.shape[0] == (hi - lo)):
+            raise RuntimeError(
+                f"sky Zarr sun-center slice length mismatch: "
+                f"u={u_sub.shape[0]} v={v_sub.shape[0]} valid={valid_sub.shape[0]} "
+                f"expected {hi - lo}"
+            )
+
+        zarr_s = self._zarr_images_spatial_size()
+        target_s = int(self._skyimg_spatial_size)
+        if zarr_s <= 1:
+            raise ValueError(f"sky Zarr spatial size must be > 1 (got {zarr_s})")
+        scale = (
+            1.0
+            if zarr_s == target_s
+            else (float(target_s) - 1.0) / (float(zarr_s) - 1.0)
+        )
+
+        for i, idx in enumerate(frame_indices):
+            if idx is None:
+                continue
+            j = int(idx) - lo
+            uu = float(u_sub[j])
+            vv = float(v_sub[j])
+            # sun_valid is uint8 0/1; also reject NaN centers.
+            is_valid = int(valid_sub[j]) == 1 and np.isfinite(uu) and np.isfinite(vv)
+            if not is_valid:
+                continue
+            valid_out[i] = True
+            u_out[i] = uu * scale
+            v_out[i] = vv * scale
+        return u_out, v_out, valid_out
+
+    def _load_image_valid_from_zarr(
+        self, frame_indices: list[int | None]
+    ) -> np.ndarray:
+        """Load image validity for selected Zarr rows; padded slots are invalid."""
+        w = len(frame_indices)
+        if w != self.skyimg_window_size:
+            raise ValueError(
+                f"_load_image_valid_from_zarr expected {self.skyimg_window_size} "
+                f"indices, got {w}"
+            )
+        valid_out = np.zeros(w, dtype=np.float32)
+        if self._skyimg_ds is None:
+            return valid_out
+
+        ds = self._skyimg_ds
+        if "image_valid" not in ds.data_vars:
+            raise KeyError(
+                "_load_image_valid_from_zarr: missing Zarr variable 'image_valid'"
+            )
+        real_pos = [i for i, idx in enumerate(frame_indices) if idx is not None]
+        if not real_pos:
+            return valid_out
+
+        real_idx = [int(frame_indices[i]) for i in real_pos]  # type: ignore[arg-type]
+        lo, hi = int(real_idx[0]), int(real_idx[-1]) + 1
+        if real_idx != list(range(lo, hi)):
+            raise RuntimeError(
+                f"sky Zarr image-valid indices must be a contiguous run; got {real_idx[:8]}..."
+            )
+
+        time_dim = self._sky_zarr_time_dim
+        if time_dim is None or not time_dim:
+            zkey = getattr(self, "_sky_zarr_key", "") or ""
+            time_dim, _, _ = _folsom_get_cached_zarr_sky_times(ds, zkey or "_anon")
+        valid_sub = np.asarray(
+            ds["image_valid"].isel({time_dim: slice(lo, hi)}).values
+        ).reshape(-1)
+        if valid_sub.shape[0] != (hi - lo):
+            raise RuntimeError(
+                "sky Zarr image_valid slice length mismatch: "
+                f"got {valid_sub.shape[0]}, expected {hi - lo}"
+            )
+        if not bool(np.all((valid_sub == 0) | (valid_sub == 1))):
+            bad = np.unique(valid_sub[(valid_sub != 0) & (valid_sub != 1)])
+            raise ValueError(
+                f"sky Zarr image_valid must contain only 0/1; got {bad[:8].tolist()}"
+            )
+        for i, idx in enumerate(frame_indices):
+            if idx is not None:
+                valid_out[i] = float(valid_sub[int(idx) - lo])
+        return valid_out
+
     def _load_sky_tensor(self, path: Path) -> torch.Tensor:
-        """Return ``[3, s, s]`` float32 in ``[0, 1]`` (matches PVDataset)."""
+        """Return ``[3, H, W]`` float32 in ``[0, 1]`` from a raw (unflipped) Folsom JPG.
+
+        JPGs are assumed already at ``skyimg_spatial_size`` (no resize).
+        """
         try:
             if path.is_file():
-                try:
-                    resample = Image.Resampling.LANCZOS
-                except AttributeError:
-                    resample = Image.LANCZOS
-                s = self._skyimg_spatial_size
                 with Image.open(path) as im:
                     im = im.convert("RGB")
-                    im = im.resize((s, s), resample)
                     arr = np.asarray(im, dtype=np.uint8).copy()
                 t = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
                 return t.to(torch.float32) / 255.0
@@ -1098,6 +1779,242 @@ class FolsomIrradianceDataset(Dataset):
             for p in frame_paths
         ]
         return torch.stack(frames, dim=0)
+
+    def _get_fisheye_fit(self) -> dict:
+        """Lazy-load + cache the Folsom fisheye fit (``cx, cy, f, alpha0``).
+
+        Shared by :meth:`_build_ray_and_valid_cache` (for the calibrated
+        ``ray_map``) and :meth:`_compute_sun_mask_for_frames` (for the sun
+        mask). The CSV is read at most once per dataset instance.
+        """
+        if self._fisheye_fit is None:
+            self._fisheye_fit = fisheye_sunmask.load_fisheye_fit(
+                "folsom", native_size=224
+            )
+        return self._fisheye_fit
+
+    def _build_ray_and_valid_cache(self) -> None:
+        """Populate ``_ray_map_cache`` and ``_sky_valid_cache`` together (one ``compute_ray_map`` call).
+
+        ``compute_ray_map`` is a pure function of ``(H, W, fit)`` so a single
+        instance suffices for all samples; ``sun_mask`` reuses the same fit.
+        """
+        s = self._skyimg_spatial_size
+        ray, valid = compute_ray_map(s, s, self._get_fisheye_fit())
+        self._ray_map_cache = torch.from_numpy(np.ascontiguousarray(ray, dtype=np.float32))
+        self._sky_valid_cache = torch.from_numpy(np.ascontiguousarray(valid, dtype=np.float32))
+
+    def _get_ray_map(self) -> torch.Tensor:
+        """Lazy ``[3, H, W]`` float32 image-axis ray map (``fisheye_raymap.compute_ray_map``)."""
+        if self._ray_map_cache is None:
+            self._build_ray_and_valid_cache()
+        return self._ray_map_cache  # type: ignore[return-value]
+
+    def _get_sky_valid(self) -> torch.Tensor:
+        """Lazy ``[1, H, W]`` float32 fisheye validity mask (1.0 inside the image circle)."""
+        if self._sky_valid_cache is None:
+            self._build_ray_and_valid_cache()
+        return self._sky_valid_cache  # type: ignore[return-value]
+
+    def _compute_sun_mask_for_frames(
+        self,
+        frame_timestamps_utc: list[pd.Timestamp],
+    ) -> torch.Tensor:
+        """Per-frame ``[T, 1, H, W]`` float32 sun mask on the raw-image pixel grid.
+
+        Thin wrapper around
+        :func:`SPMF_preprocessing.fisheye_calib.fisheye_sunmask.compute_sun_mask`,
+        which owns the lens math (fit at native 1536 in flipped-u space; project in
+        flip space, mirror ``u`` to raw, Euclidean disc ``R = f_s * deg2rad(radius)``).
+        This method only:
+
+        1. Calls :func:`compute_solar_features` for the per-frame
+           ``(azimuth, zenith)`` (meteorological convention: 0°=N, 90°=E,
+           clockwise; zenith from up).
+        2. Lazily loads the Folsom fit on first call.
+        3. Delegates the actual mask construction to the calibration module.
+        4. Wraps the result as a contiguous ``[T, 1, H, W]`` ``torch.float32``
+           tensor with a channel dim.
+
+        Frames with ``zen >= 90°`` (sun below horizon) return all zeros.
+        """
+        if not frame_timestamps_utc:
+            raise ValueError("_compute_sun_mask_for_frames: frame_timestamps_utc is empty")
+        t = int(len(frame_timestamps_utc))
+
+        feats = compute_solar_features(frame_timestamps_utc, self.latitude, self.longitude)
+        az_deg = np.asarray(feats["azimuth"], dtype=np.float64)
+        ze_deg = np.asarray(feats["zenith"], dtype=np.float64)
+        if az_deg.shape[0] != t or ze_deg.shape[0] != t:
+            raise RuntimeError(
+                f"compute_solar_features returned T={az_deg.shape[0]}/{ze_deg.shape[0]} "
+                f"for {t} frames"
+            )
+
+        mask_np = fisheye_sunmask.compute_sun_mask(
+            az_deg=az_deg,
+            zen_deg=ze_deg,
+            image_size=self._skyimg_spatial_size,
+            radius_deg=self.sun_mask_radius_deg,
+            fit=self._get_fisheye_fit(),
+            mode=self.sun_mask_mode,
+            sigma_px=self.sun_mask_sigma_px,
+            sigma_deg=self.sun_mask_sigma_deg,
+        )
+        mask_t = torch.from_numpy(np.ascontiguousarray(mask_np, dtype=np.float32))
+        return mask_t.unsqueeze(1).contiguous()  # [T, 1, H, W]
+
+    def _compute_sun_mask_from_centers(
+        self,
+        sun_u: np.ndarray,
+        sun_v: np.ndarray,
+        sun_valid: np.ndarray,
+    ) -> torch.Tensor:
+        """Per-frame ``[T, 1, H, W]`` float32 sun mask from stored Zarr pixel centers."""
+        mask_np = fisheye_sunmask.compute_sun_mask_from_centers(
+            u_sun=sun_u,
+            v_sun=sun_v,
+            valid=sun_valid,
+            image_size=self._skyimg_spatial_size,
+            fit=self._get_fisheye_fit(),
+            mode=self.sun_mask_mode,
+            radius_deg=self.sun_mask_radius_deg,
+            sigma_px=self.sun_mask_sigma_px,
+            sigma_deg=self.sun_mask_sigma_deg,
+        )
+        mask_t = torch.from_numpy(np.ascontiguousarray(mask_np, dtype=np.float32))
+        return mask_t.unsqueeze(1).contiguous()  # [T, 1, H, W]
+
+    def _compute_sky_disc_mask_for_frames(
+        self,
+        frame_timestamps: list[pd.Timestamp],
+        t_dim: int,
+        h_dim: int,
+        w_dim: int,
+    ) -> torch.Tensor:
+        """Per-frame ``[T, 1, H, W]`` float32 sky-disc keep mask (0/1)."""
+        if self.sky_disc_mask_mode == "none":
+            raise ValueError(
+                "_compute_sky_disc_mask_for_frames called but sky_disc_mask_mode is 'none'"
+            )
+        return compute_sky_disc_mask(
+            t_dim,
+            h_dim,
+            w_dim,
+            self.sky_disc_mask_mode,
+            fit=self._get_fisheye_fit(),
+            frame_timestamps=frame_timestamps,
+            latitude=self.latitude,
+            longitude=self.longitude,
+            radius_px_override=self.sky_disc_mask_radius_px,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+    def _build_sky_channels(
+        self,
+        rgb_frames: torch.Tensor,
+        frame_timestamps: list[pd.Timestamp] | None = None,
+        *,
+        sun_u: np.ndarray | None = None,
+        sun_v: np.ndarray | None = None,
+        sun_valid: np.ndarray | None = None,
+        image_valid: np.ndarray | None = None,
+    ) -> torch.Tensor:
+        """Assemble ``[T, sky_in_channels, H, W]`` sky tensor per ``self.sky_channels``.
+
+        ``rgb_frames`` is the existing ``[T, 3, H, W]`` float32 tensor produced by
+        :meth:`_stack_sky_from_zarr` / :meth:`_stack_sky_frames`. Channel order in the
+        output follows ``self.sky_channels`` exactly. Default config (``("rgb",)``)
+        returns ``rgb_frames`` unchanged so behavior is byte-identical to today.
+
+        When ``sun_mask`` is in ``sky_channels``:
+
+        * Zarr path passes ``sun_u`` / ``sun_v`` / ``sun_valid`` (stored centers).
+        * JPEG path passes ``frame_timestamps`` and recomputes via pvlib + fisheye.
+        """
+        if self.sky_channels == _DEFAULT_SKY_CHANNELS:
+            return rgb_frames
+        if rgb_frames.ndim != 4 or rgb_frames.shape[1] != 3:
+            raise ValueError(
+                f"_build_sky_channels: expected rgb_frames [T, 3, H, W], got {tuple(rgb_frames.shape)}"
+            )
+        t_dim, _, h_dim, w_dim = rgb_frames.shape
+        parts: list[torch.Tensor] = []
+        for name in self.sky_channels:
+            if name == _SKY_CHANNEL_RGB:
+                parts.append(rgb_frames)
+            elif name == _SKY_CHANNEL_RAY_MAP:
+                ray = self._get_ray_map()
+                if ray.shape[-2:] != (h_dim, w_dim):
+                    raise RuntimeError(
+                        f"ray map cache shape {tuple(ray.shape)} does not match "
+                        f"sky frames spatial size {(h_dim, w_dim)}"
+                    )
+                parts.append(ray.unsqueeze(0).expand(t_dim, -1, -1, -1))
+            elif name == _SKY_CHANNEL_SUN_MASK:
+                if sun_u is not None or sun_v is not None or sun_valid is not None:
+                    if sun_u is None or sun_v is None or sun_valid is None:
+                        raise ValueError(
+                            "_build_sky_channels: sun_u/sun_v/sun_valid must all be "
+                            "provided together for the Zarr sun_mask path"
+                        )
+                    sun_mask = self._compute_sun_mask_from_centers(
+                        sun_u, sun_v, sun_valid
+                    )
+                else:
+                    if frame_timestamps is None:
+                        raise ValueError(
+                            "_build_sky_channels: 'sun_mask' requires frame_timestamps "
+                            "(JPEG / recompute path) or sun_u/sun_v/sun_valid (Zarr path)"
+                        )
+                    sun_mask = self._compute_sun_mask_for_frames(list(frame_timestamps))
+                if sun_mask.shape[0] != t_dim:
+                    raise RuntimeError(
+                        f"sun mask T={sun_mask.shape[0]} does not match rgb T={t_dim}"
+                    )
+                if tuple(sun_mask.shape[-2:]) != (h_dim, w_dim):
+                    raise RuntimeError(
+                        f"sun mask spatial size {tuple(sun_mask.shape[-2:])} does not match "
+                        f"sky frame spatial size {(h_dim, w_dim)}"
+                    )
+                parts.append(sun_mask)
+            elif name == _SKY_CHANNEL_SKY_MASK:
+                if frame_timestamps is None:
+                    raise ValueError(
+                        "_build_sky_channels: 'sky_mask' requires frame_timestamps "
+                        "(per-frame UTC pd.Timestamps for disc mask computation)"
+                    )
+                disc_mask = self._compute_sky_disc_mask_for_frames(
+                    list(frame_timestamps), t_dim, h_dim, w_dim
+                )
+                # Black/padding frames from _black_sky_tensor() are all-zero RGB.
+                valid = rgb_frames.abs().amax(dim=(1, 2, 3)) > 0
+                disc_mask = disc_mask * valid.view(t_dim, 1, 1, 1).to(disc_mask.dtype)
+                parts.append(disc_mask)
+            elif name == _SKY_CHANNEL_IMAGE_VALID:
+                if image_valid is None:
+                    raise ValueError(
+                        "_build_sky_channels: Zarr 'image_valid' channel requires "
+                        "image_valid values for the selected frame indices"
+                    )
+                valid = torch.as_tensor(
+                    image_valid, dtype=torch.float32, device=rgb_frames.device
+                )
+                if valid.shape != (t_dim,):
+                    raise ValueError(
+                        "_build_sky_channels: image_valid must have shape "
+                        f"({t_dim},), got {tuple(valid.shape)}"
+                    )
+                if not bool(torch.all((valid == 0) | (valid == 1))):
+                    raise ValueError("_build_sky_channels: image_valid must contain only 0/1")
+                parts.append(valid.view(t_dim, 1, 1, 1).expand(-1, 1, h_dim, w_dim))
+            else:
+                raise ValueError(f"sky_channels: unknown feature {name!r}")
+        out = torch.cat(parts, dim=1).contiguous()
+        if out.dtype != torch.float32:
+            out = out.to(torch.float32)
+        return out
 
     def _interpolate_nwp(self, forecast_timestamps: list[pd.Timestamp]) -> torch.Tensor:
         """
@@ -1209,32 +2126,25 @@ class FolsomIrradianceDataset(Dataset):
         """
         Resolve last-N sky records for ``anchor`` without building full tensors.
 
-        JPEG mode: per-frame paths. Zarr mode: nominal UTC grid and row count inside the Zarr slice.
+        JPEG mode: per-frame paths. Zarr mode: last ``N`` Zarr ``time_utc`` values at/before anchor.
         """
         x_idx = anchor + self._x_tail_1d
         sub_x = self._df.iloc[x_idx]
         t_x_end = sub_x[self._time_col].iloc[-1]
         if self._sky_format == "zarr":
-            nominal = self._nominal_sky_frame_times(t_x_end)
-            t_last_n = pd.Timestamp(nominal[-1])
-            n_z = 0
-            if self._skyimg_ds is not None and len(nominal) > 0:
-                try:
-                    n_z = _folsom_sky_zarr_count_in_time_range(
-                        self._skyimg_ds, nominal[0], nominal[-1]
-                    )
-                except Exception:
-                    n_z = 0
+            sk_times, sk_idx = self._history_sky_zarr_frame_records(t_x_end)
+            n_found = sum(1 for i in sk_idx if i is not None)
+            t_last_n = pd.Timestamp(sk_times[-1])
             return {
                 "anchor_row": int(anchor),
                 "last_input_time_utc_naive": str(t_last_n),
-                "n_frames": len(nominal),
-                "utc_times": [str(pd.Timestamp(t)) for t in nominal],
+                "n_frames": len(sk_times),
+                "utc_times": [str(pd.Timestamp(t)) for t in sk_times],
                 "paths": [],
-                "n_files_found": n_z,
+                "n_files_found": n_found,
                 "skyimg_dir": self._skyimg_dir,
                 "sky_format": "zarr",
-                "zarr_slice_timesteps": n_z,
+                "zarr_slice_timesteps": n_found,
             }
         sk_times, sk_paths = self._history_sky_frame_records(t_x_end)
         n_found = sum(1 for p in sk_paths if p is not None)
@@ -1331,13 +2241,33 @@ class FolsomIrradianceDataset(Dataset):
 
         t_x_end = sub_x[self._time_col].iloc[-1]
         if self._sky_format == "zarr":
-            nominal = self._nominal_sky_frame_times(t_x_end)
-            skimg_tensor = self._stack_sky_from_zarr(t_x_end)
-            skimg_solar_features = compute_solar_features(nominal, self.latitude, self.longitude)
+            skimg_timestamps, sk_idx = self._history_sky_zarr_frame_records(t_x_end)
+            rgb_frames = self._stack_sky_from_zarr(sk_idx)
+            image_valid = self._load_image_valid_from_zarr(sk_idx)
+            if _SKY_CHANNEL_SUN_MASK in self.sky_channels:
+                sun_u, sun_v, sun_valid = self._load_sun_centers_from_zarr(sk_idx)
+                skimg_tensor = self._build_sky_channels(
+                    rgb_frames,
+                    skimg_timestamps,
+                    sun_u=sun_u,
+                    sun_v=sun_v,
+                    sun_valid=sun_valid,
+                    image_valid=image_valid,
+                )
+            else:
+                skimg_tensor = self._build_sky_channels(
+                    rgb_frames, skimg_timestamps, image_valid=image_valid
+                )
+            skimg_solar_features = compute_solar_features(
+                skimg_timestamps, self.latitude, self.longitude
+            )
             skimg_tf = solar_features_encoder(skimg_solar_features)
-            skimg_dtf = delta_time_encoder(nominal, time0)
+            skimg_dtf = delta_time_encoder(skimg_timestamps, time0)
             skimg_timefeats = torch.cat([skimg_tf, skimg_dtf.unsqueeze(1)], dim=1)
-            skimg_timestamps = [t.strftime("%Y%m%d%H%M%S") for t in nominal]
+            skimg_timestamps = [
+                (None if idx is None else pd.Timestamp(t).strftime("%Y%m%d%H%M%S"))
+                for t, idx in zip(skimg_timestamps, sk_idx)
+            ]
         else:
             skimg_timestamps, skimg_paths = self._history_sky_frame_records(t_x_end)
             skimg_solar_features = compute_solar_features(
@@ -1346,7 +2276,8 @@ class FolsomIrradianceDataset(Dataset):
             skimg_tf = solar_features_encoder(skimg_solar_features)
             skimg_dtf = delta_time_encoder(skimg_timestamps, time0)
             skimg_timefeats = torch.cat([skimg_tf, skimg_dtf.unsqueeze(1)], dim=1)
-            skimg_tensor = self._stack_sky_frames(skimg_paths)
+            rgb_frames = self._stack_sky_frames(skimg_paths)
+            skimg_tensor = self._build_sky_channels(rgb_frames, skimg_timestamps)
             skimg_timestamps = [
                 (None if p is None else pd.Timestamp(t).strftime("%Y%m%d%H%M%S"))
                 for t, p in zip(skimg_timestamps, skimg_paths)
@@ -1467,10 +2398,11 @@ def build_folsom_irradiance_datasets_from_conf(
     Build train/test :class:`FolsomIrradianceDataset` from a Folsom dataset YAML (new schema:
     ``config/datasets/conf_folsom.yaml``).
 
-    Reads ``paths.{data_dir, pv_path, sky_image_path, sat_path, sky_format}`` and the ``sampling:`` section
+    Reads ``paths.{data_dir, pv_path, sky_image_path, sat_path}`` and the ``sampling:`` section
     (PVDataset-style window / stride / image-shape fields). Lat/lon comes from
     ``<paths.data_dir>/info.yaml`` and the optional NWP merged CSV from
-    ``paths.folsom_nwp_merged_csv`` — both read inside the dataset constructor.
+    ``paths.folsom_nwp_merged_csv`` (or globbed from ``paths.nwp_path`` when unset) — both read
+    inside the dataset constructor.
 
     A ``conf_path`` is required (it is also forwarded to the dataset as ``config_path``); pass
     ``conf`` if you've already loaded the YAML to avoid re-reading it. ``train_epoch_len`` is
@@ -1509,10 +2441,13 @@ def build_folsom_irradiance_datasets_from_conf(
         pv_input_len=int(_req_s("pv_input_len")),
         pv_output_interval_min=int(_req_s("pv_output_interval_min")),
         pv_output_len=int(_req_s("pv_output_len")),
-        pv_train_time_fraction=float(_req_s("pv_train_time_fraction")),
+        pv_train_time_fraction=float(sampling_cfg.get("pv_train_time_fraction", 0.7)),
+        train_split=float(sampling_cfg.get("train_split", 0.66)),
+        val_split=float(sampling_cfg.get("val_split", 0.18)),
+        test_split=float(sampling_cfg.get("test_split", 0.16)),
         test_anchor_stride_min=int(_req_s("test_anchor_stride_min")),
         val_anchor_stride_min=int(_req_s("val_anchor_stride_min")),
-        test_collect_time_match_tolerance_min=int(_req_s("test_collect_time_match_tolerance_min")),
+        test_collect_time_match_tolerance_min=int(sampling_cfg.get("test_collect_time_match_tolerance_min", 0)),
         skyimg_window_size=sky_w,
         skyimg_time_resolution_min=int(_req_s("skyimg_time_resolution_min")),
         skyimg_spatial_size=int(_req_s("skyimg_spatial_size")),
@@ -1520,6 +2455,21 @@ def build_folsom_irradiance_datasets_from_conf(
         satimg_time_resolution_min=int(_req_s("satimg_time_resolution_min")),
         satimg_npy_shape_hwc=tuple(int(x) for x in shwc),
         use_satellite=bool(sampling_cfg.get("use_satellite", False)),
+    )
+    sky_channels, sun_mask_radius_deg, sky_disc_mask_mode, sun_mask_mode = sky_knobs_to_internal(
+        sampling_cfg.get("ray_map"),
+        sampling_cfg.get("sun_mask"),
+        sampling_cfg.get("sky_mask"),
+    )
+    sigma_px, sigma_deg = resolve_sun_mask_sigmas(sampling_cfg)
+    kwargs.update(
+        sky_channels=sky_channels,
+        sun_mask_mode=sun_mask_mode,
+        sun_mask_radius_deg=sun_mask_radius_deg,
+        sun_mask_sigma_px=sigma_px,
+        sun_mask_sigma_deg=sigma_deg,
+        sky_disc_mask_mode=sky_disc_mask_mode,
+        sky_disc_mask_radius_px=None,
     )
     train_ds = FolsomIrradianceDataset(split="train", **kwargs)
     test_ds = FolsomIrradianceDataset(split="test", **kwargs)
@@ -1535,6 +2485,11 @@ __all__ = [
     "build_folsom_irradiance_datasets_from_conf",
     "load_folsom_conf",
     "run_smoke_cli",
+    "sky_knobs_to_internal",
+    "normalize_ray_map",
+    "normalize_sun_mask",
+    "normalize_sky_mask",
+    "resolve_sun_mask_sigmas",
 ]
 
 
@@ -1623,7 +2578,8 @@ def _validate_smoke_anchor_train(ds: FolsomIrradianceDataset, anchor: int) -> No
     r = anchor - amin
     if not bool(ds._train_anchor_mask[r]):
         raise ValueError(
-            f"anchor_row={anchor} falls outside the train time band (fixed 60% train / 10% val / 30% test). "
+            f"anchor_row={anchor} falls outside the train time band "
+            f"(train_split={ds._train_split}, val_split={ds._val_split}, test_split={ds._test_split}). "
             "Smoke uses the train dataset only: pick an earlier calendar time."
         )
 
@@ -1696,8 +2652,8 @@ def run_smoke_cli(argv: list[str] | None = None) -> int:
         print(f"Failed to load Folsom data from {args.conf.resolve()}:\n  {e}", file=sys.stderr)
         print(
             "Fix paths.data_dir, paths.pv_path (folder with the irradiance CSV), "
-            "paths.sky_image_path, paths.sat_path (placeholder), paths.folsom_nwp_merged_csv "
-            "in that YAML, and ensure <data_dir>/info.yaml provides site.latitude / "
+            "paths.sky_image_path, paths.sat_path (placeholder), paths.nwp_path (folder with the "
+            "merged NWP CSV) in that YAML, and ensure <data_dir>/info.yaml provides site.latitude / "
             "site.longitude so files exist on disk.",
             file=sys.stderr,
         )

@@ -18,13 +18,14 @@ the project brief. Inference and rendering are kept separate so visual tweaks
 do not require re-running the model: predictions are cached in a NPZ next to
 the GIF (see ``--force`` to recompute).
 
-Two-model overlay (v2 mode):
+Multi-model overlay (v2+ mode):
 
     Pass ``--checkpoint-extra <path>`` to overlay a second model's prediction
-    on the same panel as a third (blue) line. This is used to visually compare
-    a sky-arm against a no-sky arm. The two checkpoints can carry different
-    ``zero_sky`` flags; each forward uses its own checkpoint's flag. The
-    dataset is constructed once and reused for both forwards.
+    on the same panel as a blue line. Optionally pass ``--checkpoint-third
+    <path>`` for a third (green) line. This is used to visually compare sky /
+    no-sky / other arms. Each checkpoint can carry different ``zero_sky`` flags;
+    each forward uses its own checkpoint's flag. The dataset is constructed once
+    and reused for all forwards.
 
 Usage::
 
@@ -32,19 +33,28 @@ Usage::
     micromamba run -n luoyang python inference/animate_forecast.py \
         --date 2014-01-15
 
-    # v2 (sky vs no-sky 3-line overlay):
+    # v2 (sky vs no-sky overlay):
     micromamba run -n luoyang python inference/animate_forecast.py \
         --run-label v2_sky_vs_nosky \
         --date 2014-01-15 \
         --checkpoint /path/to/sky_best.pt \
         --checkpoint-extra /path/to/nosky_best.pt
 
+    # v3 (three-model overlay):
+    micromamba run -n luoyang python inference/animate_forecast.py \
+        --run-label v3_three_way \
+        --date 2014-01-15 \
+        --checkpoint /path/to/sky_best.pt \
+        --checkpoint-extra /path/to/nosky_best.pt \
+        --checkpoint-third /path/to/other_best.pt
+
 Outputs (under ``playground/animations/<run_label>/``):
 
     <date>.gif                  the animation itself
-    <date>_predictions.npz      per-frame (t, gt, pred[, pred_extra]) arrays
+    <date>_predictions.npz      per-frame (t, gt, pred[, pred_extra[, pred_third]]) arrays
                                 v1 schema: gt_kw, pred_kw
                                 v2 schema: gt_kw, pred_sky_kw, pred_nosky_kw
+                                v3 adds: pred_third_kw (when --checkpoint-third set)
     <date>_meta.json            checkpoint / run / config metadata
     <date>_frames/              per-frame PNGs (only with --keep-frames)
 """
@@ -52,9 +62,11 @@ Outputs (under ``playground/animations/<run_label>/``):
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -83,15 +95,20 @@ _DEFAULT_RUN_NAME = "ghi_sky_nwp_s0"
 # change model / horizon / anchor stride / rendering choices so old artifacts
 # survive. RUNS.md alongside --out-dir documents what each label means.
 _DEFAULT_RUN_LABEL = "v1_vit_sky_nwp_s0"
+_DEFAULT_DATASET_CONFIG = "conf_folsom.yaml"
+# Canonical Folsom full-resolution sky store (same imagery as ``processed/full/sky`` JPGs).
+_DEFAULT_SKY_ZARR = (
+    _PROJECT_ROOT.parent / "folsom_ds" / "processed" / "full" / "sky_xr_120.zarr"
+).resolve()
+_INVALID_SKY_PATH_MARKERS = ("sample_250k",)
 
 # Folsom is California; January is PST = UTC-8, summer is PDT = UTC-7. zoneinfo
 # does the right thing automatically for any date in [1970, 2037].
 _LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 
-# Folsom ViT was trained at a 4 h / 16-step horizon (see RUN_NOTES.txt in the
-# archive). Override the dataset YAML's pv_output_len=192 with this so model
-# output, forecast_timefeats, and target arrays all line up at 16 steps.
-_FORCE_PV_OUTPUT_LEN = 16
+# Override the dataset YAML's pv_output_len so model output, forecast_timefeats,
+# and target arrays match the checkpoint horizon (t0+15 models use 1 step).
+_FORCE_PV_OUTPUT_LEN = 1
 
 # Animation tuning. The brief asks for fps=5 and frame size ~1024x512 or smaller.
 _FPS = 5
@@ -189,20 +206,83 @@ def _find_display_grid_utc(
 # --------------------------------------------------------------------------- #
 
 
-def _build_folsom_dataset_for_inference(pv_output_len: int):
+def _assert_valid_sky_source(path: Path, *, role: str) -> None:
+    """Reject sample_250k sky paths; playground GIFs must use full-resolution sky."""
+    s = path.as_posix()
+    for marker in _INVALID_SKY_PATH_MARKERS:
+        if marker in s:
+            raise ValueError(
+                f"{role} sky path must not use {marker!r} (got {path}). "
+                f"Use {_DEFAULT_SKY_ZARR} or folsom_ds/processed/full/sky JPGs."
+            )
+
+
+def _infer_sky_in_channels_from_state(state: dict) -> int:
+    """Read sky-branch input width from a saved ``model_state_dict``."""
+    key = "sky_patch_embed.patch_embed.weight"
+    if key in state:
+        return int(state[key].shape[1])
+    return 3
+
+
+def _build_folsom_dataset_for_inference(
+    pv_output_len: int,
+    *,
+    sky_zarr: Path,
+    dataset_config: str = _DEFAULT_DATASET_CONFIG,
+    ray_map: bool | None = None,
+    sun_mask: str | None = None,
+    sky_mask: str | None = None,
+) -> tuple[Any, dict[str, str]]:
     """Construct a FolsomIrradianceDataset with the given pv_output_len override.
 
     Uses the trainer's standard dataset kwargs and forces ``split="train"`` because
     early-2014 (well within the train-time band) is where the sample dates live.
     We never call ``__getitem__``; we drive ``_build_tensors(anchor)`` directly.
-    """
-    from training.train_vit_test_folsom import _dataset_kwargs
 
-    ds_kwargs = _dataset_kwargs("conf_folsom.yaml", "train")
+    ``sky_zarr`` is applied to **model inference** (``skyimg_dir`` + ``paths.sky_format:
+    zarr``). It must match the left-panel ``--sky-zarr`` store so display and
+    forward pass see the same full-resolution imagery (not ``sample_250k/sky``).
+    """
+    import yaml
+
+    from training.train_vit_test_folsom import (
+        _dataset_kwargs,
+        _load_yaml,
+        _sky_knob_overrides,
+    )
+
+    sky_zarr = Path(sky_zarr).expanduser().resolve()
+    _assert_valid_sky_source(sky_zarr, role="Model inference")
+    if not sky_zarr.is_dir():
+        raise FileNotFoundError(f"model sky zarr not found: {sky_zarr}")
+
+    ds_kwargs = _dataset_kwargs(
+        dataset_config,
+        "train",
+        **_sky_knob_overrides(dataset_config, ray_map, sun_mask, sky_mask),
+    )
     ds_kwargs["pv_output_len"] = int(pv_output_len)
+    ds_kwargs["skyimg_dir"] = str(sky_zarr)
+
+    base_cfg_path = Path(ds_kwargs["config_path"])
+    cfg = _load_yaml(base_cfg_path)
+    cfg2 = copy.deepcopy(cfg)
+    cfg2.setdefault("paths", {})["sky_format"] = "zarr"
+    tmp = Path(tempfile.mkdtemp(prefix="animate_sky_cfg_"))
+    patched_cfg = tmp / "dataset.yaml"
+    with patched_cfg.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg2, f, sort_keys=False, allow_unicode=True)
+    ds_kwargs["config_path"] = str(patched_cfg.resolve())
+
     from dataloader.folsom import FolsomIrradianceDataset
 
-    return FolsomIrradianceDataset(**ds_kwargs)
+    ds = FolsomIrradianceDataset(**ds_kwargs)
+    sky_meta = dict(
+        model_sky_zarr=str(sky_zarr),
+        model_sky_format="zarr",
+    )
+    return ds, sky_meta
 
 
 def _resolve_anchor_row_for_t0(ds, t0_utc: pd.Timestamp) -> int:
@@ -284,13 +364,22 @@ def _run_model_on_anchors(
     ckpt_zero_sky = bool(ckpt.get("zero_sky", False))
     ckpt_use_nwp = bool(ckpt.get("use_nwp", True))
     nwp_features, nwp_use_invalid_mask = resolve_nwp_features_from_ckpt(ckpt)
+    state = ckpt.get("model_state_dict", ckpt)
+    sky_in_channels = _infer_sky_in_channels_from_state(state)
+    if int(getattr(ds, "sky_in_channels", 3)) != sky_in_channels:
+        raise RuntimeError(
+            f"Dataset sky_in_channels={getattr(ds, 'sky_in_channels', 3)} but "
+            f"checkpoint {checkpoint_path.name} expects {sky_in_channels}. "
+            f"Rebuild the dataset with matching --ray-map / --sun-mask / "
+            f"--sky-mask flags for this checkpoint."
+        )
 
     model = pv_forecasting_model_vit_imgs(
         dev_dn_list=ds.devDn_list,
         nwp_features=nwp_features,
         use_invalid_mask=nwp_use_invalid_mask,
+        sky_in_channels=sky_in_channels,
     ).to(device)
-    state = ckpt.get("model_state_dict", ckpt)
     missing, unexpected = model.load_state_dict(state, strict=False)
     missing_list = list(missing)
     unexpected_list = list(unexpected)
@@ -437,8 +526,8 @@ def _render_one_frame(
     """Render one (left=sky, right=plot) frame and return as ``[H, W, 3]`` uint8.
 
     ``preds`` is a list of ``(values, hex_color, legend_label)`` tuples; one
-    line is plotted per entry. v1 mode passes a single tuple (red); v2 mode
-    passes two (red sky, blue no-sky).
+    line is plotted per entry. v1 mode passes a single tuple (red); multi-model
+    mode passes up to three (red main, blue extra, green third).
     """
     import matplotlib
 
@@ -605,17 +694,71 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Legend label for the main prediction line. Defaults to "
-            "'GHI + NWP + Sky' when --checkpoint-extra is set, else 'Point pred.'."
+            "'GHI + full sky' when --checkpoint-extra is set, else 'Point pred.'."
         ),
     )
     p.add_argument(
         "--label-extra",
         type=str,
-        default="GHI + NWP",
+        default="GHI only (zero sky)",
         help=(
             "Legend label for the second (extra) prediction line "
-            "(default: 'GHI + NWP')."
+            "(default: 'GHI only (zero sky)')."
         ),
+    )
+    p.add_argument(
+        "--checkpoint-third",
+        type=str,
+        default=None,
+        help=(
+            "Optional third checkpoint. When set, a fourth (green) line is "
+            "overlaid on the right panel. The third model's own ``zero_sky`` "
+            "flag is used for its sky-input preparation."
+        ),
+    )
+    p.add_argument(
+        "--archive-name-third",
+        type=str,
+        default=None,
+        help="Archive folder name for the third checkpoint (metadata only).",
+    )
+    p.add_argument(
+        "--run-name-third",
+        type=str,
+        default=None,
+        help="Run name for the third checkpoint (metadata only).",
+    )
+    p.add_argument(
+        "--label-third",
+        type=str,
+        default="Third model",
+        help=(
+            "Legend label for the third prediction line "
+            "(default: 'Third model')."
+        ),
+    )
+    p.add_argument(
+        "--ray-map-third",
+        dest="ray_map_third",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Build the third-model dataset with fisheye ray_map sky channels.",
+    )
+    p.add_argument(
+        "--sun-mask-third",
+        dest="sun_mask_third",
+        type=str,
+        default=None,
+        choices=["none", "sun_only", "sun_halo"],
+        help="Sun_mask mode for the third-model dataset: none|sun_only|sun_halo.",
+    )
+    p.add_argument(
+        "--sky-mask-third",
+        dest="sky_mask_third",
+        type=str,
+        default=None,
+        choices=["none", "loose", "tight", "valid_disc"],
+        help="RGB sky-disc gating mode for the third-model dataset (matches training).",
     )
     p.add_argument(
         "--label-gt",
@@ -657,12 +800,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--run-label",
         type=str,
-        default=_DEFAULT_RUN_LABEL,
+        default=None,
         help=(
-            "Variant tag used as a subfolder under --out-dir (default: "
-            f"{_DEFAULT_RUN_LABEL!r}). Use a different label whenever you change "
-            "the model, anchor stride, horizon, or other rendering choices so "
-            "outputs do not overwrite each other."
+            "Subfolder under --out-dir (default: same as --date). Pass an "
+            "explicit label when you want multiple variants for one date to "
+            "coexist without overwriting."
         ),
     )
     p.add_argument(
@@ -702,22 +844,46 @@ def _parse_args() -> argparse.Namespace:
             "slower than the default of 5)."
         ),
     )
+    p.add_argument(
+        "--sky-zarr",
+        type=str,
+        default=str(_DEFAULT_SKY_ZARR),
+        help=(
+            "Folsom sky xarray Zarr used for BOTH the left-panel fisheye frames "
+            "AND model inference (must expose time_utc + images). "
+            f"Default: {_DEFAULT_SKY_ZARR}."
+        ),
+    )
+    p.add_argument(
+        "--dataset-config",
+        type=str,
+        default=_DEFAULT_DATASET_CONFIG,
+        help=(
+            "Dataset YAML under config/datasets/ (default: conf_folsom.yaml). "
+            "Use conf_folsom_full.yaml for dates outside sample_250k (e.g. 2015)."
+        ),
+    )
     return p.parse_args()
 
 
 _MAIN_COLOR = "#cc1f1f"
 _EXTRA_COLOR = "#1f4ec8"
+_THIRD_COLOR = "#1a8f4a"
 
 
 def main() -> int:
     args = _parse_args()
+    run_label = args.run_label or args.date
     out_root = Path(args.out_dir).expanduser().resolve()
-    out_dir = out_root / args.run_label
+    out_dir = out_root / run_label
     out_dir.mkdir(parents=True, exist_ok=True)
 
     has_extra = bool(args.checkpoint_extra)
-    label_main = args.label_main or ("GHI + NWP + Sky" if has_extra else "Point pred.")
+    has_third = bool(args.checkpoint_third)
+    has_multi = has_extra or has_third
+    label_main = args.label_main or ("GHI + full sky" if has_multi else "Point pred.")
     label_extra = args.label_extra
+    label_third = args.label_third
     label_gt = args.label_gt
 
     stride_min = int(args.stride_min)
@@ -737,7 +903,15 @@ def main() -> int:
 
     import xarray as xr
 
-    sky_ds = xr.open_zarr("/work/folsom_dataset/sky_zarr")
+    sky_zarr_path = Path(args.sky_zarr).expanduser().resolve()
+    _assert_valid_sky_source(sky_zarr_path, role="Left-panel display")
+    if not sky_zarr_path.is_dir():
+        raise FileNotFoundError(
+            f"sky zarr not found: {sky_zarr_path}  "
+            f"(pass --sky-zarr to a local xarray Zarr with time_utc + images)"
+        )
+    print(f"[animate] sky_zarr (display + model): {sky_zarr_path}")
+    sky_ds = xr.open_zarr(str(sky_zarr_path), consolidated=False)
     sky_times_raw = sky_ds["time_utc"].values
 
     grid_utc, first_sky, last_sky = _find_display_grid_utc(
@@ -749,6 +923,7 @@ def main() -> int:
     )
 
     pred_extra_kw: np.ndarray | None = None
+    pred_third_kw: np.ndarray | None = None
 
     if npz_path.is_file() and not args.force:
         print(f"[animate] using cached predictions: {npz_path}")
@@ -761,6 +936,8 @@ def main() -> int:
             pred_extra_kw = cached["pred_nosky_kw"]
         else:
             pred_kw = cached["pred_kw"]
+        if "pred_third_kw" in keys:
+            pred_third_kw = cached["pred_third_kw"]
         with meta_path.open() as f:
             meta = json.load(f)
         # Rebuild display grid from cache so a stale --date doesn't lie.
@@ -769,6 +946,11 @@ def main() -> int:
             raise RuntimeError(
                 f"--checkpoint-extra was passed but cached NPZ {npz_path} only "
                 f"holds a single prediction. Re-run with --force to recompute."
+            )
+        if has_third and pred_third_kw is None:
+            raise RuntimeError(
+                f"--checkpoint-third was passed but cached NPZ {npz_path} lacks "
+                f"pred_third_kw. Re-run with --force to recompute."
             )
     else:
         import torch
@@ -781,7 +963,15 @@ def main() -> int:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"[animate] device={device}")
 
-        ds = _build_folsom_dataset_for_inference(_FORCE_PV_OUTPUT_LEN)
+        ds, model_sky_meta = _build_folsom_dataset_for_inference(
+            _FORCE_PV_OUTPUT_LEN,
+            sky_zarr=sky_zarr_path,
+            dataset_config=str(args.dataset_config),
+        )
+        print(
+            f"[animate] model skyimg_dir={model_sky_meta['model_sky_zarr']}  "
+            f"format={model_sky_meta['model_sky_format']}"
+        )
         if int(ds.pv_output_len) != _FORCE_PV_OUTPUT_LEN:
             raise RuntimeError(
                 f"dataset pv_output_len override failed: got {ds.pv_output_len}, "
@@ -837,6 +1027,70 @@ def main() -> int:
                     "cos_zenith mismatch between main and extra forwards (should be identical)."
                 )
 
+        run_meta_third: dict | None = None
+        if has_third:
+            ckpt_third_path = Path(args.checkpoint_third).expanduser().resolve()
+            ckpt_third_peek = torch.load(ckpt_third_path, map_location="cpu")
+            need_sky_ch = _infer_sky_in_channels_from_state(
+                ckpt_third_peek.get("model_state_dict", ckpt_third_peek)
+            )
+            ds_third = ds
+            if (
+                int(ds.sky_in_channels) != need_sky_ch
+                or args.ray_map_third is not None
+                or args.sun_mask_third is not None
+                or args.sky_mask_third is not None
+            ):
+                ray_map_third = args.ray_map_third
+                sun_mask_third = args.sun_mask_third
+                if ray_map_third is None and sun_mask_third is None:
+                    if need_sky_ch == 4:
+                        sun_mask_third = "sun_halo"
+                    elif need_sky_ch == 6:
+                        ray_map_third = True
+                    elif need_sky_ch == 7:
+                        ray_map_third = True
+                        sun_mask_third = "sun_halo"
+                ds_third, _ = _build_folsom_dataset_for_inference(
+                    _FORCE_PV_OUTPUT_LEN,
+                    sky_zarr=sky_zarr_path,
+                    dataset_config=str(args.dataset_config),
+                    ray_map=ray_map_third,
+                    sun_mask=sun_mask_third,
+                    sky_mask=args.sky_mask_third,
+                )
+                if int(ds_third.sky_in_channels) != need_sky_ch:
+                    raise RuntimeError(
+                        f"Third checkpoint expects sky_in_channels={need_sky_ch} but "
+                        f"built dataset has {ds_third.sky_in_channels}. Pass matching "
+                        f"--ray-map-third / --sun-mask-third / --sky-mask-third."
+                    )
+                print(
+                    f"[animate] third-model dataset sky_channels="
+                    f"{list(getattr(ds_third, 'sky_channels', ('rgb',)))}  "
+                    f"sky_in_channels={ds_third.sky_in_channels}"
+                )
+            print(
+                f"[animate] forwarding third checkpoint: {ckpt_third_path} "
+                f"(legacy_pre_518dca9={bool(args.legacy_pre_518dca9)})"
+            )
+            pred_third_kw, gt_kw_third, cz_third, run_meta_third = _run_model_on_anchors(
+                ds_third,
+                anchors_rows,
+                checkpoint_path=ckpt_third_path,
+                device=device,
+                batch_size=int(args.batch_size),
+                legacy_pre_518dca9=bool(args.legacy_pre_518dca9),
+            )
+            if not np.allclose(gt_kw, gt_kw_third, equal_nan=True):
+                raise RuntimeError(
+                    "GT mismatch between main and third forwards (should be identical)."
+                )
+            if not np.allclose(cz, cz_third, equal_nan=True):
+                raise RuntimeError(
+                    "cos_zenith mismatch between main and third forwards (should be identical)."
+                )
+
         t_utc_arr = np.asarray([pd.Timestamp(t).to_datetime64() for t in grid_utc], dtype="datetime64[s]")
         t_local_arr = np.asarray(
             [
@@ -846,8 +1100,7 @@ def main() -> int:
             dtype="datetime64[s]",
         )
         if has_extra:
-            np.savez_compressed(
-                npz_path,
+            npz_payload = dict(
                 t_utc=t_utc_arr,
                 t_local=t_local_arr,
                 gt_kw=gt_kw,
@@ -856,27 +1109,32 @@ def main() -> int:
                 cos_zenith=cz,
             )
         else:
-            np.savez_compressed(
-                npz_path,
+            npz_payload = dict(
                 t_utc=t_utc_arr,
                 t_local=t_local_arr,
                 gt_kw=gt_kw,
                 pred_kw=pred_kw,
                 cos_zenith=cz,
             )
+        if has_third:
+            npz_payload["pred_third_kw"] = pred_third_kw
+        np.savez_compressed(npz_path, **npz_payload)
 
         meta = dict(
             date_local=args.date,
-            run_label=args.run_label,
+            run_label=run_label,
+            dataset_config=str(args.dataset_config),
             horizon_step_used=0,
             pv_output_len_at_inference=int(_FORCE_PV_OUTPUT_LEN),
             n_frames=int(len(grid_utc)),
             fps=float(args.fps),
             stride_min=int(stride_min),
-            sky_zarr="/work/folsom_dataset/sky_zarr",
+            sky_zarr=str(sky_zarr_path),
+            **model_sky_meta,
             sky_time_tolerance_s=int(_SKY_TIME_MATCH_TOLERANCE_S),
             local_tz="America/Los_Angeles",
             two_model_overlay=bool(has_extra),
+            three_model_overlay=bool(has_third),
             legacy_pre_518dca9=bool(args.legacy_pre_518dca9),
         )
         if has_extra:
@@ -911,7 +1169,24 @@ def main() -> int:
                 missing_keys_first5=list(run_meta_extra["missing_keys_first5"]),
                 unexpected_keys_first5=list(run_meta_extra["unexpected_keys_first5"]),
             )
-        else:
+        if has_third:
+            assert run_meta_third is not None
+            meta["third"] = dict(
+                label=label_third,
+                color=_THIRD_COLOR,
+                archive_name=args.archive_name_third,
+                run_name=args.run_name_third,
+                checkpoint=run_meta_third["checkpoint"],
+                zero_sky=bool(run_meta_third["zero_sky"]),
+                use_nwp=bool(run_meta_third["use_nwp"]),
+                nwp_features=run_meta_third["nwp_features"],
+                nwp_use_invalid_mask=bool(run_meta_third["nwp_use_invalid_mask"]),
+                missing_keys_count=int(run_meta_third["missing_keys_count"]),
+                unexpected_keys_count=int(run_meta_third["unexpected_keys_count"]),
+                missing_keys_first5=list(run_meta_third["missing_keys_first5"]),
+                unexpected_keys_first5=list(run_meta_third["unexpected_keys_first5"]),
+            )
+        if not has_extra:
             meta.update(
                 archive_name=args.archive_name,
                 run_name=args.run_name,
@@ -935,10 +1210,12 @@ def main() -> int:
         dtype=np.float64,
     )
 
+    arrays_for_ylim = [gt_kw, pred_kw]
     if pred_extra_kw is not None:
-        finite_vals = np.concatenate([gt_kw, pred_kw, pred_extra_kw])
-    else:
-        finite_vals = np.concatenate([gt_kw, pred_kw])
+        arrays_for_ylim.append(pred_extra_kw)
+    if pred_third_kw is not None:
+        arrays_for_ylim.append(pred_third_kw)
+    finite_vals = np.concatenate(arrays_for_ylim)
     ymax_data = float(np.nanmax(finite_vals)) if finite_vals.size else 1.0
     if not np.isfinite(ymax_data) or ymax_data <= 0:
         ymax_data = 1.0
@@ -952,13 +1229,13 @@ def main() -> int:
 
     title_right = f"Our approach (1-step ViT nowcast) — {args.date}"
 
+    preds_for_render: list[tuple[np.ndarray, str, str]] = [
+        (pred_kw, _MAIN_COLOR, label_main),
+    ]
     if pred_extra_kw is not None:
-        preds_for_render: list[tuple[np.ndarray, str, str]] = [
-            (pred_kw, _MAIN_COLOR, label_main),
-            (pred_extra_kw, _EXTRA_COLOR, label_extra),
-        ]
-    else:
-        preds_for_render = [(pred_kw, _MAIN_COLOR, label_main)]
+        preds_for_render.append((pred_extra_kw, _EXTRA_COLOR, label_extra))
+    if pred_third_kw is not None:
+        preds_for_render.append((pred_third_kw, _THIRD_COLOR, label_third))
 
     if args.keep_frames:
         frames_dir.mkdir(parents=True, exist_ok=True)
@@ -993,8 +1270,9 @@ def main() -> int:
 
     print("\n[animate] === SUMMARY ===")
     print(f"  date_local      : {args.date}")
-    print(f"  run_label       : {args.run_label}")
+    print(f"  run_label       : {run_label}")
     print(f"  two_model       : {has_extra}")
+    print(f"  three_model     : {has_third}")
     if has_extra:
         m = meta.get("main", {})
         e = meta.get("extra", {})
@@ -1012,11 +1290,25 @@ def main() -> int:
             f"  extra.zero_sky  : {e.get('zero_sky')}  "
             f"missing={e.get('missing_keys_count')}  unexpected={e.get('unexpected_keys_count')}"
         )
+    elif has_third:
+        print(f"  archive_name    : {meta.get('archive_name')}")
+        print(f"  run_name        : {meta.get('run_name')}")
+        print(f"  checkpoint      : {meta.get('checkpoint')}")
+        print(f"  zero_sky        : {meta.get('zero_sky')}")
     else:
         print(f"  archive_name    : {meta.get('archive_name')}")
         print(f"  run_name        : {meta.get('run_name')}")
         print(f"  checkpoint      : {meta.get('checkpoint')}")
         print(f"  zero_sky        : {meta.get('zero_sky')}")
+    if has_third:
+        t = meta.get("third", {})
+        print(f"  third.archive   : {t.get('archive_name')}")
+        print(f"  third.run       : {t.get('run_name')}")
+        print(f"  third.checkpoint: {t.get('checkpoint')}")
+        print(
+            f"  third.zero_sky  : {t.get('zero_sky')}  "
+            f"missing={t.get('missing_keys_count')}  unexpected={t.get('unexpected_keys_count')}"
+        )
     print(f"  horizon step    : {meta.get('horizon_step_used')} (= +15 min from anchor)")
     print(f"  pv_output_len   : {meta.get('pv_output_len_at_inference')}")
     print(f"  frames          : {len(frames)} @ {args.fps:g} fps")
@@ -1026,6 +1318,8 @@ def main() -> int:
     print(f"  peak_pred_main  : {float(np.nanmax(pred_kw)):.2f}")
     if pred_extra_kw is not None:
         print(f"  peak_pred_extra : {float(np.nanmax(pred_extra_kw)):.2f}")
+    if pred_third_kw is not None:
+        print(f"  peak_pred_third : {float(np.nanmax(pred_third_kw)):.2f}")
     if args.keep_frames:
         print(f"  frames_dir      : {frames_dir}")
 

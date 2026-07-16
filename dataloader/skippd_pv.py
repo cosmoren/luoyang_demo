@@ -26,7 +26,7 @@ This module is a near-1:1 port of :class:`dataloader.folsom.FolsomIrradianceData
   SKIPP'd has no GHI; we keep anchors whose Y window has any ``kt_mask == 1`` row
   (i.e. ``p_cs > _SKIPPD_KT_DAYTIME_THRESHOLD``). Same daytime intent.
 
-Everything else — Folsom-style 60/10/30 row split, random train anchors per epoch,
+Everything else — 60/10/30 row split (Folsom uses 66/18/18), random train anchors per epoch,
 strided val/test anchors, Ineichen clear-sky model, sky-Zarr nearest-frame stacking
 with the same ``_sky_anchor_max_lag`` / 90s tolerance,
 ``kt = pv_kW / (p_cs * p_mean + eps) * kt_mask`` (Luoyang-parity),
@@ -250,7 +250,7 @@ class SkippdPvDataset(Dataset):
     ``site.{latitude, longitude}`` (with a Stanford rooftop fallback) — SKIPP'd has no
     ``<paths.data_dir>/info.yaml``. ``paths.sky_format`` must be ``zarr``.
 
-    Splits: rows are partitioned 60% train / 10% val / 30% test (same as Folsom).
+    Splits: rows are partitioned 60% train / 10% val / 30% test (SkipPP'd; Folsom uses 66/18/18).
     Train samples a random valid anchor per ``__getitem__`` (epoch length defaults to
     ``_DEFAULT_SKIPPD_TRAIN_EPOCH_LEN``; settable via ``self._train_epoch_len``);
     val/test use the respective ``*_anchor_stride_min`` strides.
@@ -484,7 +484,7 @@ class SkippdPvDataset(Dataset):
         self._x_tail_1d = (-(lx - 1) * sx + np.arange(lx, dtype=np.intp) * sx).astype(np.intp, copy=False)
         self._y_off_1d = (sy + np.arange(ly, dtype=np.intp) * sy).astype(np.intp, copy=False)
 
-        # Fixed 60% / 10% / 30% train/val/test split (matches Folsom / PVDataset).
+        # Fixed 60% / 10% / 30% train/val/test split (SkipPP'd; Folsom uses 66/18/18).
         split_train_end = int(n * 0.6)
         split_val_end = int(n * 0.7)
         if not (0 < split_train_end < split_val_end < n):

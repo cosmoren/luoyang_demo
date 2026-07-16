@@ -164,6 +164,8 @@ class SkyPatchSpatiotemporalEmbed(nn.Module):
             raise ValueError(
                 f"image_size ({image_size}) must be divisible by patch_size ({patch_size})"
             )
+        if in_channels < 1:
+            raise ValueError(f"in_channels must be >= 1, got {in_channels}")
         self.embed_dim = embed_dim
         self.patch_size = patch_size
         self.image_size = image_size
@@ -179,7 +181,7 @@ class SkyPatchSpatiotemporalEmbed(nn.Module):
     def forward(self, x: torch.Tensor, timefeats: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
-            x: ``[B, T, 3, H, W]`` where ``H=W=image_size``.
+            x: ``[B, T, C, H, W]`` where ``H=W=image_size`` and ``C=in_channels``.
             timefeats: ``[B, T, 1]`` single ``delta_t`` scalar per frame.
         Returns:
             ``[B, T, P, D]`` where ``P=num_patches`` and ``D=embed_dim``.

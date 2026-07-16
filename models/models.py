@@ -597,6 +597,9 @@ class pv_forecasting_model_vit_imgs(nn.Module):
 
         self.use_batchnorm = use_batchnorm
         self.dropout = dropout
+        if sky_in_channels < 1:
+            raise ValueError(f"sky_in_channels must be >= 1, got {sky_in_channels}")
+        self.sky_in_channels = int(sky_in_channels)
 
         if nwp_features is None:
             nwp_features = list(_DEFAULT_VIT_IMGS_NWP_FEATURES)

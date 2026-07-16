@@ -32,13 +32,13 @@ ActiveTask = Literal[
 ACTIVE_TASK: ActiveTask = "augment_irradiance_csv"
 
 # --- Task: flatten_jpegs ------------------------------------------------------
-FOLSOM_INPUT_DIR = Path("/home/kyber/projects/digital energy/folsom_ds/original/sky image/raw")
-SPMF_OUTPUT_DIR = Path("/home/kyber/projects/digital energy/folsom_ds/processed/sky")
+FOLSOM_INPUT_DIR = Path("/home/kyber/projects/digital_energy/folsom_ds/original/sky image/raw")
+SPMF_OUTPUT_DIR = Path("/home/kyber/projects/digital_energy/folsom_ds/processed/sky")
 OVERWRITE_EXISTING = False
 
 # --- Task: merge_nwp_csvs (4 CSVs → 1 averaged CSV) --------------------------
-NWP_AVG_INPUT_DIR = Path("/home/kyber/projects/digital energy/folsom_ds/original/NAM forecast/raw")
-NWP_AVG_OUTPUT_DIR = Path("/home/kyber/projects/digital energy/folsom_ds/processed/NWP")
+NWP_AVG_INPUT_DIR = Path("/home/kyber/projects/digital_energy/folsom_ds/original/NAM forecast/raw")
+NWP_AVG_OUTPUT_DIR = Path("/home/kyber/projects/digital_energy/folsom_ds/processed/NWP")
 NWP_AVG_OUTPUT_FILENAME = "nwp_merged_averaged.csv"
 
 # Folsom NAM row-2 headers (full order): reftime, valtime, dwsw, cloud_cover,
@@ -63,7 +63,7 @@ NWP_CSV_HEADER_ROW = 1
 NWP_ROUND_CLOUD_COVER_AND_REL_HUMIDITY = True
 
 # --- Task: rename_jpg_date_time (``20140101_000011.jpg`` -> ``20140101000011.jpg``) -
-RENAME_JPG_DATE_TIME_DIR = Path("/home/kyber/projects/digital energy/folsom_ds/processed/sky")
+RENAME_JPG_DATE_TIME_DIR = Path("/home/kyber/projects/digital_energy/folsom_ds/processed/sky")
 
 # --- Task: augment_irradiance_csv (add p_cs/kt/kt_mask/p_mean to irradiance CSV) ----
 IRR_INPUT_CSV = Path("/work/folsom_dataset/irradiance/Folsom_irradiance.csv")

@@ -1,81 +1,39 @@
-# Folsom-specific overrides on top of the shared `config/train/conf_train.yaml`.
-# Only keys explicitly set here override the shared defaults; missing keys inherit.
-# Trainer flow: load conf_train.yaml -> apply this `training:` block -> CLI flags win.
-training:
-  epochs: 40
-
-# Folsom, CA — irradiance CSV + sky Zarr + (optional) merged NWP CSV.
-# -----------------------------------------------------------------------------
-# Same schema as Luoyang `pv_*` keys (no `irr_*`, no `dataset_profile: folsom`).
-# Used by ``dataloader.folsom`` and ``training/train_vit_test_folsom.py``.
-#
-# Run Folsom training:
-#   python training/train_vit_test_folsom.py --dataset-config conf_folsom.yaml
-# -----------------------------------------------------------------------------
+# New and cleaned up verions of foslom config file
+# Some parameters are changed to ensure reliable resutls on most experiments
+# Any new format or data should have go to a new folder
 
 site:
-  name: "Folsom, CA"
+  name: Folsom
 
 paths:
-  data_dir: "/work/folsom_dataset"
-  # PVDataset reads this Excel via train_vit_test.py main() to build dev_dn_list.
-  # FolsomIrradianceDataset itself never reads it (returns dev_idx=0 for the single GHI sensor),
-  # so we keep the Luoyang Excel as a placeholder; trainer's nn.Embedding lookup still works.
-  # FolsomIrradianceDataset globs `pv_path` for exactly one CSV (the Folsom irradiance file).
+  data_dir: /home/kyber/projects/digital_energy/folsom_ds/processed2
   pv_path: irradiance
-  sky_format: zarr
-  sky_image_path: sky_zarr
-  # Folsom GOES-15 GridSat-CONUS per-frame shards live under
-  # ``<data_dir>/sat_goes_gridsat/YYYY/MM/goes15_YYYYMMDD_HHMM.npy`` (3 x 100 x 100 float16,
-  # values in [0, 1]; ~94k files covering 2014-01-01 -> 2016-12-31 UTC). Used when
-  # ``sampling.use_satellite: true``; otherwise FolsomIrradianceDataset never reads from
-  # this directory.
+  sky_image_path: sky.zarr 
   sat_path: sat_goes_gridsat
-  # PVDataset uses `paths.nwp_path` (folder with solar.csv / wind.csv); placeholder for Folsom.
   nwp_path: NWP
-  # Folsom-specific: single merged NWP CSV (reftime, valtime, ssrd/cloud_cover/.../temperature/.../wind).
-  # If missing or unreadable, FolsomIrradianceDataset falls back to zero NWP + per-step invalid mask.
-  folsom_nwp_merged_csv: NWP/nwp_merged_averaged.csv
 
-# Sampling / window keys for ``dataloader.folsom`` and ``training/train_vit_test_folsom.py``
 sampling:
-  # Random anchor draws per training epoch from the valid-train pool.
-  # Folsom has ~925k valid train anchors; 100k/epoch over 40 epochs is 4M total
-  # draws -> ~99% unique-anchor coverage, ~4.3x average per-anchor revisits.
-  # Going past 4M total draws is mostly diminishing returns. CLI flag
-  # --train_epoch_len overrides this; fallback if absent is the dataloader
-  # constant _DEFAULT_FOLSOM_TRAIN_EPOCH_LEN.
-  train_epoch_len: 100000
-  # CSV row spacing (Folsom is 1-min; Luoyang was 5-min).
+  train_epoch_len: 50000 # number of anchors per training epoch
   csv_interval_min: 1
-  # PVDataset / FolsomIrradianceDataset input window (X) and forecast window (Y).
-  pv_input_interval_min: 5      # multiple of csv_interval_min
-  pv_input_len: 576             # 576 * 5min = 48 h history
-  pv_output_interval_min: 15    # multiple of csv_interval_min
-  pv_output_len: 16             # 16 * 15min = 4 h forecast
-  # Time-based split: 60% train / 10% val / 30% test (fixed in the dataset class; this fraction
-  # is required by the schema but only `pv_train_time_fraction` is read for legacy parity).
-  pv_train_time_fraction: 0.7
-  test_anchor_stride_min: 1500
-  val_anchor_stride_min: 7000
-  test_collect_time_match_tolerance_min: 0
-  # Sky stack (last N frames ending at the anchor; zarr time series).
+  pv_input_interval_min: 5
+  pv_input_len: 576
+  pv_output_interval_min: 15
+  pv_output_len: 16
+  # chronological split of data for training, validation, and testing
+  train_split: 0.66 
+  val_split: 0.17
+  test_split: 0.17
+  test_anchor_stride_min: 100
+  val_anchor_stride_min: 250
   skyimg_window_size: 30
   skyimg_time_resolution_min: 1
   skyimg_spatial_size: 224
-  # Enable Folsom GOES-15 satellite branch. When true, the loader resolves per-frame
-  # NPY shards from <data_dir>/<paths.sat_path>/YYYY/MM/goes15_YYYYMMDD_HHMM.npy and
-  # emits sat_tensor [T_sat, 3, 100, 100] + sat_timefeats [T_sat, 9]. When false,
-  # sat_tensor / sat_timefeats are None; the model (see models/models.py:727) treats
-  # None / all-zero as "no sat" and uses a learned zero embedding instead. The CLI
-  # flag --use-satellite / --no-use-satellite on the trainer overrides this value.
-  use_satellite: true
-  # Satellite stack: 24 frames at 15-min cadence ending floor_15(time0 - 30 min) (oldest -> newest).
-  # NPY shards on disk are CHW (3, 100, 100) float16 already in [0, 1]; the loader returns float32.
-  # ``satimg_npy_shape_hwc`` is kept in [H, W, C] order to match the PVDataset constructor signature;
-  # ``dataloader.folsom._load_satimg_tensor`` accepts both CHW and HWC layouts. With
-  # ``use_satellite: false`` only ``satimg_npy_shape_hwc`` is consulted (for the zero-tensor
-  # fallback in the model) and the shards are never opened.
+  # extra channels for sky image: ray_map, sun_mask, sky_mask
+  ray_map: true  # true | false
+  sun_mask: sun_only  # none | sun_only | sun_halo | gaussian_pixel | gaussian_angular
+  sun_mask_sigma_px: 70
+  sun_mask_sigma_deg: 55
+  sky_mask: tight  # none | loose | tight | valid_disc
   satimg_window_size: 24
   satimg_time_resolution_min: 15
   satimg_npy_shape_hwc: [100, 100, 3]
