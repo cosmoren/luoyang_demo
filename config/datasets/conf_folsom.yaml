@@ -6,9 +6,9 @@ site:
   name: Folsom
 
 paths:
-  data_dir: "/home/kyber/projects/digital energy/folsom_ds/processed/full"
+  data_dir: /home/kyber/projects/digital_energy/folsom_ds/processed2
   pv_path: irradiance
-  sky_image_path: "sky.zarr" 
+  sky_image_path: sky.zarr 
   sat_path: sat_goes_gridsat
   nwp_path: NWP
 

@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import math
 import os
 import random
 import sys
@@ -84,11 +85,10 @@ from models.models import (  # noqa: E402
 _FOLSOM_NWP_TEMPERATURE_INDEX = _FOLSOM_NWP_FEATURE_COLS.index("temperature")
 # ``pv_forecasting_model_vit_imgs`` reads ``nwp_tensor[:, :, 0]`` as shortwave-like and ``[:, :, 2]`` as Kelvin temp.
 _VIT_IMGS_NWP_TEMPERATURE_SLOT = 2
-# Folsom forecast horizon for loss / val metrics: first 16 output steps
-# (t0+15 min .. t0+4h at 15 min cadence). Must match ``sampling.pv_output_len`` in
-# ``conf_folsom.yaml`` so model output, loss, and masked RMSE/MAE cover the same window.
-_LOSS_METRIC_HORIZON = 16
-
+# Optional override for train/eval loss+metrics horizon (first N forecast steps).
+# ``None`` = use ``sampling.pv_output_len`` from the dataset config (default). Set an int
+# to score loss on fewer steps while keeping full model ``T_out``.
+_LOSS_METRIC_HORIZON: int | None = None
 # Special token in ``--nwp-features`` that toggles the per-step invalid-mask channel
 # (``nwp_tensor[:, :, -1]``); not a real NWP feature so kept out of the features list.
 _NWP_INVALID_MASK_TOKEN = "invalid_mask"
@@ -367,6 +367,7 @@ def train_one_epoch(
     max_batches: int | None = None,
     ema: ModelEMA | None = None,
     *,
+    loss_metric_horizon: int,
     use_nwp: bool = False,
     zero_sky: bool = False,
 ) -> float:
@@ -386,7 +387,7 @@ def train_one_epoch(
         pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
         t_out = int(pv_pred.shape[1])
         assert d["target_pv"].shape[1] == t_out, (pv_pred.shape, d["target_pv"].shape)
-        h = min(_LOSS_METRIC_HORIZON, t_out)
+        h = min(int(loss_metric_horizon), t_out)
         m = d["target_mask"][:, :h]
         loss = criterion(
             (pv_pred[:, :h] * m),
@@ -407,13 +408,17 @@ def evaluate(
     loader: DataLoader,
     criterion: nn.Module,
     *,
+    loss_metric_horizon: int,
     max_batches: int | None = None,
     use_nwp: bool = False,
     zero_sky: bool = False,
 ) -> tuple[float, float, float]:
-    """Returns mean Huber loss (first ``_LOSS_METRIC_HORIZON`` steps, masked like train), RMSE and
+    """Returns mean Huber loss (first ``loss_metric_horizon`` steps, masked like train), RMSE and
     MAE in **normalized** GHI space over the same slice (``target_mask``; predictions at night
     cos-zenith < 0 are zeroed before residuals, matching ``train_vit_test.py``).
+
+    ``loss_metric_horizon`` defaults to ``sampling.pv_output_len`` (dataset ``T_out``);
+    may be lowered independently (see ``_LOSS_METRIC_HORIZON`` / main assignment).
 
     If ``max_batches`` is set, only the first N batches are used (smoke / faster dev runs; metrics
     are not a full pass over the split).
@@ -424,6 +429,7 @@ def evaluate(
     sum_abs = 0.0
     sum_sq = 0.0
     n_elem = 0.0
+    horizon = int(loss_metric_horizon)
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
             if max_batches is not None and batch_idx >= int(max_batches):
@@ -434,7 +440,7 @@ def evaluate(
             kt_pred = forward_vit(model, d) * _FOLSOM_KT_INPUT_SCALE
             pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
             t_out = int(pv_pred.shape[1])
-            h = min(_LOSS_METRIC_HORIZON, t_out)
+            h = min(horizon, t_out)
             m = d["target_mask"][:, :h]
             tgt = d["target_pv"][:, :h]
             loss = criterion((pv_pred[:, :h] * m), (tgt * m))
@@ -455,9 +461,8 @@ def evaluate(
     mae_wm2 = sum_abs / max(n_elem, 1.0)
     rmse_wm2 = (sum_sq / max(n_elem, 1.0)) ** 0.5
     print(
-        f"First-{_LOSS_METRIC_HORIZON}-step metrics (masked GHI; pred zeroed at night): "
-        f"MAE={mae_wm2:.4f} W/m²  RMSE={rmse_wm2:.4f} W/m²  "
-        f"(t0+15 min .. t0+4h at 15 min cadence)"
+        f"First-{horizon}-step metrics (masked GHI; pred zeroed at night): "
+        f"MAE={mae_wm2:.4f} W/m²  RMSE={rmse_wm2:.4f} W/m²"
     )
     return mean_loss, rmse_wm2, mae_wm2
 
@@ -550,8 +555,11 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--warmup-epochs",
         type=int,
-        default=4,
-        help="Linear LR warmup in epoch units before cosine decay (0 = no warmup).",
+        default=None,
+        help=(
+            "Linear LR warmup in epoch units before cosine decay (0 = no warmup). "
+            "Default: floor(10%% of --epochs)."
+        ),
     )
     parser.add_argument(
         "--lr-min",
@@ -1086,6 +1094,8 @@ def main() -> None:
 
     parser = _build_parser(h, config_default=pre_args.config)
     args = parser.parse_args()
+    if args.warmup_epochs is None:
+        args.warmup_epochs = math.ceil(args.epochs * 0.1)
 
     _train_epoch_len, _train_epoch_len_src = _resolved_train_epoch_len(
         argv=sys.argv,
@@ -1146,9 +1156,9 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # ``sky_in_channels`` is the dataset-side source of truth for sky-branch input
-    # width (rgb=3, +ray_map=+3, +sun_mask=+1, +sky_mask=+1). Configured via
-    # ``--ray-map`` / ``--sun-mask`` / ``--sky-mask`` CLI flags or the matching
-    # ``sampling.*`` keys in the dataset YAML.
+    # width (rgb=3, +ray_map=+3, +sun_mask=+1, +sky_mask=+1, plus the always-on
+    # Zarr image_valid=+1). Optional channels are configured via ``--ray-map`` /
+    # ``--sun-mask`` / ``--sky-mask`` or matching ``sampling.*`` YAML keys.
     sky_in_channels = int(getattr(train_dataset, "sky_in_channels", 3))
     model = pv_forecasting_model_vit_imgs(
         dev_dn_list=dev_dn_list,
@@ -1236,11 +1246,19 @@ def main() -> None:
     eval_cap = args.eval_max_batches
     use_nwp = bool(args.use_nwp)
     zero_sky = bool(args.zero_sky)
+    # Default: match config sampling.pv_output_len; can lower for loss-only while
+    # keeping full T_out (edit here, or set module-level ``_LOSS_METRIC_HORIZON``).
+    loss_metric_horizon = (
+        int(_LOSS_METRIC_HORIZON)
+        if _LOSS_METRIC_HORIZON is not None
+        else int(train_dataset.pv_output_len)
+    )
     initial_test_loss, _, _ = evaluate(
         model,
         device,
         test_loader,
         criterion,
+        loss_metric_horizon=loss_metric_horizon,
         max_batches=eval_cap,
         use_nwp=use_nwp,
         zero_sky=zero_sky,
@@ -1265,6 +1283,7 @@ def main() -> None:
             optimizer,
             max_batches,
             ema=ema if ema_active else None,
+            loss_metric_horizon=loss_metric_horizon,
             use_nwp=use_nwp,
             zero_sky=zero_sky,
         )
@@ -1276,6 +1295,7 @@ def main() -> None:
                     device,
                     val_loader,
                     criterion,
+                    loss_metric_horizon=loss_metric_horizon,
                     max_batches=eval_cap,
                     use_nwp=use_nwp,
                     zero_sky=zero_sky,
@@ -1286,6 +1306,7 @@ def main() -> None:
                 device,
                 val_loader,
                 criterion,
+                loss_metric_horizon=loss_metric_horizon,
                 max_batches=eval_cap,
                 use_nwp=use_nwp,
                 zero_sky=zero_sky,
@@ -1376,6 +1397,7 @@ def main() -> None:
             device,
             test_loader,
             criterion,
+            loss_metric_horizon=loss_metric_horizon,
             max_batches=eval_cap,
             use_nwp=use_nwp,
             zero_sky=zero_sky,
@@ -1403,6 +1425,7 @@ def main() -> None:
             device,
             test_loader,
             criterion,
+            loss_metric_horizon=loss_metric_horizon,
             max_batches=eval_cap,
             use_nwp=use_nwp,
             zero_sky=zero_sky,

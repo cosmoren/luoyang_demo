@@ -30,9 +30,14 @@ Conventions
 Masking method
 --------------
 :func:`compute_sun_mask` projects the sun onto the image via
-:func:`project_sun_to_pixel`, then marks pixels inside a **Euclidean pixel
-circle** of radius ``R = f_s * beta`` where ``beta = deg2rad(radius_deg)``.
+:func:`project_sun_to_pixel`, then delegates to
+:func:`compute_sun_mask_from_centers`, which marks pixels inside a **Euclidean
+pixel circle** of radius ``R = f_s * beta`` where ``beta = deg2rad(radius_deg)``.
 Frames with the sun below the horizon are all-zero.
+
+Callers that already have per-frame ``(u, v)`` centers (e.g. Folsom sky Zarr
+``sun_u`` / ``sun_v`` / ``sun_valid``) should call
+:func:`compute_sun_mask_from_centers` directly and skip projection.
 
 Gaussian modes (``gaussian_pixel``, ``gaussian_angular``) produce soft masks in
 ``[0, 1]`` clipped after the Gaussian. If the projected sun pixel falls outside
@@ -235,91 +240,6 @@ def _sun_ray_image_axis(
     return ray
 
 
-def compute_sun_mask_gaussian_pixel(
-    az_deg: np.ndarray,
-    zen_deg: np.ndarray,
-    image_size: int,
-    fit: dict,
-    sigma_px: float = DEFAULT_SUN_MASK_SIGMA_PX,
-) -> np.ndarray:
-    """Per-frame ``[T, H, W]`` soft sun mask via a pixel-space Gaussian."""
-    az = np.asarray(az_deg, dtype=np.float64)
-    zen = np.asarray(zen_deg, dtype=np.float64)
-    _validate_sun_mask_inputs(az, zen, image_size)
-    if not (sigma_px > 0.0):
-        raise ValueError(
-            f"fisheye_sunmask.compute_sun_mask_gaussian_pixel: sigma_px must be > 0 "
-            f"(got {sigma_px})"
-        )
-
-    t = int(az.shape[0])
-    s = int(image_size)
-    u_sun, v_sun, above, _ = project_sun_to_pixel(az, zen, s, fit)
-
-    u_grid, v_grid = np.meshgrid(
-        np.arange(s, dtype=np.float64),
-        np.arange(s, dtype=np.float64),
-        indexing="xy",
-    )
-    inv_two_sigma_sq = 1.0 / (2.0 * float(sigma_px) * float(sigma_px))
-
-    out = np.zeros((t, s, s), dtype=np.float32)
-    for i in range(t):
-        if not bool(above[i]):
-            continue
-        us = float(u_sun[i])
-        vs = float(v_sun[i])
-        if not _sun_pixel_in_image_bounds(us, vs, s, s):
-            continue
-        du = u_grid - us
-        dv = v_grid - vs
-        out[i] = np.exp(-(du * du + dv * dv) * inv_two_sigma_sq).astype(np.float32)
-    return np.clip(out, 0.0, 1.0)
-
-
-def compute_sun_mask_gaussian_angular(
-    az_deg: np.ndarray,
-    zen_deg: np.ndarray,
-    image_size: int,
-    fit: dict,
-    sigma_deg: float = DEFAULT_SUN_MASK_SIGMA_DEG,
-) -> np.ndarray:
-    """Per-frame ``[T, H, W]`` soft sun mask via an angular Gaussian in ray space."""
-    az = np.asarray(az_deg, dtype=np.float64)
-    zen = np.asarray(zen_deg, dtype=np.float64)
-    _validate_sun_mask_inputs(az, zen, image_size)
-    if not (sigma_deg > 0.0):
-        raise ValueError(
-            f"fisheye_sunmask.compute_sun_mask_gaussian_angular: sigma_deg must be > 0 "
-            f"(got {sigma_deg})"
-        )
-
-    t = int(az.shape[0])
-    s = int(image_size)
-    u_sun, v_sun, above, _ = project_sun_to_pixel(az, zen, s, fit)
-    cx_s, cy_s, f_s = _scaled_optical_center_and_f(fit, s, s)
-    rays = _compute_image_axis_rays(s, s, fit)
-    sigma_rad = float(np.deg2rad(sigma_deg))
-    inv_two_sigma_sq = 1.0 / (2.0 * sigma_rad * sigma_rad)
-
-    out = np.zeros((t, s, s), dtype=np.float32)
-    for i in range(t):
-        if not bool(above[i]):
-            continue
-        us = float(u_sun[i])
-        vs = float(v_sun[i])
-        if not _sun_pixel_in_image_bounds(us, vs, s, s):
-            continue
-        sun_ray = _sun_ray_image_axis(us, vs, cx_s, cy_s, f_s)
-        dot = (
-            rays[0] * sun_ray[0] + rays[1] * sun_ray[1] + rays[2] * sun_ray[2]
-        )
-        dot = np.clip(dot, -1.0, 1.0)
-        angle_rad = np.arccos(dot)
-        out[i] = np.exp(-(angle_rad * angle_rad) * inv_two_sigma_sq).astype(np.float32)
-    return np.clip(out, 0.0, 1.0)
-
-
 def _validate_sun_mask_inputs(
     az: np.ndarray, zen: np.ndarray, image_size: int
 ) -> None:
@@ -337,6 +257,201 @@ def _validate_sun_mask_inputs(
         )
 
 
+def _validate_sun_center_inputs(
+    u_sun: np.ndarray,
+    v_sun: np.ndarray,
+    valid: np.ndarray,
+    image_size: int,
+) -> None:
+    if u_sun.ndim != 1 or v_sun.ndim != 1 or valid.ndim != 1:
+        raise ValueError(
+            f"fisheye_sunmask: u_sun/v_sun/valid must be 1-D, got shapes "
+            f"{u_sun.shape}, {v_sun.shape}, {valid.shape}"
+        )
+    if not (u_sun.shape[0] == v_sun.shape[0] == valid.shape[0]):
+        raise ValueError(
+            f"fisheye_sunmask: u/v/valid length mismatch "
+            f"{u_sun.shape[0]}/{v_sun.shape[0]}/{valid.shape[0]}"
+        )
+    if image_size <= 0:
+        raise ValueError(
+            f"fisheye_sunmask: image_size must be > 0 (got {image_size})"
+        )
+
+
+def compute_sun_mask_from_centers(
+    u_sun: np.ndarray,
+    v_sun: np.ndarray,
+    valid: np.ndarray,
+    image_size: int,
+    fit: dict,
+    *,
+    mode: str = "sun_halo",
+    radius_deg: float = 30.0,
+    sigma_px: float | None = None,
+    sigma_deg: float | None = None,
+) -> np.ndarray:
+    """Per-frame ``[T, image_size, image_size]`` ``float32`` sun mask from pixel centers.
+
+    ``u_sun`` / ``v_sun`` are raw-image pixel coords at ``image_size`` (same
+    convention as :func:`project_sun_to_pixel`). ``valid`` is a boolean (or 0/1)
+    flag; frames with ``valid=False``, non-finite centers, or out-of-bounds
+    centers yield an all-zero mask.
+
+    ``mode`` matches :func:`compute_sun_mask`:
+
+    * ``sun_only`` / ``sun_halo`` — hard Euclidean disc (``radius_deg``; needs ``fit`` for ``f``).
+    * ``gaussian_pixel`` — soft pixel Gaussian (``sigma_px``; ``fit`` unused for geometry).
+    * ``gaussian_angular`` — soft angular Gaussian in image-axis ray space (``sigma_deg``).
+    """
+    u = np.asarray(u_sun, dtype=np.float64)
+    v = np.asarray(v_sun, dtype=np.float64)
+    above = np.asarray(valid, dtype=bool)
+    _validate_sun_center_inputs(u, v, above, image_size)
+    # NaN / inf centers are treated as invalid even if the flag says otherwise.
+    above = above & np.isfinite(u) & np.isfinite(v)
+
+    mode = str(mode).strip()
+    s = int(image_size)
+    t = int(u.shape[0])
+
+    if mode == "gaussian_pixel":
+        if sigma_px is None:
+            sigma_px = DEFAULT_SUN_MASK_SIGMA_PX
+        if not (float(sigma_px) > 0.0):
+            raise ValueError(
+                f"fisheye_sunmask.compute_sun_mask_from_centers: sigma_px must be > 0 "
+                f"(got {sigma_px})"
+            )
+        u_grid, v_grid = np.meshgrid(
+            np.arange(s, dtype=np.float64),
+            np.arange(s, dtype=np.float64),
+            indexing="xy",
+        )
+        inv_two_sigma_sq = 1.0 / (2.0 * float(sigma_px) * float(sigma_px))
+        out = np.zeros((t, s, s), dtype=np.float32)
+        for i in range(t):
+            if not bool(above[i]):
+                continue
+            us = float(u[i])
+            vs = float(v[i])
+            if not _sun_pixel_in_image_bounds(us, vs, s, s):
+                continue
+            du = u_grid - us
+            dv = v_grid - vs
+            out[i] = np.exp(-(du * du + dv * dv) * inv_two_sigma_sq).astype(np.float32)
+        return np.clip(out, 0.0, 1.0)
+
+    if mode == "gaussian_angular":
+        if sigma_deg is None:
+            sigma_deg = DEFAULT_SUN_MASK_SIGMA_DEG
+        if not (float(sigma_deg) > 0.0):
+            raise ValueError(
+                f"fisheye_sunmask.compute_sun_mask_from_centers: sigma_deg must be > 0 "
+                f"(got {sigma_deg})"
+            )
+        cx_s, cy_s, f_s = _scaled_optical_center_and_f(fit, s, s)
+        rays = _compute_image_axis_rays(s, s, fit)
+        sigma_rad = float(np.deg2rad(sigma_deg))
+        inv_two_sigma_sq = 1.0 / (2.0 * sigma_rad * sigma_rad)
+        out = np.zeros((t, s, s), dtype=np.float32)
+        for i in range(t):
+            if not bool(above[i]):
+                continue
+            us = float(u[i])
+            vs = float(v[i])
+            if not _sun_pixel_in_image_bounds(us, vs, s, s):
+                continue
+            sun_ray = _sun_ray_image_axis(us, vs, cx_s, cy_s, f_s)
+            dot = (
+                rays[0] * sun_ray[0] + rays[1] * sun_ray[1] + rays[2] * sun_ray[2]
+            )
+            dot = np.clip(dot, -1.0, 1.0)
+            angle_rad = np.arccos(dot)
+            out[i] = np.exp(-(angle_rad * angle_rad) * inv_two_sigma_sq).astype(
+                np.float32
+            )
+        return np.clip(out, 0.0, 1.0)
+
+    if mode not in _SUN_MASK_HARD_MODES:
+        raise ValueError(
+            f"fisheye_sunmask.compute_sun_mask_from_centers: unknown mode {mode!r}; "
+            f"expected one of {sorted(_SUN_MASK_HARD_MODES | _SUN_MASK_GAUSSIAN_MODES)}"
+        )
+    if not (float(radius_deg) > 0.0):
+        raise ValueError(
+            f"fisheye_sunmask.compute_sun_mask_from_centers: radius_deg must be > 0 "
+            f"(got {radius_deg})"
+        )
+
+    _cx_s, _cy_s, f_s = _scaled_optical_center_and_f(fit, s, s)
+    radius_px = float(f_s) * float(np.deg2rad(radius_deg))
+    radius_px_sq = radius_px * radius_px
+    u_grid, v_grid = np.meshgrid(
+        np.arange(s, dtype=np.float64),
+        np.arange(s, dtype=np.float64),
+        indexing="xy",
+    )
+    out = np.zeros((t, s, s), dtype=np.float32)
+    for i in range(t):
+        if not bool(above[i]):
+            continue
+        us = float(u[i])
+        vs = float(v[i])
+        if not _sun_pixel_in_image_bounds(us, vs, s, s):
+            continue
+        du = u_grid - us
+        dv = v_grid - vs
+        out[i] = (du * du + dv * dv <= radius_px_sq).astype(np.float32)
+    return out
+
+
+def compute_sun_mask_gaussian_pixel(
+    az_deg: np.ndarray,
+    zen_deg: np.ndarray,
+    image_size: int,
+    fit: dict,
+    sigma_px: float = DEFAULT_SUN_MASK_SIGMA_PX,
+) -> np.ndarray:
+    """Per-frame ``[T, H, W]`` soft sun mask via a pixel-space Gaussian."""
+    az = np.asarray(az_deg, dtype=np.float64)
+    zen = np.asarray(zen_deg, dtype=np.float64)
+    _validate_sun_mask_inputs(az, zen, image_size)
+    u_sun, v_sun, above, _ = project_sun_to_pixel(az, zen, int(image_size), fit)
+    return compute_sun_mask_from_centers(
+        u_sun,
+        v_sun,
+        above,
+        image_size,
+        fit,
+        mode="gaussian_pixel",
+        sigma_px=float(sigma_px),
+    )
+
+
+def compute_sun_mask_gaussian_angular(
+    az_deg: np.ndarray,
+    zen_deg: np.ndarray,
+    image_size: int,
+    fit: dict,
+    sigma_deg: float = DEFAULT_SUN_MASK_SIGMA_DEG,
+) -> np.ndarray:
+    """Per-frame ``[T, H, W]`` soft sun mask via an angular Gaussian in ray space."""
+    az = np.asarray(az_deg, dtype=np.float64)
+    zen = np.asarray(zen_deg, dtype=np.float64)
+    _validate_sun_mask_inputs(az, zen, image_size)
+    u_sun, v_sun, above, _ = project_sun_to_pixel(az, zen, int(image_size), fit)
+    return compute_sun_mask_from_centers(
+        u_sun,
+        v_sun,
+        above,
+        image_size,
+        fit,
+        mode="gaussian_angular",
+        sigma_deg=float(sigma_deg),
+    )
+
+
 def compute_sun_mask(
     az_deg: np.ndarray,
     zen_deg: np.ndarray,
@@ -350,18 +465,12 @@ def compute_sun_mask(
 ) -> np.ndarray:
     """Per-frame ``[T, image_size, image_size]`` ``float32`` sun mask.
 
-    For hard-disc modes (``sun_only`` / ``sun_halo``), each frame above the
-    horizon and in-bounds:
-
-    1. Project the sun to ``(u_sun, v_sun)`` via :func:`project_sun_to_pixel`.
-    2. Set ``R = f_s * deg2rad(radius_deg)``.
-    3. Mark ``mask[v, u] = 1`` when ``(u - u_sun)^2 + (v - v_sun)^2 <= R^2``.
+    Projects ``(az_deg, zen_deg)`` via :func:`project_sun_to_pixel`, then builds
+    the mask with :func:`compute_sun_mask_from_centers`. Prefer the center-based
+    API when centers are already stored (e.g. Folsom Zarr ``sun_u`` / ``sun_v``).
 
     Frames with the sun below the horizon (``zen_deg >= 90``) are all-zero.
     Projected sun pixels outside ``[0, W-1] x [0, H-1]`` yield all-zero frames.
-    The lens math (``cx, cy, f, alpha0`` + the calibration's horizontal flip)
-    comes from ``fit`` (see :func:`load_fisheye_fit`); the runtime grid is
-    ``image_size`` square and the fit is scaled from ``fit['native_size']``.
 
     ``mode`` selects the mask family:
 
@@ -370,58 +479,18 @@ def compute_sun_mask(
     * ``gaussian_angular`` — soft angular Gaussian in image-axis ray space
       (``sigma_deg``).
     """
-    mode = str(mode).strip()
-    if mode in _SUN_MASK_GAUSSIAN_MODES:
-        if mode == "gaussian_pixel":
-            if sigma_px is None:
-                sigma_px = DEFAULT_SUN_MASK_SIGMA_PX
-            return compute_sun_mask_gaussian_pixel(
-                az_deg, zen_deg, image_size, fit, sigma_px=float(sigma_px)
-            )
-        if sigma_deg is None:
-            sigma_deg = DEFAULT_SUN_MASK_SIGMA_DEG
-        return compute_sun_mask_gaussian_angular(
-            az_deg, zen_deg, image_size, fit, sigma_deg=float(sigma_deg)
-        )
-    if mode not in _SUN_MASK_HARD_MODES:
-        raise ValueError(
-            f"fisheye_sunmask.compute_sun_mask: unknown mode {mode!r}; "
-            f"expected one of {sorted(_SUN_MASK_HARD_MODES | _SUN_MASK_GAUSSIAN_MODES)}"
-        )
-
     az = np.asarray(az_deg, dtype=np.float64)
     zen = np.asarray(zen_deg, dtype=np.float64)
     _validate_sun_mask_inputs(az, zen, image_size)
-    if not (radius_deg > 0.0):
-        raise ValueError(
-            f"fisheye_sunmask.compute_sun_mask: radius_deg must be > 0 "
-            f"(got {radius_deg})"
-        )
-
-    t = int(az.shape[0])
-    s = int(image_size)
-
-    u_sun, v_sun, above, (_cx_s, _cy_s, f_s) = project_sun_to_pixel(
-        az, zen, s, fit
+    u_sun, v_sun, above, _ = project_sun_to_pixel(az, zen, int(image_size), fit)
+    return compute_sun_mask_from_centers(
+        u_sun,
+        v_sun,
+        above,
+        image_size,
+        fit,
+        mode=mode,
+        radius_deg=radius_deg,
+        sigma_px=sigma_px,
+        sigma_deg=sigma_deg,
     )
-    radius_px = float(f_s) * float(np.deg2rad(radius_deg))
-    radius_px_sq = radius_px * radius_px
-
-    u_grid, v_grid = np.meshgrid(
-        np.arange(s, dtype=np.float64),
-        np.arange(s, dtype=np.float64),
-        indexing="xy",
-    )
-
-    out = np.zeros((t, s, s), dtype=np.float32)
-    for i in range(t):
-        if not bool(above[i]):
-            continue
-        us = float(u_sun[i])
-        vs = float(v_sun[i])
-        if not _sun_pixel_in_image_bounds(us, vs, s, s):
-            continue
-        du = u_grid - us
-        dv = v_grid - vs
-        out[i] = (du * du + dv * dv <= radius_px_sq).astype(np.float32)
-    return out

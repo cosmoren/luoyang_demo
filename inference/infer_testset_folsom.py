@@ -425,11 +425,16 @@ def main() -> None:
             "checkpoint": ckpt_basename,
         })
 
-    # 48h-pooled aggregate (trainer-style): all 192 (or T_out, whichever is smaller)
-    # output steps, masked by ``target_mask``. Predictions at night were already zeroed
-    # above when --mask_night is on (default), mirroring the trainer's evaluate(). We
-    # do NOT re-mask here -- just respect the existing ``preds`` array.
-    h_pooled = min(_LOSS_METRIC_HORIZON, T_out)
+    # Trainer-style pooled aggregate: same horizon as train/eval loss metrics
+    # (``_LOSS_METRIC_HORIZON`` if set, else full ``sampling.pv_output_len`` / T_out).
+    # Masked by ``target_mask``. Predictions at night were already zeroed above when
+    # --mask_night is on (default), mirroring the trainer's evaluate(). We do NOT
+    # re-mask here -- just respect the existing ``preds`` array.
+    h_pooled = (
+        min(int(_LOSS_METRIC_HORIZON), T_out)
+        if _LOSS_METRIC_HORIZON is not None
+        else int(T_out)
+    )
     m_pool = target_mask[:, :h_pooled].astype(np.float64)
     n_valid_pool = int(m_pool.sum())
     if n_valid_pool > 0:
