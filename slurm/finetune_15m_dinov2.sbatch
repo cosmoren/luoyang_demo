@@ -49,8 +49,43 @@ cd "$PROJECT_ROOT"
     --config conf_train.yaml \
     --num_workers "$NUM_WORKERS" \
     --huber-delta 2000 \
-    --checkpoint_dir /shared_work/yuan/workspace/luoyang_demo/checkpoints_15m_dinov2_scratch \
+    --checkpoint_dir /shared_work/yuan/workspace/luoyang_demo/checkpoints_15m_dinov2_scratch1 \
     --model pv_forecasting_model_vit_dinov2
 
+"$YUAN_PY" -u training/train_vit_luoyang2026total.py \
+    --task "$TASK" \
+    --dataset-config "$DATASET_CONF" \
+    --config conf_train.yaml \
+    --num_workers "$NUM_WORKERS" \
+    --huber-delta 2000 \
+    --checkpoint_dir /shared_work/yuan/workspace/luoyang_demo/checkpoints_15m_dinov2_scratch2 \
+    --model pv_forecasting_model_vit_dinov2
+
+"$YUAN_PY" -u training/train_vit_luoyang2026total.py \
+    --task "$TASK" \
+    --dataset-config "$DATASET_CONF" \
+    --config conf_train.yaml \
+    --num_workers "$NUM_WORKERS" \
+    --huber-delta 2000 \
+    --checkpoint_dir /shared_work/yuan/workspace/luoyang_demo/checkpoints_15m_dinov2_scratch3 \
+    --model pv_forecasting_model_vit_dinov2
+
+"$YUAN_PY" -u training/train_vit_luoyang2026total.py \
+    --task "$TASK" \
+    --dataset-config "$DATASET_CONF" \
+    --config conf_train.yaml \
+    --num_workers "$NUM_WORKERS" \
+    --huber-delta 2000 \
+    --checkpoint_dir /shared_work/yuan/workspace/luoyang_demo/checkpoints_15m_dinov2_scratch4 \
+    --model pv_forecasting_model_vit_dinov2
+
+"$YUAN_PY" -u training/train_vit_luoyang2026total.py \
+    --task "$TASK" \
+    --dataset-config "$DATASET_CONF" \
+    --config conf_train.yaml \
+    --num_workers "$NUM_WORKERS" \
+    --huber-delta 2000 \
+    --checkpoint_dir /shared_work/yuan/workspace/luoyang_demo/checkpoints_15m_dinov2_scratch5 \
+    --model pv_forecasting_model_vit_dinov2
 
 echo "=== done $(date) ==="
