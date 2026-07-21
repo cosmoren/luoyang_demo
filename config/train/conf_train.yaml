@@ -1,11 +1,11 @@
 training:
   epochs: 20
-  lr: 5e-4
+  lr: 1e-4
   batch_size: 32
   save_every: 5
   # dataset holds large in-memory caches; each worker forks a full copy,
   # so num_workers > 0 can easily OOM the node. Keep 0 unless memory allows.
-  num_workers: 0
+  num_workers: 2
   # LR warmup epochs. 0 = no warmup (recommended for finetune);
   # use a few epochs (e.g. 3-5) when training from scratch.
   # CLI --warmup-epochs overrides this value.
