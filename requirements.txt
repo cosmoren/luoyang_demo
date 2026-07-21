@@ -1,0 +1,10 @@
+# Core dependencies for luoyang_demo inference simulator (offline/online GUIs)
+numpy
+pandas
+matplotlib
+PyYAML
+
+# Open-Meteo live forecast fetcher (external/openmeteo.py)
+openmeteo-requests
+requests-cache
+retry-requests
