@@ -18,7 +18,7 @@ sampling:
   pv_input_interval_min: 5
   pv_input_len: 576
   pv_output_interval_min: 15
-  pv_output_len: 16
+  pv_output_len: 1
   # chronological split of data for training, validation, and testing
   train_split: 0.66 
   val_split: 0.17

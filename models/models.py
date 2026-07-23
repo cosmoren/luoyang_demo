@@ -592,6 +592,8 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         use_invalid_mask: bool = _DEFAULT_VIT_IMGS_NWP_USE_INVALID_MASK,
         nwp_dropout_prob: float = 0.0,
         nwp_history_dropout_prob: float = 0.0,
+        # Folsom Zarr RGB+image_valid = 4 (knobs off). Trainer must pass dataset.sky_in_channels.
+        sky_in_channels: int = 4,
     ):
         super().__init__()
 
@@ -680,7 +682,10 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         
         self.sky_embed_dim = 64
         self.sky_patch_embed = SkyPatchSpatiotemporalEmbed(
-            embed_dim=self.sky_embed_dim, patch_size=16, image_size=224, in_channels=4
+            embed_dim=self.sky_embed_dim,
+            patch_size=16,
+            image_size=224,
+            in_channels=self.sky_in_channels,
         )
         self.sky_alt_attn = SkyAlternatingIntraInterFrameAttention(
             embed_dim=self.sky_embed_dim, num_heads=8, num_cycles=4, dropout=dropout
@@ -895,14 +900,16 @@ class pv_forecasting_model_vit_imgs(nn.Module):
             sat_compressed = sat_compressed * sat_valid_mask.unsqueeze(2)
             sat_mask = sat_mask * sat_valid_mask
 
-        # sky images encoder
+        # sky images encoder (Branch 2 residual memory)
         if skimg_tensor is None or skimg_tensor.max() == 0:
             sky_compressed = torch.zeros(B, 48, 64, device=pv.device, dtype=pv.dtype) + self.sky_mod_embed
             sky_mask = torch.zeros(B, 48, device=pv.device, dtype=pv.dtype)
         else:
             B_sky, T_sky, C_sky, H_sky, W_sky = skimg_tensor.shape
-            if C_sky < 3:
-                raise ValueError(f"skimg_tensor expected at least 3 channels, got {C_sky}")
+            if C_sky != self.sky_in_channels:
+                raise ValueError(
+                    f"skimg_tensor channels {C_sky} != model sky_in_channels {self.sky_in_channels}"
+                )
             skimg_timefeats = skimg_timefeats[:, :, [2, 3, 8]]
             if H_sky != 224 or W_sky != 224:
                 sky_hr = nn.functional.interpolate(
@@ -945,7 +952,6 @@ class pv_forecasting_model_vit_imgs(nn.Module):
             sky_compressed = sky_compressed * skimg_valid_mask.unsqueeze(2)
             sky_mask = sky_mask * skimg_valid_mask
 
-        # tabm_mask = torch.ones(B, tabm_summary_token.shape[1], device=pv.device, dtype=pv.dtype)
         hist_mem_compressed = torch.cat(
             [sat_compressed, sky_compressed], dim=1
         )
@@ -964,12 +970,12 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         # Inverter features (embeddings)
         inverter_features = self.inverter_embedding(device_id).unsqueeze(1).repeat(1, forecast_pv_features.shape[1], 1)
 
-        # Fuse and predict
+        # Fuse and predict: Branch1 TabM + Branch2 sky residual
         fused = torch.cat([forecast_pv_features, inverter_features], dim=2)
         pv_feats = self.pv_feats_head(fused)
         delta_kt = self.fc(pv_feats) * row_has_valid.unsqueeze(2)  # [B,1,1]
 
-        kt = kt_tabm.unsqueeze(1) + delta_kt # [B,1,1]
+        kt = kt_tabm.unsqueeze(1) + delta_kt  # [B,1,1]
 
         return kt.squeeze(-1)
 

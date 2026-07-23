@@ -1155,11 +1155,22 @@ def main() -> None:
     nwp_features_str = _format_nwp_features_for_log(nwp_features, nwp_use_invalid_mask)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # ``sky_in_channels`` is the dataset-side source of truth for sky-branch input
-    # width (rgb=3, +ray_map=+3, +sun_mask=+1, +sky_mask=+1, plus the always-on
-    # Zarr image_valid=+1). Optional channels are configured via ``--ray-map`` /
-    # ``--sun-mask`` / ``--sky-mask`` or matching ``sampling.*`` YAML keys.
-    sky_in_channels = int(getattr(train_dataset, "sky_in_channels", 3))
+    # Dataset is the source of truth for sky width (Zarr: RGB + image_valid = 4 with
+    # knobs off). Do not silently fall back to 3 — that desyncs SkyPatch embed.
+    if not hasattr(train_dataset, "sky_in_channels"):
+        raise AttributeError(
+            "Folsom dataset missing sky_in_channels; cannot construct vit_imgs sky embed"
+        )
+    sky_in_channels = int(train_dataset.sky_in_channels)
+    if sky_in_channels != 4:
+        raise ValueError(
+            f"expected sky_in_channels==4 (RGB + image_valid, knobs off), "
+            f"got {sky_in_channels} from channels={getattr(train_dataset, 'sky_channels', None)!r}"
+        )
+    print(
+        f"sky_in_channels={sky_in_channels} "
+        f"sky_channels={getattr(train_dataset, 'sky_channels', None)!r}"
+    )
     model = pv_forecasting_model_vit_imgs(
         dev_dn_list=dev_dn_list,
         nwp_features=nwp_features,

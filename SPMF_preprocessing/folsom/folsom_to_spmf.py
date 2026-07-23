@@ -66,8 +66,8 @@ NWP_ROUND_CLOUD_COVER_AND_REL_HUMIDITY = True
 RENAME_JPG_DATE_TIME_DIR = Path("/home/kyber/projects/digital_energy/folsom_ds/processed/sky")
 
 # --- Task: augment_irradiance_csv (add p_cs/kt/kt_mask/p_mean to irradiance CSV) ----
-IRR_INPUT_CSV = Path("/work/folsom_dataset/irradiance/Folsom_irradiance.csv")
-IRR_OUTPUT_CSV = Path("/work/folsom_dataset/irradiance/Folsom_irradiance_with_kt.csv")
+IRR_INPUT_CSV = Path("/home/kyber/projects/digital_energy/folsom_ds/processed/full/irradiance/Folsom_irradiance.csv")
+IRR_OUTPUT_CSV = Path("/home/kyber/projects/digital_energy/folsom_ds/processed2/irradiance/Folsom_irradiance_with_kt.csv")
 IRR_TIME_COL = "timeStamp"
 IRR_GHI_COL = "ghi"
 IRR_DNI_COL = "dni"
