@@ -4,7 +4,7 @@ set -euo pipefail
 # =============================================================================
 # 1) Knobs
 # =============================================================================
-RUN_ROOT="runs/folsom_channel_ablation"
+RUN_ROOT="/home/kyber/projects/digital_energy/experiment_files/runs/2026-07-23_fol-tabm"
 REPEAT=2
 SEED_START=1
 GPUS=(0 1)
@@ -23,13 +23,13 @@ BASE_CMD=(python training/train_vit_test_folsom.py)
 #    Queue order: seed-outer (all exps @ SEED_START, then next seed, ...)
 # =============================================================================
 EXPERIMENTS=(
-  "baseline|--zero-sky --no-ray-map --sun-mask none --sky-mask none"
+  "ghi|--zero-sky --no-ray-map --sun-mask none --sky-mask none"
   "sky_rgb|--no-ray-map --sun-mask none --sky-mask none"
-  "ray_map|--ray-map --sun-mask none --sky-mask none"
-  "valid_disk|--no-ray-map --sun-mask none --sky-mask valid_disc"
-  "manual_tight|--no-ray-map --sun-mask none --sky-mask tight"
-  "sun_halo|--no-ray-map --sun-mask sun_halo --sky-mask none"
-  "gaussian_angular|--no-ray-map --sun-mask gaussian_angular --sky-mask none"
+  # "ray_map|--ray-map --sun-mask none --sky-mask none"
+  # "valid_disk|--no-ray-map --sun-mask none --sky-mask valid_disc"
+  # "manual_tight|--no-ray-map --sun-mask none --sky-mask tight"
+  # "sun_halo|--no-ray-map --sun-mask sun_halo --sky-mask none"
+  # "gaussian_angular|--no-ray-map --sun-mask gaussian_angular --sky-mask none"
 )
 
 # =============================================================================
