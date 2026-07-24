@@ -4,9 +4,9 @@ set -euo pipefail
 # =============================================================================
 # 1) Knobs
 # =============================================================================
-RUN_ROOT="/home/kyber/projects/digital_energy/experiment_files/runs/2026-07-23_fol-tabm"
+RUN_ROOT="/home/kyber/projects/digital_energy/experiment_files/runs/2026-07-22_folsom-mix-1case"
 REPEAT=2
-SEED_START=1
+SEED_START=3
 GPUS=(0 1)
 FREE_MEM_MIB=2048
 POLL_SEC=30
@@ -23,13 +23,14 @@ BASE_CMD=(python training/train_vit_test_folsom.py)
 #    Queue order: seed-outer (all exps @ SEED_START, then next seed, ...)
 # =============================================================================
 EXPERIMENTS=(
-  "ghi|--zero-sky --no-ray-map --sun-mask none --sky-mask none"
-  "sky_rgb|--no-ray-map --sun-mask none --sky-mask none"
+  # "ghi_only|--zero-sky --no-ray-map --sun-mask none --sky-mask none"
+  # "sky_rgb|--no-ray-map --sun-mask none --sky-mask none"
   # "ray_map|--ray-map --sun-mask none --sky-mask none"
   # "valid_disk|--no-ray-map --sun-mask none --sky-mask valid_disc"
   # "manual_tight|--no-ray-map --sun-mask none --sky-mask tight"
-  # "sun_halo|--no-ray-map --sun-mask sun_halo --sky-mask none"
-  # "gaussian_angular|--no-ray-map --sun-mask gaussian_angular --sky-mask none"
+  # "sun_mask|--no-ray-map --sun-mask sun_only --sky-mask none"
+  # "gaussian_pixel|--no-ray-map --sun-mask gaussian_pixel --sky-mask none"
+  "tight-gaussian|--no-ray-map --sun-mask gaussian_pixel --sky-mask tight"
 )
 
 # =============================================================================
@@ -162,6 +163,11 @@ for pid in "${JOB_PIDS[@]}"; do
   fi
 done
 echo "[done]"
+
+echo "[results] generating ${RUN_ROOT}/results.png ..."
+if ! python scripts/exp_results.py "${RUN_ROOT}"; then
+  echo "[warn] results PNG generation failed for ${RUN_ROOT}/results.png (continuing)" >&2
+fi
 
 _used_sh="${RUN_ROOT}/local_run_used.sh"
 if [[ -e "${_used_sh}" ]]; then
