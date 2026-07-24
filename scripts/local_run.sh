@@ -164,9 +164,21 @@ for pid in "${JOB_PIDS[@]}"; do
 done
 echo "[done]"
 
-echo "[results] generating ${RUN_ROOT}/results.png ..."
-if ! python scripts/exp_results.py "${RUN_ROOT}"; then
-  echo "[warn] results PNG generation failed for ${RUN_ROOT}/results.png (continuing)" >&2
+_seed_tag=""
+for ((i = 0; i < REPEAT; i++)); do
+  _seed_tag+="$((SEED_START + i))"
+done
+_results_png="${RUN_ROOT}/results_s${_seed_tag}.png"
+if [[ -e "${_results_png}" ]]; then
+  _n=2
+  while [[ -e "${RUN_ROOT}/results_s${_seed_tag}_${_n}.png" ]]; do
+    _n=$((_n + 1))
+  done
+  _results_png="${RUN_ROOT}/results_s${_seed_tag}_${_n}.png"
+fi
+echo "[results] generating ${_results_png} ..."
+if ! python scripts/exp_results.py "${RUN_ROOT}" --out "${_results_png}"; then
+  echo "[warn] results PNG generation failed for ${_results_png} (continuing)" >&2
 fi
 
 _used_sh="${RUN_ROOT}/local_run_used.sh"
