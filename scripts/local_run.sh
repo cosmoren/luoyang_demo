@@ -6,6 +6,7 @@ set -euo pipefail
 # =============================================================================
 RUN_ROOT="runs/folsom_channel_ablation"
 REPEAT=2
+SEED_START=1
 GPUS=(0 1)
 FREE_MEM_MIB=2048
 POLL_SEC=30
@@ -19,7 +20,7 @@ BASE_CMD=(python training/train_vit_test_folsom.py)
 
 # =============================================================================
 # 2) Experiments — edit name|flags (one per line)
-#    Queue order: seed-outer (all exps @ seed 1, then seed 2, ...)
+#    Queue order: seed-outer (all exps @ SEED_START, then next seed, ...)
 # =============================================================================
 EXPERIMENTS=(
   "baseline|--zero-sky --no-ray-map --sun-mask none --sky-mask none"
@@ -124,7 +125,8 @@ _wait_for_free_gpu() {
 _conda_activate
 
 JOB_PIDS=()
-for ((seed = 1; seed <= REPEAT; seed++)); do
+for ((i = 0; i < REPEAT; i++)); do
+  seed=$((SEED_START + i))
   for entry in "${EXPERIMENTS[@]}"; do
     name="${entry%%|*}"
     flags="${entry#*|}"
@@ -160,4 +162,16 @@ for pid in "${JOB_PIDS[@]}"; do
   fi
 done
 echo "[done]"
+
+_used_sh="${RUN_ROOT}/local_run_used.sh"
+if [[ -e "${_used_sh}" ]]; then
+  _n=2
+  while [[ -e "${RUN_ROOT}/local_run_used_${_n}.sh" ]]; do
+    _n=$((_n + 1))
+  done
+  _used_sh="${RUN_ROOT}/local_run_used_${_n}.sh"
+fi
+echo "[snapshot] copying launcher -> ${_used_sh}"
+cp "${BASH_SOURCE[0]}" "${_used_sh}"
+
 exit "${fail}"
