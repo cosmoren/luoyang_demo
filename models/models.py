@@ -1124,11 +1124,10 @@ class pv_forecasting_model_vit_dinov2(nn.Module):
         self.fc = FC(in_dim=64, out_dim=1)
         # TabM base prediction: same I/O as ``pv_forecasting_model_vit_simvp``
         # (flatten pv + pv_ramp over 576 steps → 1152 features).
-        # ``d_out`` matches ``nwp_future_steps`` (16 × 15 min ≈ 4 h).
         self.pv_tabm_head = TabM(
             n_num_features=1152,
             cat_cardinalities=None,
-            d_out=self.nwp_future_steps,
+            d_out=1,
             n_blocks=3,
             d_block=512,
             dropout=dropout,
@@ -1234,8 +1233,10 @@ class pv_forecasting_model_vit_dinov2(nn.Module):
         x_num = pv_hist_flat
 
         self.pv_tabm_preoutput_features = None
-        tabm_out = self.pv_tabm_head(x_num=x_num, x_cat=None)  # [B, K, T_out]
-        kt_tabm = tabm_out.mean(dim=1)  # [B, T_out] with T_out = nwp_future_steps
+        tabm_out = self.pv_tabm_head(x_num=x_num, x_cat=None)  # [B, K, 1]
+        kt_tabm = tabm_out.mean(dim=1)  # [B, 1]
+
+        # return kt_tabm  # [B, 1] — keep dim so pv_pred = kt * target_p_cs * p_mean is [B, 1]
 
         # Forecast queries: Luoyang total variant only uses two NWP channels:
         # ssrd (idx=0) and t2m (idx=2), where nwp_tensor layout is
@@ -1386,30 +1387,19 @@ class pv_forecasting_model_vit_dinov2(nn.Module):
         safe_mask = torch.where(
             row_has_valid.bool(), key_value_mask, torch.ones_like(key_value_mask)
         )
-        # Multi-step query over full forecast horizon [B, T_out, 64].
-        forecast_pv_features = self.cross_attention_pv(
-            query=forecast_query,
-            key=hist_mem_compressed,
-            value=hist_mem_compressed,
-            key_value_mask=safe_mask,
-        )
+        forecast_pv_features = self.cross_attention_pv(query=forecast_query[:,-1:,:], key=hist_mem_compressed, value=hist_mem_compressed, key_value_mask=safe_mask)
 
         # Inverter features (embeddings)
         inverter_features = self.inverter_embedding(device_id).unsqueeze(1).repeat(1, forecast_pv_features.shape[1], 1)
 
-        # Fuse and predict: Branch1 TabM + Branch2 sky residual → [B, T_out]
+        # Fuse and predict
         fused = torch.cat([forecast_pv_features, inverter_features], dim=2)
         pv_feats = self.pv_feats_head(fused)
-        delta_kt = self.fc(pv_feats) * row_has_valid.unsqueeze(2)  # [B, T_out, 1]
-        delta_kt = delta_kt.squeeze(-1)  # [B, T_out]
-        if kt_tabm.shape != delta_kt.shape:
-            raise ValueError(
-                f"kt_tabm shape {tuple(kt_tabm.shape)} != delta_kt shape {tuple(delta_kt.shape)} "
-                f"(expected both [B, {self.nwp_future_steps}])"
-            )
-        kt = kt_tabm + delta_kt  # [B, T_out]
+        delta_kt = self.fc(pv_feats) * row_has_valid.unsqueeze(2)  # [B,1,1]
 
-        return kt
+        kt = kt_tabm.unsqueeze(1) + delta_kt # [B,1,1]
+
+        return kt.squeeze(-1)
 
 
 class pv_forecasting_model_vit_pvb(nn.Module):

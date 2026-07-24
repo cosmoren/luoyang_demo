@@ -2,17 +2,18 @@
 Folsom trainer for ``pv_forecasting_model_vit_dinov2`` (parallel to ``train_vit_test_folsom.py``).
 
 PV/GHI + sky by default: satellite off, NWP zeroed (``--use-nwp`` / ``--use-satellite`` opt-in).
-Model predicts the full Folsom horizon (``T_out = sampling.pv_output_len``, typically 16 × 15 min).
+The DINOv2 head currently predicts a single horizon (``T_out=1``); Folsom targets may be longer
+(e.g. 16). Train/eval slice targets/masks to the model output length (first-horizon loss only).
 
 Uses ``dataloader.folsom.FolsomIrradianceDataset`` + ``collate_batched``. Configs:
 ``config/train/conf_train.yaml``, ``config/datasets/conf_folsom.yaml``.
 
 Local smoke (1 logical GPU, tiny run):
 
-  python training/train_vit_test_folsom_dinov2.py --epochs 1 --train_max_batches_per_epoch 3 \\
+  python training/train_vit_test_folsom_dinov2.py --epochs 1 --train_max_batches_per_epoch 3 \
     --eval_max_batches 2 --num_workers 0 --batch_size 1
 
-  # Optional: real NWP / zero sky for ablation:
+  # Optional: real NWP (still first-horizon loss) / zero sky for ablation:
   python training/train_vit_test_folsom_dinov2.py --use-nwp --zero-sky
 """
 from __future__ import annotations
@@ -67,7 +68,8 @@ _VIT_IMGS_NWP_TEMPERATURE_SLOT = 2
 # Optional override for train/eval loss+metrics horizon (first N forecast steps).
 # ``None`` = use ``sampling.pv_output_len`` from the dataset config (default). Set an int
 # to score loss on fewer steps while keeping full model ``T_out``.
-_LOSS_METRIC_HORIZON: int | None = None
+# DINOv2 head is single-step; default loss/metrics to first forecast horizon only.
+_LOSS_METRIC_HORIZON: int | None = 1
 # Special token in ``--nwp-features`` that toggles the per-step invalid-mask channel
 # (``nwp_tensor[:, :, -1]``); not a real NWP feature so kept out of the features list.
 _NWP_INVALID_MASK_TOKEN = "invalid_mask"
@@ -363,9 +365,12 @@ def train_one_epoch(
         B = d["device_id"].size(0)
         optimizer.zero_grad()
         kt_pred = forward_vit(model, d) * _FOLSOM_KT_INPUT_SCALE
-        pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
-        t_out = int(pv_pred.shape[1])
-        assert d["target_pv"].shape[1] == t_out, (pv_pred.shape, d["target_pv"].shape)
+        t_out = int(kt_pred.shape[1])
+        target_len = int(d["target_pv"].shape[1])
+        # DINOv2 is single-horizon (T_out=1) while Folsom targets may be longer (e.g. 16).
+        assert target_len >= t_out, (kt_pred.shape, d["target_pv"].shape)
+        pcs = d["target_p_cs"][:, :t_out]
+        pv_pred = kt_pred * pcs * d["p_mean"].unsqueeze(1)
         h = min(int(loss_metric_horizon), t_out)
         m = d["target_mask"][:, :h]
         loss = criterion(
@@ -396,8 +401,8 @@ def evaluate(
     MAE in **normalized** GHI space over the same slice (``target_mask``; predictions at night
     cos-zenith < 0 are zeroed before residuals, matching ``train_vit_test.py``).
 
-    ``loss_metric_horizon`` defaults to ``sampling.pv_output_len`` (dataset ``T_out``, typically 16);
-    may be lowered independently (see ``_LOSS_METRIC_HORIZON`` / main assignment).
+    ``loss_metric_horizon`` defaults to 1 for this DINOv2 entrypoint (model ``T_out=1``);
+    targets longer than the prediction are sliced to the first ``t_out`` steps.
 
     If ``max_batches`` is set, only the first N batches are used (smoke / faster dev runs; metrics
     are not a full pass over the split).
@@ -417,9 +422,11 @@ def evaluate(
             _prepare_nwp_for_vit(d, use_nwp=use_nwp)
             _prepare_sky_for_vit(d, zero_sky=zero_sky)
             kt_pred = forward_vit(model, d) * _FOLSOM_KT_INPUT_SCALE
-            pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
-            t_out = int(pv_pred.shape[1])
-            assert d["target_pv"].shape[1] == t_out, (pv_pred.shape, d["target_pv"].shape)
+            t_out = int(kt_pred.shape[1])
+            target_len = int(d["target_pv"].shape[1])
+            assert target_len >= t_out, (kt_pred.shape, d["target_pv"].shape)
+            pcs = d["target_p_cs"][:, :t_out]
+            pv_pred = kt_pred * pcs * d["p_mean"].unsqueeze(1)
             h = min(horizon, t_out)
             m = d["target_mask"][:, :h]
             tgt = d["target_pv"][:, :h]
@@ -1226,12 +1233,12 @@ def main() -> None:
     eval_cap = args.eval_max_batches
     use_nwp = bool(args.use_nwp)
     zero_sky = bool(args.zero_sky)
-    # Default: match config sampling.pv_output_len (typically 16); can lower for loss-only while
-    # keeping full T_out (edit here, or set module-level ``_LOSS_METRIC_HORIZON``).
+    # DINOv2 predicts one step; default loss horizon is 1 (see ``_LOSS_METRIC_HORIZON``).
+    # Predictions are always sliced against the first ``model T_out`` target steps.
     loss_metric_horizon = (
         int(_LOSS_METRIC_HORIZON)
         if _LOSS_METRIC_HORIZON is not None
-        else int(train_dataset.pv_output_len)
+        else 1
     )
     initial_test_loss, _, _ = evaluate(
         model,
