@@ -705,12 +705,11 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         self.cross_attention_pv = CrossAttention(query_dim=64, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
         self.pv_feats_head = MLP(in_dim=80, hidden_dims=(128, 64), out_dim=64, dropout=0.0)  # PV 64 + sat 64 + inverter 16
         self.fc = FC(in_dim=64, out_dim=1)
-        # TabM Branch 1: flatten PV history (+ padded NWP future) → multi-step kt [B, T_out].
-        # ``d_out`` matches ``nwp_future_steps`` (16 × 15 min ≈ 4 h).
+        # TabM Branch 1: flatten PV history (+ padded NWP future) → single-step kt [B, 1].
         self.pv_tabm_head = TabM(
             n_num_features=2336,
             cat_cardinalities=None,
-            d_out=self.nwp_future_steps,
+            d_out=1,
             n_blocks=3,
             d_block=512,
             dropout=dropout,
@@ -813,8 +812,8 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         x_num = torch.cat([pv_hist_flat, nwp_tensor_flat], dim=1)
 
         self.pv_tabm_preoutput_features = None
-        tabm_out = self.pv_tabm_head(x_num=x_num, x_cat=None)  # [B, K, T_out]
-        kt_tabm = tabm_out.mean(dim=1)  # [B, T_out] with T_out = nwp_future_steps
+        tabm_out = self.pv_tabm_head(x_num=x_num, x_cat=None)  # [B, K, 1]
+        kt_tabm = tabm_out.mean(dim=1)  # [B, 1]
 
         # Forecast queries: Luoyang total variant only uses two NWP channels:
         # ssrd (idx=0) and t2m (idx=2), where nwp_tensor layout is
@@ -963,9 +962,9 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         safe_mask = torch.where(
             row_has_valid.bool(), key_value_mask, torch.ones_like(key_value_mask)
         )
-        # Branch 2: multi-step query over full forecast horizon [B, T_out, 64].
+        # Branch 2: single-horizon residual via last forecast query step.
         forecast_pv_features = self.cross_attention_pv(
-            query=forecast_query,
+            query=forecast_query[:, -1:, :],
             key=hist_mem_compressed,
             value=hist_mem_compressed,
             key_value_mask=safe_mask,
@@ -974,19 +973,14 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         # Inverter features (embeddings)
         inverter_features = self.inverter_embedding(device_id).unsqueeze(1).repeat(1, forecast_pv_features.shape[1], 1)
 
-        # Fuse and predict: Branch1 TabM + Branch2 sky residual → [B, T_out]
+        # Fuse and predict: Branch1 TabM + Branch2 sky residual → [B, 1]
         fused = torch.cat([forecast_pv_features, inverter_features], dim=2)
         pv_feats = self.pv_feats_head(fused)
-        delta_kt = self.fc(pv_feats) * row_has_valid.unsqueeze(2)  # [B, T_out, 1]
-        delta_kt = delta_kt.squeeze(-1)  # [B, T_out]
-        if kt_tabm.shape != delta_kt.shape:
-            raise ValueError(
-                f"kt_tabm shape {tuple(kt_tabm.shape)} != delta_kt shape {tuple(delta_kt.shape)} "
-                f"(expected both [B, {self.nwp_future_steps}])"
-            )
-        kt = kt_tabm + delta_kt  # [B, T_out]
+        delta_kt = self.fc(pv_feats) * row_has_valid.unsqueeze(2)  # [B,1,1]
 
-        return kt
+        kt = kt_tabm.unsqueeze(1) + delta_kt  # [B,1,1]
+
+        return kt.squeeze(-1)
 
 
 # Using PV history and NWP to forecast PV, solar features and NWP features are used as query
