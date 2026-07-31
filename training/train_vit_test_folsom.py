@@ -6,22 +6,26 @@ Uses ``dataloader.folsom.FolsomIrradianceDataset`` (zarr/JPEG skies, merged NWP,
 ``paths.sky_format`` is set explicitly in the dataset YAML.
 
 Compared to ``training/train_vit_test.py`` (Luoyang), this file adds Folsom semantics (NWP
-zero-vs-raw via ``--use-nwp``, ``--eval_max_batches``, GHI-scale metrics, optional ``--zero-sky``)
-while keeping TensorBoard logging and optional EMA (same pattern as ``train_vit_test.py``). The
-4-modality satellite branch (formerly the ``train_vit_test_folsom_2.py`` sidecar) is unified in:
-feeding ``sat_tensor`` to the model is toggled by ``sampling.use_satellite`` in the dataset YAML
-and the ``--use-satellite`` / ``--no-use-satellite`` CLI overrides (default off; CLI > YAML > False).
+Folsom→Luoyang channel remap via ``--use-nwp`` / ``--no-use-nwp``, ``--eval_max_batches``,
+GHI-scale metrics, optional ``--zero-sky``) while keeping TensorBoard logging and optional EMA
+(same pattern as ``train_vit_test.py``). The 4-modality satellite branch (formerly the
+``train_vit_test_folsom_2.py`` sidecar) is unified in: feeding ``sat_tensor`` to the model is
+toggled by ``sampling.use_satellite`` in the dataset YAML and the ``--use-satellite`` /
+``--no-use-satellite`` CLI overrides (default off; CLI > YAML > False).
 
 Local smoke (1 logical GPU, tiny run):
 
   python training/train_vit_test_folsom.py --epochs 1 --train_max_batches_per_epoch 3 \\
     --eval_max_batches 20 --num_workers 0 --batch_size 1
 
-  # Manager-style PV+NWP (real NWP, sky tensors zeroed after load; dataloader still reads Zarr):
-  python training/train_vit_test_folsom.py --use-nwp --zero-sky  # add your usual epoch/batch flags
+  # Manager-style PV+NWP (NWP remapped on by default; sky tensors zeroed after load):
+  python training/train_vit_test_folsom.py --zero-sky  # add your usual epoch/batch flags
 
   # 4-modality run (PV + sky + NWP + GOES-15 sat); overrides the dataset YAML's use_satellite key:
-  python training/train_vit_test_folsom.py --use-satellite --use-nwp  # add your usual epoch/batch flags
+  python training/train_vit_test_folsom.py --use-satellite  # add your usual epoch/batch flags
+
+  # NWP ablation (zero nwp_tensor; same as Luoyang-off baseline):
+  python training/train_vit_test_folsom.py --no-use-nwp
 
 Training hyperparameters: ``config/train/conf_train.yaml`` (``--config``). Dataset paths:
 ``config/datasets/conf_folsom.yaml`` (``--dataset-config``).
@@ -67,6 +71,7 @@ from dataloader.folsom import (  # noqa: E402
     _DEFAULT_FOLSOM_TRAIN_EPOCH_LEN,
     _FOLSOM_HUBER_DELTA,
     _FOLSOM_KT_INPUT_SCALE,
+    _FOLSOM_NWP_FEATURE_COLS,
     FolsomIrradianceDataset,
     normalize_ray_map,
     normalize_sky_mask,
@@ -77,10 +82,45 @@ from dataloader.folsom import (  # noqa: E402
 from dataloader.luoyang_zarr import collate_batched  # noqa: E402
 from models.models import pv_forecasting_model_vit_imgs  # noqa: E402
 
+# Folsom merged-NWP feature indices (``_interpolate_nwp`` order; mask is the trailing channel).
+_FOLSOM_NWP_DWSW_INDEX = _FOLSOM_NWP_FEATURE_COLS.index("dwsw")
+_FOLSOM_NWP_PRESSURE_INDEX = _FOLSOM_NWP_FEATURE_COLS.index("pressure")
+_FOLSOM_NWP_TEMPERATURE_INDEX = _FOLSOM_NWP_FEATURE_COLS.index("temperature")
+_FOLSOM_NWP_WIND_U_INDEX = _FOLSOM_NWP_FEATURE_COLS.index("wind-u")
+# Luoyang-style slots hardcoded by ``pv_forecasting_model_vit_imgs`` forward:
+# ``[ssrd, msl, t2m, u10, ...]`` (+ trailing invalid mask).
+_VIT_IMGS_NWP_SSRD_SLOT = 0
+_VIT_IMGS_NWP_MSL_SLOT = 1
+_VIT_IMGS_NWP_T2M_SLOT = 2
+_VIT_IMGS_NWP_U10_SLOT = 3
 # Optional override for train/eval loss+metrics horizon (first N forecast steps).
 # ``None`` = use ``sampling.pv_output_len`` from the dataset config (default). Set an int
 # to score loss on fewer steps while keeping full model ``T_out``.
 _LOSS_METRIC_HORIZON: int | None = None
+
+
+def remap_nwp_tensor_for_pv_vit_imgs(nwp_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Copy Folsom merged-NWP columns into the Luoyang slot layout ``vit_imgs`` hardcodes.
+
+    Folsom ``_interpolate_nwp`` stacks ``_FOLSOM_NWP_FEATURE_COLS`` then appends an invalid
+    mask. The model reads Luoyang slots ``0=ssrd``, ``1=msl``, ``2=t2m``, ``3=u10`` and applies
+    its own Luoyang scaling — this helper only reorders/copies values (no pressure rescale;
+    unused Folsom feature cols and the trailing mask stay as-is).
+    """
+    if nwp_tensor.ndim != 3:
+        raise ValueError(f"nwp_tensor expected [B, T, C], got shape {tuple(nwp_tensor.shape)}")
+    n_feat = len(_FOLSOM_NWP_FEATURE_COLS)
+    if nwp_tensor.shape[-1] != n_feat + 1:
+        raise ValueError(
+            f"nwp_tensor last dim expected {n_feat + 1} (features + mask), got {nwp_tensor.shape[-1]}"
+        )
+    out = nwp_tensor.clone()
+    out[:, :, _VIT_IMGS_NWP_SSRD_SLOT] = nwp_tensor[:, :, _FOLSOM_NWP_DWSW_INDEX]
+    out[:, :, _VIT_IMGS_NWP_MSL_SLOT] = nwp_tensor[:, :, _FOLSOM_NWP_PRESSURE_INDEX]
+    out[:, :, _VIT_IMGS_NWP_T2M_SLOT] = nwp_tensor[:, :, _FOLSOM_NWP_TEMPERATURE_INDEX]
+    out[:, :, _VIT_IMGS_NWP_U10_SLOT] = nwp_tensor[:, :, _FOLSOM_NWP_WIND_U_INDEX]
+    return out
 
 
 def _gpu_id_for_checkpoint() -> int:
@@ -125,7 +165,8 @@ def _prepare_nwp_for_vit(d: dict, *, use_nwp: bool) -> dict:
     """
     Prepare ``d['nwp_tensor']`` for the ViT, in place.
 
-      * ``use_nwp=True``  -> leave the raw Folsom merged-NWP tensor unchanged.
+      * ``use_nwp=True``  -> remap Folsom feature order into Luoyang slots for ``vit_imgs``,
+        then pass through (model scaling unchanged).
       * ``use_nwp=False`` -> overwrite with ``zeros_like`` (NWP-ablation baseline).
 
     Keep original shape/dtype/device; ``None`` would crash the forward pass.
@@ -135,6 +176,8 @@ def _prepare_nwp_for_vit(d: dict, *, use_nwp: bool) -> dict:
         return d
     if not use_nwp:
         d["nwp_tensor"] = torch.zeros_like(nwp)
+    else:
+        d["nwp_tensor"] = remap_nwp_tensor_for_pv_vit_imgs(nwp)
     return d
 
 
@@ -230,7 +273,7 @@ def train_one_epoch(
     ema: ModelEMA | None = None,
     *,
     loss_metric_horizon: int,
-    use_nwp: bool = False,
+    use_nwp: bool = True,
     zero_sky: bool = False,
 ) -> float:
     model.train()
@@ -272,7 +315,7 @@ def evaluate(
     *,
     loss_metric_horizon: int,
     max_batches: int | None = None,
-    use_nwp: bool = False,
+    use_nwp: bool = True,
     zero_sky: bool = False,
 ) -> tuple[float, float, float]:
     """Returns mean Huber loss (first ``loss_metric_horizon`` steps, masked like train), RMSE and
@@ -492,10 +535,12 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--use-nwp",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
-            "Feed the raw Folsom merged-NWP tensor to the ViT. Default is OFF: the NWP "
-            "tensor is replaced with zeros (blacked-out baseline)."
+            "Feed remapped Folsom merged-NWP (Folsom columns → Luoyang vit_imgs slots) to the "
+            "model. Default ON (like Luoyang always feeding NWP). Pass --no-use-nwp to zero "
+            "nwp_tensor for an NWP-ablation baseline."
         ),
     )
     parser.add_argument(
@@ -504,7 +549,7 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
         help=(
             "After each batch is on device, replace sky image tensors (and sky time features) with "
             "zeros so the ViT uses the empty-sky branch while the dataset still loads real Zarr/JPEG. "
-            "Use with --use-nwp for PV+NWP vs PV+NWP+sky comparisons."
+            "Use for PV+NWP vs PV+NWP+sky comparisons (NWP is on by default)."
         ),
     )
     parser.add_argument(
