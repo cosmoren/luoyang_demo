@@ -988,7 +988,9 @@ class pv_forecasting_model_vit_dinov2(nn.Module):
     """
     Like ``pv_forecasting_model_vit_imgs``, but sky patch features come from
     DINOv2 (``SkyDINOv2PatchSpatiotemporalEmbed``) instead of a learned Conv
-    patch embedder. Satellite branch is unchanged.
+    patch embedder. An optional Folsom sun-mask channel is patch-embedded in
+    parallel and fused into the DINOv2 tokens before sky attention/compression.
+    Satellite branch is unchanged.
     """
 
     def __init__(
@@ -1003,11 +1005,21 @@ class pv_forecasting_model_vit_dinov2(nn.Module):
         dinov2_model_name: str = "dinov2_vits14",
         dinov2_freeze: bool = True,
         dinov2_pretrained: bool = True,
+        sky_in_channels: int = 4,
+        use_sun_mask: bool = False,
     ):
         super().__init__()
 
         self.use_batchnorm = use_batchnorm
         self.dropout = dropout
+        self.sky_in_channels = int(sky_in_channels)
+        self.use_sun_mask = bool(use_sun_mask)
+        expected_sky_channels = 5 if self.use_sun_mask else 4
+        if self.sky_in_channels != expected_sky_channels:
+            raise ValueError(
+                f"vit_dinov2 expected sky_in_channels={expected_sky_channels} when "
+                f"use_sun_mask={self.use_sun_mask}, got {self.sky_in_channels}"
+            )
 
         if nwp_features is None:
             nwp_features = list(_DEFAULT_VIT_IMGS_NWP_FEATURES)
@@ -1098,6 +1110,15 @@ class pv_forecasting_model_vit_dinov2(nn.Module):
             pretrained=dinov2_pretrained,
             in_channels=4,
         )
+        # Folsom gaussian sun_mask is a feature, separate from the DINOv2 RGB
+        # image_valid gate. ViT-S/14 alignment gives 16×16 = 256 sun tokens.
+        self.sky_sun_patch_embed = nn.Conv2d(
+            1,
+            self.sky_embed_dim,
+            kernel_size=self.sky_patch_embed.patch_size,
+            stride=self.sky_patch_embed.patch_size,
+        )
+        self.sky_sun_alpha = nn.Parameter(torch.tensor(0.0))
         self.sky_alt_attn = SkyAlternatingIntraInterFrameAttention(
             embed_dim=self.sky_embed_dim, num_heads=8, num_cycles=4, dropout=dropout
         )
@@ -1320,8 +1341,11 @@ class pv_forecasting_model_vit_dinov2(nn.Module):
             sky_mask = torch.zeros(B, 48, device=pv.device, dtype=pv.dtype)
         else:
             B_sky, T_sky, C_sky, H_sky, W_sky = skimg_tensor.shape
-            if C_sky < 3:
-                raise ValueError(f"skimg_tensor expected at least 3 channels, got {C_sky}")
+            if C_sky != self.sky_in_channels:
+                raise ValueError(
+                    f"skimg_tensor channels {C_sky} != model sky_in_channels "
+                    f"{self.sky_in_channels}"
+                )
             n_sky = min(self.sky_num_frames, T_sky)
             skimg_tensor = skimg_tensor[:, -n_sky:]
             skimg_timefeats = skimg_timefeats[:, -n_sky:, [2, 3, 8]]
@@ -1335,11 +1359,35 @@ class pv_forecasting_model_vit_dinov2(nn.Module):
             else:
                 sky_hr = skimg_tensor
 
+            if self.use_sun_mask:
+                # Folsom Zarr C=5 order is RGB, sun_mask, image_valid. Keep
+                # image_valid as DINOv2's fourth-channel RGB gate; sun is only
+                # consumed by the parallel Conv2d feature path.
+                sky_dinov2 = torch.cat([sky_hr[:, :, :3], sky_hr[:, :, -1:]], dim=2)
+                sun_hr = sky_hr[:, :, 3:4]
+            else:
+                sky_dinov2 = sky_hr
+                sun_hr = None
+
             sky_patch_tokens = patchify_spatiotemporal_sky_images(
-                sky_hr,
+                sky_dinov2,
                 self.sky_patch_embed,
                 timefeats=skimg_timefeats[:, :, -1].unsqueeze(2),
             )
+            if sun_hr is not None:
+                sun_tokens = self.sky_sun_patch_embed(
+                    sun_hr.reshape(B_sky * T_sky, 1, 224, 224)
+                )
+                sun_tokens = sun_tokens.flatten(2).transpose(1, 2).view(
+                    B_sky,
+                    T_sky,
+                    self.sky_patch_embed.num_patches,
+                    self.sky_embed_dim,
+                )
+                sky_patch_tokens = (
+                    sky_patch_tokens
+                    + self.sky_sun_alpha.to(dtype=sky_patch_tokens.dtype) * sun_tokens
+                )
             sky_patch_tokens = self.sky_alt_attn(sky_patch_tokens)
             sky_start = skimg_timefeats[:, 0, -1]   # [B]
             sky_end   = skimg_timefeats[:, -1, -1]  # [B]

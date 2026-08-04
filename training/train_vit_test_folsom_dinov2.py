@@ -1027,14 +1027,21 @@ def main() -> None:
     dev_dn_list = train_dataset.devDn_list
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # Log Folsom sky channel layout; dinov2 SkyDINOv2 embed is hard-coded to 4ch in the model.
-    sky_in_channels = int(getattr(train_dataset, "sky_in_channels", 4))
+    if not hasattr(train_dataset, "sky_in_channels"):
+        raise AttributeError(
+            "Folsom dataset missing sky_in_channels; cannot construct vit_dinov2 sky paths"
+        )
+    sky_in_channels = int(train_dataset.sky_in_channels)
+    sky_channels = tuple(getattr(train_dataset, "sky_channels", ()))
+    use_sun_mask = "sun_mask" in sky_channels
     print(
         f"model_type=vit_dinov2 sky_in_channels={sky_in_channels} "
-        f"sky_channels={getattr(train_dataset, 'sky_channels', None)!r}"
+        f"sky_channels={sky_channels!r} use_sun_mask={use_sun_mask}"
     )
     model = pv_forecasting_model_vit_dinov2(
         dev_dn_list=dev_dn_list,
+        sky_in_channels=sky_in_channels,
+        use_sun_mask=use_sun_mask,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),

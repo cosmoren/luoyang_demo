@@ -4,9 +4,9 @@ set -euo pipefail
 # =============================================================================
 # 1) Knobs
 # =============================================================================
-RUN_ROOT="/home/kyber/projects/digital_energy/experiment_files/runs/2026-07-22_folsom-mix-1case"
-REPEAT=2
-SEED_START=3
+RUN_ROOT="/home/kyber/projects/digital_energy/experiment_files/runs/2026-07-31_fol-tabm-nwp-2dg"
+REPEAT=5
+SEED_START=1
 GPUS=(0 1)
 FREE_MEM_MIB=2048
 POLL_SEC=30
@@ -16,21 +16,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
-BASE_CMD=(python training/train_vit_test_folsom.py)
+# Default trainer if an experiment line omits the script field (2-field form).
+DEFAULT_TRAIN_SCRIPT="training/train_vit_test_folsom.py"
 
 # =============================================================================
-# 2) Experiments — edit name|flags (one per line)
+# 2) Experiments — one per line, either:
+#      name|flags                         (uses DEFAULT_TRAIN_SCRIPT)
+#      name|train_script|flags            (vit_imgs and dinov2 in one file)
 #    Queue order: seed-outer (all exps @ SEED_START, then next seed, ...)
 # =============================================================================
 EXPERIMENTS=(
-  # "ghi_only|--zero-sky --no-ray-map --sun-mask none --sky-mask none"
-  # "sky_rgb|--no-ray-map --sun-mask none --sky-mask none"
-  # "ray_map|--ray-map --sun-mask none --sky-mask none"
-  # "valid_disk|--no-ray-map --sun-mask none --sky-mask valid_disc"
-  # "manual_tight|--no-ray-map --sun-mask none --sky-mask tight"
-  # "sun_mask|--no-ray-map --sun-mask sun_only --sky-mask none"
-  # "gaussian_pixel|--no-ray-map --sun-mask gaussian_pixel --sky-mask none"
-  "tight-gaussian|--no-ray-map --sun-mask gaussian_pixel --sky-mask tight"
+  # Weekend matrix: NWP on (trainer default), sun off vs gaussian_pixel
+  "vit_imgs_nwp|training/train_vit_test_folsom.py|--use-nwp --no-ray-map --sun-mask none --sky-mask none"
+  "vit_imgs_nwp_sun|training/train_vit_test_folsom.py|--use-nwp --no-ray-map --sun-mask gaussian_pixel --sky-mask none"
+  "dinov2_nwp|training/train_vit_test_folsom_dinov2.py|--use-nwp --no-ray-map --sun-mask none --sky-mask none"
+  "dinov2_nwp_sun|training/train_vit_test_folsom_dinov2.py|--use-nwp --no-ray-map --sun-mask gaussian_pixel --sky-mask none"
 )
 
 # =============================================================================
@@ -130,7 +130,15 @@ for ((i = 0; i < REPEAT; i++)); do
   seed=$((SEED_START + i))
   for entry in "${EXPERIMENTS[@]}"; do
     name="${entry%%|*}"
-    flags="${entry#*|}"
+    rest="${entry#*|}"
+    # 3-field: name|train_script|flags  |  2-field: name|flags
+    if [[ "${rest}" == *"|"* ]]; then
+      train_script="${rest%%|*}"
+      flags="${rest#*|}"
+    else
+      train_script="${DEFAULT_TRAIN_SCRIPT}"
+      flags="${rest}"
+    fi
     run_dir="${RUN_ROOT}/${name}/seed_${seed}"
     mkdir -p "${run_dir}"
 
@@ -140,7 +148,7 @@ for ((i = 0; i < REPEAT; i++)); do
     extra=( ${flags} )
     cmd=(
       env "CUDA_VISIBLE_DEVICES=${gpu}"
-      "${BASE_CMD[@]}"
+      python "${train_script}"
       --seed "${seed}"
       --tb-log-dir "${run_dir}"
       --checkpoint_dir "${run_dir}"

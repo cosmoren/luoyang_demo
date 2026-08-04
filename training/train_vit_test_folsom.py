@@ -1039,18 +1039,13 @@ def main() -> None:
     dev_dn_list = train_dataset.devDn_list
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # Dataset is the source of truth for sky width (Zarr: RGB + image_valid = 4 with
-    # knobs off). Do not silently fall back to 3 — that desyncs SkyPatch embed.
+    # Dataset is the source of truth for sky width (Zarr: RGB [+ optional knobs] +
+    # image_valid). Pass through to vit_imgs; do not hardcode 4.
     if not hasattr(train_dataset, "sky_in_channels"):
         raise AttributeError(
             "Folsom dataset missing sky_in_channels; cannot construct vit_imgs sky embed"
         )
     sky_in_channels = int(train_dataset.sky_in_channels)
-    if sky_in_channels != 4:
-        raise ValueError(
-            f"expected sky_in_channels==4 (RGB + image_valid, knobs off), "
-            f"got {sky_in_channels} from channels={getattr(train_dataset, 'sky_channels', None)!r}"
-        )
     print(
         f"sky_in_channels={sky_in_channels} "
         f"sky_channels={getattr(train_dataset, 'sky_channels', None)!r}"
