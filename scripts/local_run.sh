@@ -4,9 +4,9 @@ set -euo pipefail
 # =============================================================================
 # 1) Knobs
 # =============================================================================
-RUN_ROOT="/home/kyber/projects/digital_energy/experiment_files/runs/2026-07-31_fol-tabm-nwp-2dg"
-REPEAT=5
-SEED_START=1
+RUN_ROOT="/home/kyber/projects/digital_energy/experiment_files/runs/2026-07-30_fol-tabm"
+REPEAT=2
+SEED_START=4
 GPUS=(0 1)
 FREE_MEM_MIB=2048
 POLL_SEC=30
@@ -26,11 +26,8 @@ DEFAULT_TRAIN_SCRIPT="training/train_vit_test_folsom.py"
 #    Queue order: seed-outer (all exps @ SEED_START, then next seed, ...)
 # =============================================================================
 EXPERIMENTS=(
-  # Weekend matrix: NWP on (trainer default), sun off vs gaussian_pixel
-  "vit_imgs_nwp|training/train_vit_test_folsom.py|--use-nwp --no-ray-map --sun-mask none --sky-mask none"
-  "vit_imgs_nwp_sun|training/train_vit_test_folsom.py|--use-nwp --no-ray-map --sun-mask gaussian_pixel --sky-mask none"
-  "dinov2_nwp|training/train_vit_test_folsom_dinov2.py|--use-nwp --no-ray-map --sun-mask none --sky-mask none"
-  "dinov2_nwp_sun|training/train_vit_test_folsom_dinov2.py|--use-nwp --no-ray-map --sun-mask gaussian_pixel --sky-mask none"
+  "ghi|--zero-sky --no-use-nwp --no-ray-map --sun-mask none --sky-mask none"
+  "sky_rgb|--no-use-nwp --no-ray-map --sun-mask none --sky-mask none"
 )
 
 # =============================================================================

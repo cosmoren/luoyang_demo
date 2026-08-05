@@ -1118,7 +1118,7 @@ class pv_forecasting_model_vit_dinov2(nn.Module):
             kernel_size=self.sky_patch_embed.patch_size,
             stride=self.sky_patch_embed.patch_size,
         )
-        self.sky_sun_alpha = nn.Parameter(torch.tensor(0.0))
+        self.sky_sun_alpha = nn.Parameter(torch.tensor(0.1))
         self.sky_alt_attn = SkyAlternatingIntraInterFrameAttention(
             embed_dim=self.sky_embed_dim, num_heads=8, num_cycles=4, dropout=dropout
         )

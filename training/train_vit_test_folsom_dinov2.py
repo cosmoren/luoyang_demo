@@ -437,6 +437,16 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
         default=_DEFAULT_FOLSOM_DATASET_CONFIG,
         help=f"Dataset YAML filename under config/datasets/ (default: {_DEFAULT_FOLSOM_DATASET_CONFIG!r}).",
     )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help=(
+            "Override paths.data_dir from the dataset YAML (absolute path to Folsom root "
+            "containing irradiance/, sky.zarr, NWP/, …). Useful on the server without "
+            "editing conf_folsom.yaml."
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=int(h["epochs"]))
     parser.add_argument("--lr", type=float, default=float(h["lr"]))
     parser.add_argument(
@@ -649,6 +659,7 @@ def _dataset_kwargs(
     sun_mask_sigma_deg_override: float | None = None,
     sky_disc_mask_mode_override: str | None = None,
     sky_disc_mask_radius_px_override: float | None = None,
+    data_dir_override: str | None = None,
 ) -> dict:
     base_cfg_path = _resolve_named_config(_DATASETS_CONFIG_DIR, dataset_config_name, "dataset-config")
     cfg_path = _folsom_pv_dataset_config_path(base_cfg_path)
@@ -660,7 +671,12 @@ def _dataset_kwargs(
             f"dataset config {base_cfg_path} is missing a non-empty 'sampling:' section"
         )
 
-    data_dir = _resolve_data_dir(paths_cfg, base_cfg_path)
+    if data_dir_override is not None and str(data_dir_override).strip() != "":
+        data_dir = Path(str(data_dir_override)).expanduser().resolve()
+        dataset_data_dir_override: str | None = str(data_dir)
+    else:
+        data_dir = _resolve_data_dir(paths_cfg, base_cfg_path)
+        dataset_data_dir_override = None
 
     def _req_path(key: str) -> str:
         v = paths_cfg.get(key)
@@ -712,6 +728,7 @@ def _dataset_kwargs(
 
     return dict(
         config_path=str(cfg_path),
+        data_dir_override=dataset_data_dir_override,
         pv_dir=str(pv_dir),
         skyimg_dir=str(skyimg_dir),
         satimg_dir=str(satimg_dir),
@@ -1001,6 +1018,7 @@ def main() -> None:
     use_satellite = _resolve_use_satellite(dataset_cfg, args.use_satellite)
     _ds_kw = dict(
         use_satellite_override=use_satellite,
+        data_dir_override=args.data_dir,
         **_sky_knob_overrides(
             dataset_cfg,
             args.ray_map,

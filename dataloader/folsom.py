@@ -878,7 +878,10 @@ class FolsomIrradianceDataset(Dataset):
     ``paths.folsom_nwp_merged_csv`` if set, else globbed from the ``paths.nwp_path`` folder, in
     the per-instance ``config_path``; site coordinates come
     from ``<paths.data_dir>/info.yaml`` (``site.latitude`` / ``site.longitude``), matching
-    :class:`dataloader.luoyang_mem.PVDataset`.
+    :class:`dataloader.luoyang_mem.PVDataset`. ``data_dir_override`` replaces
+    ``paths.data_dir`` for all of those lookups, so a caller that redirects
+    ``pv_dir`` / ``skyimg_dir`` / ``satimg_dir`` to another root (e.g. the shared server
+    copy) does not also have to edit the YAML.
 
     Splits: rows are partitioned chronologically by ``train_split`` / ``val_split`` /
     ``test_split`` (defaults ``0.66`` / ``0.18`` / ``0.16``). ``pv_train_time_fraction`` is
@@ -929,6 +932,7 @@ class FolsomIrradianceDataset(Dataset):
         sun_mask_sigma_deg: float | None = None,
         sky_disc_mask_mode: str | None = None,
         sky_disc_mask_radius_px: float | None = None,
+        data_dir_override: str | Path | None = None,
     ):
         self._config_path = Path(config_path).resolve()
         if not self._config_path.is_file():
@@ -1080,6 +1084,15 @@ class FolsomIrradianceDataset(Dataset):
         #     missing/unreadable falls back to None (zero NWP at runtime).
         with self._config_path.open() as f:
             conf = yaml.safe_load(f) or {}
+        # ``data_dir_override`` (trainer ``--data-dir``) must win before *any*
+        # data_dir-relative lookup below, otherwise info.yaml / NWP / irradiance CSV
+        # silently keep resolving against the YAML's path while the trainer's
+        # pv/sky/sat dirs point elsewhere.
+        if data_dir_override is not None and str(data_dir_override).strip() != "":
+            conf["paths"] = {
+                **(conf.get("paths") or {}),
+                "data_dir": str(Path(str(data_dir_override)).expanduser().resolve()),
+            }
         paths = get_resolved_paths(conf, _PROJECT_ROOT)
         paths_cfg = conf.get("paths") or {}
         data_dir = paths.get("data_dir")
