@@ -4,10 +4,11 @@ set -euo pipefail
 # =============================================================================
 # 1) Knobs
 # =============================================================================
-RUN_ROOT="/home/kyber/projects/digital_energy/experiment_files/runs/2026-07-30_fol-tabm"
-REPEAT=2
-SEED_START=4
-GPUS=(0 1)
+RUN_ROOT="/home/kyber/projects/digital_energy/experiment_files/runs/2026-08-10_fol-dinov2-nwp-fix"
+REPEAT=5
+SEED_START=1
+# GPUS=(0 1)
+GPUS=(0)
 FREE_MEM_MIB=2048
 POLL_SEC=30
 CONDA_ENV="luoyang"
@@ -17,7 +18,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
 # Default trainer if an experiment line omits the script field (2-field form).
-DEFAULT_TRAIN_SCRIPT="training/train_vit_test_folsom.py"
+DEFAULT_TRAIN_SCRIPT="training/train_vit_test_folsom_dinov2.py"
 
 # =============================================================================
 # 2) Experiments — one per line, either:
@@ -26,8 +27,7 @@ DEFAULT_TRAIN_SCRIPT="training/train_vit_test_folsom.py"
 #    Queue order: seed-outer (all exps @ SEED_START, then next seed, ...)
 # =============================================================================
 EXPERIMENTS=(
-  "ghi|--zero-sky --no-use-nwp --no-ray-map --sun-mask none --sky-mask none"
-  "sky_rgb|--no-use-nwp --no-ray-map --sun-mask none --sky-mask none"
+  "nwp-fix| --no-ray-map --sun-mask none --sky-mask none"
 )
 
 # =============================================================================
