@@ -73,6 +73,9 @@ _VIT_DINOV2_NWP_SSRD_SLOT = 0
 _VIT_DINOV2_NWP_MSL_SLOT = 1
 _VIT_DINOV2_NWP_T2M_SLOT = 2
 _VIT_DINOV2_NWP_U10_SLOT = 3
+# Folsom pressure (~1e5 Pa) → near [-1, +1] before the query MLP MSL slot.
+_FOLSOM_NWP_PRESSURE_NORM_CENTER = 100500.0
+_FOLSOM_NWP_PRESSURE_NORM_SCALE = 500.0
 # Optional override for train/eval loss+metrics horizon (first N forecast steps).
 # ``None`` = use ``sampling.pv_output_len`` from the dataset config (default). Set an int
 # to score loss on fewer steps while keeping full model ``T_out``.
@@ -85,10 +88,9 @@ def remap_nwp_tensor_for_pv_vit_dinov2(nwp_tensor: torch.Tensor) -> torch.Tensor
     Copy Folsom merged-NWP columns into the Luoyang slot layout ``vit_dinov2`` hardcodes.
 
     Folsom ``_interpolate_nwp`` stacks ``_FOLSOM_NWP_FEATURE_COLS`` then appends an invalid
-    mask. The model reads Luoyang slots ``0=ssrd``, ``1=msl``, ``2=t2m``, ``3=u10`` and applies
-    its own Luoyang scaling — this helper only reorders/copies values from the original
-    unmodified tensor (no pressure rescale; unused Folsom feature cols 4–7 and the trailing
-    mask stay as-is).
+    mask. The model reads Luoyang slots ``0=ssrd``, ``1=msl``, ``2=t2m``, ``3=u10``. This helper
+    reorders/copies values and normalizes pressure as ``(x - 100500) / 500`` into the MSL slot;
+    unused Folsom feature cols and the trailing mask stay as-is.
     """
     if nwp_tensor.ndim != 3:
         raise ValueError(f"nwp_tensor expected [B, T, C], got shape {tuple(nwp_tensor.shape)}")
@@ -99,7 +101,9 @@ def remap_nwp_tensor_for_pv_vit_dinov2(nwp_tensor: torch.Tensor) -> torch.Tensor
         )
     out = nwp_tensor.clone()
     out[:, :, _VIT_DINOV2_NWP_SSRD_SLOT] = nwp_tensor[:, :, _FOLSOM_NWP_DWSW_INDEX]
-    out[:, :, _VIT_DINOV2_NWP_MSL_SLOT] = nwp_tensor[:, :, _FOLSOM_NWP_PRESSURE_INDEX]
+    out[:, :, _VIT_DINOV2_NWP_MSL_SLOT] = (
+        nwp_tensor[:, :, _FOLSOM_NWP_PRESSURE_INDEX] - _FOLSOM_NWP_PRESSURE_NORM_CENTER
+    ) / _FOLSOM_NWP_PRESSURE_NORM_SCALE
     out[:, :, _VIT_DINOV2_NWP_T2M_SLOT] = nwp_tensor[:, :, _FOLSOM_NWP_TEMPERATURE_INDEX]
     out[:, :, _VIT_DINOV2_NWP_U10_SLOT] = nwp_tensor[:, :, _FOLSOM_NWP_WIND_U_INDEX]
     return out
