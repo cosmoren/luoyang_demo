@@ -154,5 +154,8 @@ playground/
 # personal info-share folder (weekly bundles shared off-server; NO codebase coupling)
 info_share/
 
+# local Slurm server_run variants (not for repo)
+scripts/server_runs/
+
 # personal AGENTS.md (kept local; not for team merges)
 AGENTS.md
