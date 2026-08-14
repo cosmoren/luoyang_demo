@@ -26,9 +26,11 @@ Training usage (same two-step pattern as ``dataloader.luoyang``):
 - ``target_ghi``, ``target_dni``, ``target_dhi``: ``[B, T_out]``
 - ``target_mask``: ``[B, T_out]`` (valid **GHI** forecast timesteps; DNI/DHI validity does not affect this mask)
 - ``skimg_tensor``: ``[B, T_sky, C_sky, H, W]`` where ``C_sky`` = ``sky_in_channels``
-  (RGB, optionally +ray_map +sun_mask +sky_mask, and always +image_valid for Zarr)
+  (RGB, optionally +ray_map +sun_mask +sky_mask; ``image_valid`` is *not* a sky channel)
   and ``H=W=skyimg_spatial_size``
 - ``skimg_timefeats``: ``[B, T_sky, feat_dim]``
+- ``skimg_valid_mask``: ``[B]`` float32 sample-level sky validity (1 if any zarr
+  ``image_valid==1`` in the window, else 0; JPEG path conservatively 0)
 - ``nwp_tensor``: ``[B, T_out, C_nwp]`` (zeros + invalid mask if NWP file missing)
 
 **Not stacked by collate** (debug / metadata; lists length ``B`` of per-sample lists):
@@ -103,9 +105,9 @@ from SPMF_preprocessing.fisheye_calib.fisheye_skymask import (
 # exposes 3 knobs under ``sampling:`` (``ray_map`` / ``sun_mask`` / ``sky_mask``); see
 # ``sky_knobs_to_internal``, which translates them into the internal ``sky_channels``
 # list. The resulting ``skimg_tensor`` concatenates each feature along the channel dim
-# in canonical order (rgb, ray_map, sun_mask, sky_mask), followed by the always-on
-# Zarr-only image_valid channel. JPEG with all knobs off remains byte-identical to
-# the historical 3-channel behavior.
+# in canonical order (rgb, ray_map, sun_mask, sky_mask). Zarr ``image_valid`` is kept
+# in the store and used only to compute sample-level ``skimg_valid`` (not as a channel).
+# JPEG with all knobs off remains byte-identical to the historical 3-channel behavior.
 #
 # Fisheye geometry conventions (training + inference share the same rules):
 #   * Training RGB: raw, unflipped Folsom JPGs assumed already ``skyimg_spatial_size`` (224).
@@ -324,6 +326,7 @@ FOLSOM_GHI_DNI_DHI_KEYS: tuple[str, ...] = (
     "target_mask",
     "skimg_tensor",
     "skimg_timefeats",
+    "skimg_valid",
     "nwp_tensor",
 )
 FOLSOM_BATCH_TENSOR_KEYS = FOLSOM_GHI_DNI_DHI_KEYS
@@ -592,14 +595,31 @@ def _read_header_line(path: Path) -> str:
         return f.readline().rstrip("\n\r")
 
 
-def _load_folsom_irradiance_csv(path: Path) -> tuple[pd.DataFrame, str, list[str], list[str]]:
+def _pick_optional_solar_columns(header_cells: list[str]) -> list[str] | None:
+    """
+    Return Luoyang-style solar column names when all four are present, else None.
+
+    Expected names: ``solar_azimuth``, ``solar_zenith``, ``day_of_year``, ``hour_of_day``.
+    """
+    solar = ["solar_azimuth", "solar_zenith", "day_of_year", "hour_of_day"]
+    present = set(header_cells)
+    if all(c in present for c in solar):
+        return solar
+    return None
+
+
+def _load_folsom_irradiance_csv(
+    path: Path,
+) -> tuple[pd.DataFrame, str, list[str], list[str], list[str] | None]:
     """
     Load the single Folsom irradiance CSV into memory with parsed time + float irradiance columns.
 
-    Returns ``(df, time_col, ghi_dni_dhi_cols, kt_cols)`` where ``df`` has columns
-    ``[time_col, ghi, dni, dhi, p_cs, kt, kt_mask, p_mean]``.
+    Returns ``(df, time_col, ghi_dni_dhi_cols, kt_cols, solar_cols)`` where ``df`` has columns
+    ``[time_col, ghi, dni, dhi, p_cs, kt, kt_mask, p_mean]`` and optionally the four Luoyang-style
+    solar columns when present. ``solar_cols`` is that name list or ``None``.
 
     Strict mode: precomputed ``p_cs`` / ``kt`` / ``kt_mask`` / ``p_mean`` are required.
+    Solar columns are optional; when missing the dataset falls back to ``compute_solar_features``.
     """
     p = path.resolve()
     _folsom_progress(f"loading irradiance CSV {p.name} into memory ...")
@@ -607,7 +627,11 @@ def _load_folsom_irradiance_csv(path: Path) -> tuple[pd.DataFrame, str, list[str
     time_col, _order, _all_cols = _pick_time_and_ghi_dni_dhi_columns(list(raw.columns))
     ghi_dni_dhi_cols = _order[1:]
     kt_cols = _pick_precomputed_kt_columns(list(raw.columns))
-    df = raw[[time_col, *ghi_dni_dhi_cols, *kt_cols]].copy()
+    solar_cols = _pick_optional_solar_columns(list(raw.columns))
+    keep = [time_col, *ghi_dni_dhi_cols, *kt_cols]
+    if solar_cols is not None:
+        keep = keep + solar_cols
+    df = raw[keep].copy()
     df[time_col] = pd.to_datetime(df[time_col], format="%Y-%m-%d %H:%M:%S", errors="coerce")
     if bool(df[time_col].isna().any()):
         raise ValueError(f"{p.name}: NaT in {time_col!r} after parsing")
@@ -617,11 +641,17 @@ def _load_folsom_irradiance_csv(path: Path) -> tuple[pd.DataFrame, str, list[str
         df[c] = pd.to_numeric(df[c], errors="coerce")
         if bool(df[c].isna().any()):
             raise ValueError(f"{p.name}: NaN found in required precomputed column {c!r}")
+    if solar_cols is not None:
+        for c in solar_cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+            if bool(df[c].isna().any()):
+                raise ValueError(f"{p.name}: NaN found in solar column {c!r}")
+    extra = f", {', '.join(solar_cols)}" if solar_cols else ""
     _folsom_progress(
         f"irradiance CSV ready: {len(df):,} rows in RAM "
-        f"({time_col!r}, {', '.join(ghi_dni_dhi_cols + kt_cols)})"
+        f"({time_col!r}, {', '.join(ghi_dni_dhi_cols + kt_cols)}{extra})"
     )
-    return df, time_col, ghi_dni_dhi_cols, kt_cols
+    return df, time_col, ghi_dni_dhi_cols, kt_cols, solar_cols
 
 
 def _resolve_folsom_csv_path(conf: dict, project_root: Path | None = None) -> Path:
@@ -997,7 +1027,8 @@ class FolsomIrradianceDataset(Dataset):
         # mask are built lazily on first use and cached since
         # ``compute_ray_map`` is a pure function of ``(H, W, fit)``. ``sun_mask``
         # reuses the same fit cache plus per-frame solar geometry from
-        # ``compute_solar_features``.
+        # ``compute_solar_features``. Zarr ``skimg_timefeats`` instead read stored
+        # solar fields (``_load_solar_features_from_zarr``).
         self.sky_channels: tuple[str, ...] = _normalize_sky_channels(sky_channels)
         self.sky_in_channels: int = _sky_in_channels(self.sky_channels)
         self._ray_map_cache: torch.Tensor | None = None
@@ -1133,21 +1164,25 @@ class FolsomIrradianceDataset(Dataset):
             _folsom_progress(
                 f"sky format auto-detected: {self._sky_format!r} ({self._skyimg_dir})"
             )
-        if self._sky_format == "zarr":
-            if _SKY_CHANNEL_IMAGE_VALID not in self.sky_channels:
-                self.sky_channels = (*self.sky_channels, _SKY_CHANNEL_IMAGE_VALID)
-            self.sky_in_channels = _sky_in_channels(self.sky_channels)
-
         self._nwp_feature_cols = tuple(_FOLSOM_NWP_FEATURE_COLS)
         # Explicit ``paths.folsom_nwp_merged_csv`` (backward compatible) else glob
         # ``paths.nwp_path`` for the merged CSV. A missing folder / no CSV is tolerated
         # (falls back to zero NWP + invalid mask below); an ambiguous folder is not.
         self._nwp_merged_df = None
+        self._nwp_xp_ns = None
+        self._nwp_fp_by_col = None
         try:
             nwp_csv = _resolve_folsom_nwp_csv_path(conf)
             self._nwp_merged_df = _load_folsom_nwp_merged_csv(nwp_csv)
         except (FileNotFoundError, KeyError):
             self._nwp_merged_df = None
+        if self._nwp_merged_df is not None:
+            vt = pd.DatetimeIndex(self._nwp_merged_df["valtime"])
+            self._nwp_xp_ns = vt.asi8.astype(np.float64)
+            self._nwp_fp_by_col = {
+                col: self._nwp_merged_df[col].to_numpy(dtype=np.float64)
+                for col in self._nwp_feature_cols
+            }
 
         # API parity with PVDataset: trainer reads ``train_dataset.devDn_list`` to size the
         # device-id embedding. Folsom is a single-sensor station, so a length-1 list is fine
@@ -1223,7 +1258,14 @@ class FolsomIrradianceDataset(Dataset):
 
         # Irradiance CSV: one in-memory table (Luoyang ``_csv_cache`` style).
         # Strict mode: CSV must already include precomputed ``p_cs`` / ``kt`` / ``kt_mask`` / ``p_mean``.
-        self._df, self._time_col, self._ghi_dni_dhi_cols, self._kt_cols = _load_folsom_irradiance_csv(self._csv_path)
+        # Optional Luoyang-style solar columns: used for PV/forecast timefeats when present.
+        (
+            self._df,
+            self._time_col,
+            self._ghi_dni_dhi_cols,
+            self._kt_cols,
+            self._solar_cols,
+        ) = _load_folsom_irradiance_csv(self._csv_path)
         self._n = int(len(self._df))
         if self._n < 1:
             raise RuntimeError(f"{self._csv_path.name}: expected at least one data row")
@@ -1232,6 +1274,24 @@ class FolsomIrradianceDataset(Dataset):
         self._kt_full = self._df[self._kt_col].to_numpy(dtype=np.float32, copy=False)
         self._kt_mask_full = self._df[self._kt_mask_col].to_numpy(dtype=np.float32, copy=False)
         self._p_mean_full = self._df[self._p_mean_col].to_numpy(dtype=np.float32, copy=False)
+        self._has_solar_cols = self._solar_cols is not None
+        if self._has_solar_cols:
+            assert self._solar_cols is not None
+            self._solar_azimuth_full = self._df[self._solar_cols[0]].to_numpy(dtype=np.float32, copy=False)
+            self._solar_zenith_full = self._df[self._solar_cols[1]].to_numpy(dtype=np.float32, copy=False)
+            self._day_of_year_full = self._df[self._solar_cols[2]].to_numpy(dtype=np.int32, copy=False)
+            self._hour_of_day_full = self._df[self._solar_cols[3]].to_numpy(dtype=np.float32, copy=False)
+            _folsom_progress(
+                "using precomputed solar columns from CSV: " + ", ".join(self._solar_cols)
+            )
+        else:
+            self._solar_azimuth_full = None
+            self._solar_zenith_full = None
+            self._day_of_year_full = None
+            self._hour_of_day_full = None
+            _folsom_progress(
+                "no solar columns in CSV; PV/forecast timefeats will use compute_solar_features"
+            )
         _folsom_progress(
             "using precomputed kt fields from CSV: "
             f"{self._p_cs_col}, {self._kt_col}, {self._kt_mask_col}, {self._p_mean_col}"
@@ -1403,11 +1463,12 @@ class FolsomIrradianceDataset(Dataset):
 
     def _validate_sky_zarr_schema(self, ds: Any) -> None:
         """
-        Require ``images``, ``image_valid``, and an alignable ``time_utc`` timeline.
+        Require ``images``, ``image_valid``, solar feature vars, and an alignable
+        ``time_utc`` timeline.
 
-        Extra arrays (e.g. ``azimuth``, ``zenith``, ``day_of_year``) are ignored; ``skimg_timefeats``
-        come from ``compute_solar_features`` on the selected Zarr frame times (padded slots use the
-        anchor time, matching the JPEG black-frame convention).
+        Required solar vars (``azimuth``, ``zenith``, ``day_of_year``, ``hour_of_day``)
+        are read for ``skimg_timefeats`` (not recomputed). Pad slots (``None`` indices)
+        get zero timefeats (Luoyang-style), not invented solar geometry.
 
         When ``sun_mask`` is enabled, also require ``sun_u`` / ``sun_v`` / ``sun_valid``
         (Zarr sun masks use stored centers; no silent pvlib recompute fallback).
@@ -1418,23 +1479,33 @@ class FolsomIrradianceDataset(Dataset):
                 "(see config/datasets/conf_folsom.yaml)."
             )
         time_dim, _ = _folsom_sky_zarr_time_dim_and_values(ds, ds["images"])
-        if "image_valid" not in ds.data_vars:
+        n_time = int(ds["images"].sizes[time_dim])
+        required_1d = (
+            "image_valid",
+            "azimuth",
+            "zenith",
+            "day_of_year",
+            "hour_of_day",
+        )
+        missing_required = [name for name in required_1d if name not in ds.data_vars]
+        if missing_required:
             raise KeyError(
-                "Folsom sky Zarr must define data variable ``image_valid`` "
-                "(uint8 0/1 aligned with the image timeline)."
+                "Folsom sky Zarr must define data variables "
+                f"{missing_required}; got {sorted(ds.data_vars)}. "
+                "Rebuild with SPMF_preprocessing/folsom/build_sky_xarray_zarr.py."
             )
-        image_valid = ds["image_valid"]
-        if image_valid.ndim != 1 or tuple(image_valid.dims) != (time_dim,):
-            raise ValueError(
-                "Folsom sky Zarr ``image_valid`` must be 1D on the images time "
-                f"dimension {time_dim!r}; got dims={image_valid.dims}, shape={image_valid.shape}"
-            )
-        if int(image_valid.sizes[time_dim]) != int(ds["images"].sizes[time_dim]):
-            raise ValueError(
-                "Folsom sky Zarr ``image_valid`` length must match images; "
-                f"got {int(image_valid.sizes[time_dim])} vs "
-                f"{int(ds['images'].sizes[time_dim])}"
-            )
+        for name in required_1d:
+            da = ds[name]
+            if da.ndim != 1 or tuple(da.dims) != (time_dim,):
+                raise ValueError(
+                    f"Folsom sky Zarr ``{name}`` must be 1D on the images time "
+                    f"dimension {time_dim!r}; got dims={da.dims}, shape={da.shape}"
+                )
+            if int(da.sizes[time_dim]) != n_time:
+                raise ValueError(
+                    f"Folsom sky Zarr ``{name}`` length must match images; "
+                    f"got {int(da.sizes[time_dim])} vs {n_time}"
+                )
         if self.sun_mask_mode != "none":
             missing = [
                 name
@@ -1722,6 +1793,75 @@ class FolsomIrradianceDataset(Dataset):
             if idx is not None:
                 valid_out[i] = float(valid_sub[int(idx) - lo])
         return valid_out
+
+    def _load_solar_features_from_zarr(
+        self, frame_indices: list[int | None]
+    ) -> dict[str, np.ndarray]:
+        """
+        Load stored sky solar fields for selected Zarr rows.
+
+        Returns ``azimuth`` / ``zenith`` / ``day_of_year`` / ``hour_of_day`` arrays of
+        length ``W``. ``None`` pad slots stay zeros (no pvlib recompute); encoded
+        ``skimg_timefeats`` rows for those slots are zeroed after concat (Luoyang pad).
+        """
+        w = len(frame_indices)
+        if w != self.skyimg_window_size:
+            raise ValueError(
+                f"_load_solar_features_from_zarr expected {self.skyimg_window_size} "
+                f"indices, got {w}"
+            )
+        out: dict[str, np.ndarray] = {
+            "azimuth": np.zeros(w, dtype=np.float32),
+            "zenith": np.zeros(w, dtype=np.float32),
+            "day_of_year": np.zeros(w, dtype=np.float32),
+            "hour_of_day": np.zeros(w, dtype=np.float32),
+        }
+        if self._skyimg_ds is None:
+            return out
+
+        ds = self._skyimg_ds
+        for name in out:
+            if name not in ds.data_vars:
+                raise KeyError(
+                    f"_load_solar_features_from_zarr: missing Zarr variable {name!r}"
+                )
+
+        real_pos = [i for i, idx in enumerate(frame_indices) if idx is not None]
+        if not real_pos:
+            return out
+
+        real_idx = [int(frame_indices[i]) for i in real_pos]  # type: ignore[arg-type]
+        lo, hi = int(real_idx[0]), int(real_idx[-1]) + 1
+        if real_idx != list(range(lo, hi)):
+            raise RuntimeError(
+                f"sky Zarr solar-feature indices must be a contiguous run; got {real_idx[:8]}..."
+            )
+
+        time_dim = self._sky_zarr_time_dim
+        if time_dim is None or not time_dim:
+            zkey = getattr(self, "_sky_zarr_key", "") or ""
+            time_dim, _, _ = _folsom_get_cached_zarr_sky_times(ds, zkey or "_anon")
+
+        sl = {time_dim: slice(lo, hi)}
+        subs = {
+            name: np.asarray(ds[name].isel(sl).values, dtype=np.float32).reshape(-1)
+            for name in out
+        }
+        expected = hi - lo
+        for name, arr in subs.items():
+            if arr.shape[0] != expected:
+                raise RuntimeError(
+                    f"sky Zarr {name} slice length mismatch: got {arr.shape[0]}, "
+                    f"expected {expected}"
+                )
+
+        for i, idx in enumerate(frame_indices):
+            if idx is None:
+                continue
+            j = int(idx) - lo
+            for name in out:
+                out[name][i] = float(subs[name][j])
+        return out
 
     def _load_sky_tensor(self, path: Path) -> torch.Tensor:
         """Return ``[3, H, W]`` float32 in ``[0, 1]`` from a raw (unflipped) Folsom JPG.
@@ -2038,18 +2178,16 @@ class FolsomIrradianceDataset(Dataset):
         """
         t_out = len(forecast_timestamps)
         c = len(self._nwp_feature_cols)
-        if self._nwp_merged_df is None:
+        if self._nwp_xp_ns is None or self._nwp_fp_by_col is None:
             zeros = np.zeros((t_out, c), dtype=np.float32)
             ones_mask = np.ones((t_out, 1), dtype=np.float32)
             return torch.from_numpy(np.concatenate([zeros, ones_mask], axis=1))
 
-        vt = pd.DatetimeIndex(self._nwp_merged_df["valtime"])
-        xp_ns = vt.asi8.astype(np.float64)
         xq_ns = pd.DatetimeIndex(pd.to_datetime(forecast_timestamps)).asi8.astype(np.float64)
-        cols = []
-        for col in self._nwp_feature_cols:
-            fp = self._nwp_merged_df[col].to_numpy(dtype=np.float64)
-            cols.append(_strict_interp_series(xp_ns, fp, xq_ns))
+        cols = [
+            _strict_interp_series(self._nwp_xp_ns, self._nwp_fp_by_col[col], xq_ns)
+            for col in self._nwp_feature_cols
+        ]
         nwp_interp = np.column_stack(cols) if cols else np.empty((t_out, 0), dtype=np.float64)
         clean, bad_mask = _sanitize_nwp_interp(nwp_interp)
         return torch.from_numpy(np.concatenate([clean, bad_mask], axis=1))
@@ -2231,12 +2369,30 @@ class FolsomIrradianceDataset(Dataset):
         ]
         nwp_tensor = self._interpolate_nwp(forecast_timestamps)
 
-        irr_solar = compute_solar_features(timestamps, self.latitude, self.longitude)
+        # PV / forecast solar timefeats: prefer precomputed CSV columns (Luoyang-style);
+        # else live ``compute_solar_features``. Delta-time stays live (anchor-relative).
+        if self._has_solar_cols:
+            irr_solar = {
+                "azimuth": self._solar_azimuth_full[x_idx],
+                "zenith": self._solar_zenith_full[x_idx],
+                "day_of_year": self._day_of_year_full[x_idx],
+                "hour_of_day": self._hour_of_day_full[x_idx],
+            }
+            forecast_solar = {
+                "azimuth": self._solar_azimuth_full[y_idx],
+                "zenith": self._solar_zenith_full[y_idx],
+                "day_of_year": self._day_of_year_full[y_idx],
+                "hour_of_day": self._hour_of_day_full[y_idx],
+            }
+        else:
+            irr_solar = compute_solar_features(timestamps, self.latitude, self.longitude)
+            forecast_solar = compute_solar_features(
+                forecast_timestamps, self.latitude, self.longitude
+            )
         irr_tf = solar_features_encoder(irr_solar)
         irr_dtf = delta_time_encoder(timestamps, time0)
         irr_timefeats = torch.cat([irr_tf, irr_dtf.unsqueeze(1)], dim=1)
 
-        forecast_solar = compute_solar_features(forecast_timestamps, self.latitude, self.longitude)
         f_tf = solar_features_encoder(forecast_solar)
         f_dtf = delta_time_encoder(forecast_timestamps, time0)
         forecast_timefeats = torch.cat([f_tf, f_dtf.unsqueeze(1)], dim=1)
@@ -2253,10 +2409,17 @@ class FolsomIrradianceDataset(Dataset):
             sat_timefeats = None
 
         t_x_end = sub_x[self._time_col].iloc[-1]
+        # Sample-level sky validity (Luoyang ``skimg_valid``): Folsom uses zarr
+        # ``image_valid`` (any frame == 1 → valid). Not a sky input channel.
+        skimg_valid = torch.tensor(0.0, dtype=torch.float32)
         if self._sky_format == "zarr":
             skimg_timestamps, sk_idx = self._history_sky_zarr_frame_records(t_x_end)
             rgb_frames = self._stack_sky_from_zarr(sk_idx)
             image_valid = self._load_image_valid_from_zarr(sk_idx)
+            skimg_valid = torch.tensor(
+                1.0 if bool(np.any(np.asarray(image_valid) > 0)) else 0.0,
+                dtype=torch.float32,
+            )
             if _SKY_CHANNEL_SUN_MASK in self.sky_channels:
                 sun_u, sun_v, sun_valid = self._load_sun_centers_from_zarr(sk_idx)
                 skimg_tensor = self._build_sky_channels(
@@ -2271,17 +2434,22 @@ class FolsomIrradianceDataset(Dataset):
                 skimg_tensor = self._build_sky_channels(
                     rgb_frames, skimg_timestamps, image_valid=image_valid
                 )
-            skimg_solar_features = compute_solar_features(
-                skimg_timestamps, self.latitude, self.longitude
-            )
+            # Read precomputed solar fields from Zarr (whatever was baked at build
+            # time — geometric until regen, apparent after). Pad slots stay zero.
+            skimg_solar_features = self._load_solar_features_from_zarr(sk_idx)
             skimg_tf = solar_features_encoder(skimg_solar_features)
             skimg_dtf = delta_time_encoder(skimg_timestamps, time0)
             skimg_timefeats = torch.cat([skimg_tf, skimg_dtf.unsqueeze(1)], dim=1)
+            # Luoyang-style: zero full timefeat rows for left-pad / missing slots.
+            for i, idx in enumerate(sk_idx):
+                if idx is None:
+                    skimg_timefeats[i].zero_()
             skimg_timestamps = [
                 (None if idx is None else pd.Timestamp(t).strftime("%Y%m%d%H%M%S"))
                 for t, idx in zip(skimg_timestamps, sk_idx)
             ]
         else:
+            # JPEG has no image_valid array → conservatively invalid (0.0).
             skimg_timestamps, skimg_paths = self._history_sky_frame_records(t_x_end)
             skimg_solar_features = compute_solar_features(
                 skimg_timestamps, self.latitude, self.longitude
@@ -2333,6 +2501,7 @@ class FolsomIrradianceDataset(Dataset):
             "sat_timefeats": sat_timefeats,
             "skimg_tensor": skimg_tensor,
             "skimg_timefeats": skimg_timefeats,
+            "skimg_valid": skimg_valid,
             "nwp_tensor": nwp_tensor,
             "input_timestamps_utc": input_timestamps_utc,
             "forecast_timestamps_utc": forecast_timestamps_utc,
@@ -2378,7 +2547,27 @@ def collate_folsom_irradiance(batch: list[dict]) -> dict:
             out[key] = None
         else:
             out[key] = torch.stack(vals)
+    out["skimg_valid_mask"] = torch.stack(
+        [s["skimg_valid"].to(torch.float32) for s in batch], dim=0
+    )
     out["skimg_timestamps"] = [b["skimg_timestamps"] for b in batch]
+    return out
+
+
+def collate_folsom_vit_batch(batch: list[dict]) -> dict:
+    """Train/eval collate: Luoyang ``collate_batched`` plus Folsom ``skimg_valid_mask``.
+
+    Folsom trainers historically imported ``dataloader.luoyang_zarr.collate_batched``
+    (PV / kt / sat / sky stack). That collate does not know about Folsom's
+    sample-level ``skimg_valid``; this wrapper stacks it to ``skimg_valid_mask``
+    shaped ``[B]`` (Luoyang naming).
+    """
+    from dataloader.luoyang_zarr import collate_batched as _luoyang_collate_batched
+
+    out = _luoyang_collate_batched(batch)
+    out["skimg_valid_mask"] = torch.stack(
+        [s["skimg_valid"].to(torch.float32) for s in batch], dim=0
+    )
     return out
 
 
@@ -2495,6 +2684,7 @@ __all__ = [
     "FOLSOM_GHI_DNI_DHI_KEYS",
     "FOLSOM_BATCH_TENSOR_KEYS",
     "collate_folsom_irradiance",
+    "collate_folsom_vit_batch",
     "build_folsom_irradiance_datasets_from_conf",
     "load_folsom_conf",
     "run_smoke_cli",

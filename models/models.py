@@ -1014,7 +1014,7 @@ class pv_forecasting_model_vit_dinov2(nn.Module):
         self.dropout = dropout
         self.sky_in_channels = int(sky_in_channels)
         self.use_sun_mask = bool(use_sun_mask)
-        expected_sky_channels = 5 if self.use_sun_mask else 4
+        expected_sky_channels = 4 if self.use_sun_mask else 3
         if self.sky_in_channels != expected_sky_channels:
             raise ValueError(
                 f"vit_dinov2 expected sky_in_channels={expected_sky_channels} when "
@@ -1360,10 +1360,9 @@ class pv_forecasting_model_vit_dinov2(nn.Module):
                 sky_hr = skimg_tensor
 
             if self.use_sun_mask:
-                # Folsom Zarr C=5 order is RGB, sun_mask, image_valid. Keep
-                # image_valid as DINOv2's fourth-channel RGB gate; sun is only
+                # Layout without image_valid: RGB(0:3) + sun(3:4). Sun is only
                 # consumed by the parallel Conv2d feature path.
-                sky_dinov2 = torch.cat([sky_hr[:, :, :3], sky_hr[:, :, -1:]], dim=2)
+                sky_dinov2 = sky_hr[:, :, :3]
                 sun_hr = sky_hr[:, :, 3:4]
             else:
                 sky_dinov2 = sky_hr

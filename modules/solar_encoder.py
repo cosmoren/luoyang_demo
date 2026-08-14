@@ -49,7 +49,8 @@ def compute_solar_features(
     From UTC forecast times and site lat/lon, compute per timestep:
     - local_solar_time: apparent solar time at the site (naive datetime64[ns])
     - azimuth: sun azimuth (degrees)
-    - zenith: sun zenith angle (degrees)
+    - zenith: pvlib ``apparent_zenith`` (refraction-corrected, degrees); dict key
+      stays ``zenith`` for API compatibility (same naming as Luoyang stores)
     - day_of_year: 1-366
     - hour_of_day: hour in local solar time (0-24, decimal)
     Returns a dict of length-T ``np.ndarray``s (one entry per field).
@@ -64,7 +65,7 @@ def compute_solar_features(
 
     solpos = solarposition.get_solarposition(times_utc, latitude, longitude)
     azimuth = solpos["azimuth"].values.astype(np.float32)
-    zenith = solpos["zenith"].values.astype(np.float32)
+    zenith = solpos["apparent_zenith"].values.astype(np.float32)
 
     day_of_year = local_solar.dayofyear.values.astype(np.int32)
     hour_of_day = (

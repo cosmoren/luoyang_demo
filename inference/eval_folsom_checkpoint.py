@@ -49,8 +49,8 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 from dataloader.folsom import (  # noqa: E402
     _FOLSOM_HUBER_DELTA,
     FolsomIrradianceDataset,
+    collate_folsom_vit_batch,
 )
-from dataloader.luoyang_zarr import collate_batched  # noqa: E402
 from models.models import pv_forecasting_model_vit_imgs  # noqa: E402
 from training.train_vit_test_folsom import (  # noqa: E402
     _DEFAULT_FOLSOM_DATASET_CONFIG as _TRAINER_DEFAULT_DS,
@@ -360,7 +360,7 @@ def main() -> None:
         test_dataset,
         batch_size=int(args.batch_size),
         shuffle=False,
-        collate_fn=collate_batched,
+        collate_fn=collate_folsom_vit_batch,
         num_workers=nw,
         pin_memory=pin,
         persistent_workers=nw > 0,

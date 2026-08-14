@@ -6,7 +6,7 @@ PV/GHI + sky by default: satellite off; NWP remapped Folsom→Luoyang slots on b
 predicts a single horizon (``T_out=1``); Folsom targets may be longer (e.g. 16). Train/eval
 slice targets/masks to the model output length (first-horizon loss only).
 
-Uses ``dataloader.folsom.FolsomIrradianceDataset`` + ``collate_batched``. Configs:
+Uses ``dataloader.folsom.FolsomIrradianceDataset`` + ``collate_folsom_vit_batch``. Configs:
 ``config/train/conf_train.yaml``, ``config/datasets/conf_folsom.yaml``.
 
 Local smoke (1 logical GPU, tiny run):
@@ -53,13 +53,13 @@ from dataloader.folsom import (  # noqa: E402
     _FOLSOM_KT_INPUT_SCALE,
     _FOLSOM_NWP_FEATURE_COLS,
     FolsomIrradianceDataset,
+    collate_folsom_vit_batch,
     normalize_ray_map,
     normalize_sky_mask,
     normalize_sun_mask,
     resolve_sun_mask_sigmas,
     sky_knobs_to_internal,
 )
-from dataloader.luoyang_zarr import collate_batched  # noqa: E402
 from models.models import pv_forecasting_model_vit_dinov2  # noqa: E402
 
 # Folsom merged-NWP feature indices (``_interpolate_nwp`` order; mask is the trailing channel).
@@ -144,6 +144,8 @@ def _batch_to_device(batch: dict, device: torch.device) -> dict:
     for key in ("sat_tensor", "sat_timefeats", "skimg_tensor", "skimg_timefeats", "nwp_tensor"):
         v = batch.get(key)
         out[key] = None if v is None else v.to(device, non_blocking=False)
+    v = batch.get("skimg_valid_mask")
+    out["skimg_valid_mask"] = None if v is None else v.to(device, non_blocking=False)
     return out
 
 
@@ -211,6 +213,7 @@ def forward_vit(model: nn.Module, d: dict) -> torch.Tensor:
         sat_timefeats=d["sat_timefeats"],
         skimg_tensor=d["skimg_tensor"],
         skimg_timefeats=d["skimg_timefeats"],
+        skimg_valid_mask=d.get("skimg_valid_mask"),
         nwp_tensor=d["nwp_tensor"],
     )
 
@@ -1086,7 +1089,7 @@ def main() -> None:
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=collate_batched,
+        collate_fn=collate_folsom_vit_batch,
         num_workers=nw,
         pin_memory=True,
         persistent_workers=(nw > 0),
@@ -1096,7 +1099,7 @@ def main() -> None:
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        collate_fn=collate_batched,
+        collate_fn=collate_folsom_vit_batch,
         num_workers=nw,
         pin_memory=True,
         persistent_workers=(nw > 0),
@@ -1106,7 +1109,7 @@ def main() -> None:
         test_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        collate_fn=collate_batched,
+        collate_fn=collate_folsom_vit_batch,
         num_workers=nw,
         pin_memory=True,
         persistent_workers=(nw > 0),

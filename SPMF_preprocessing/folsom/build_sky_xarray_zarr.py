@@ -11,13 +11,18 @@ Output schema (xarray-native):
       images                 uint8, shape (time_utc, channel, y, x)
       local_solar_time       datetime64[ns], shape (time_utc,)
       azimuth                float32, shape (time_utc,)
-      zenith                 float32, shape (time_utc,)
+      zenith                 float32, shape (time_utc,)  [pvlib apparent_zenith via
+                             compute_solar_features; key name stays ``zenith``]
       day_of_year            int16, shape (time_utc,)
       hour_of_day            float32, shape (time_utc,)
       image_valid            uint8, shape (time_utc,)  [required; --image-valid-csv]
       sun_u                  float32, shape (time_utc,) [required; --sun-centers-csv]
       sun_v                  float32, shape (time_utc,) [required; --sun-centers-csv]
       sun_valid              uint8, shape (time_utc,)  [required; --sun-centers-csv]
+
+Solar geometry comes from ``modules.solar_encoder.compute_solar_features`` (apparent
+zenith). Existing stores written before that switch may still hold geometric zenith
+until regenerated.
 
 Example:
     python scripts/build_sky_xarray_zarr.py \
@@ -507,6 +512,17 @@ def main() -> int:
                 "flag_values": "0,1",
                 "flag_meanings": "below_horizon above_horizon",
             }
+            chunk_ds["zenith"].attrs = {
+                "description": (
+                    "Sun zenith from compute_solar_features "
+                    "(pvlib apparent_zenith, degrees); variable name stays zenith"
+                ),
+                "units": "degrees",
+            }
+            chunk_ds["azimuth"].attrs = {
+                "description": "Sun azimuth from compute_solar_features (degrees)",
+                "units": "degrees",
+            }
             chunk_ds.attrs = {
                 "spatial_size": spatial,
                 "chunk_frames": chunk_frames,
@@ -517,6 +533,10 @@ def main() -> int:
                 "sun_centers_csv": str(Path(args.sun_centers_csv).expanduser().resolve()),
                 "time_convention": "UTC (stored as plain datetime64[ns] values)",
                 "local_solar_time_note": "Apparent local solar time; not UTC wall-clock.",
+                "zenith_note": (
+                    "Stored under name zenith; value is pvlib apparent_zenith "
+                    "via modules.solar_encoder.compute_solar_features."
+                ),
                 "latitude": float(latitude),
                 "longitude": float(longitude),
                 "build_time_utc": pd.Timestamp.utcnow().isoformat(),

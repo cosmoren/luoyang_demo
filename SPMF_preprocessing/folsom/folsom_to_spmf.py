@@ -10,12 +10,20 @@ unless you ask for it.
 from __future__ import annotations
 
 import shutil
+import sys
 from pathlib import Path
 from typing import Literal
 
 import numpy as np
 import pandas as pd
 import pvlib
+import yaml
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from modules.solar_encoder import compute_solar_features
 
 # =============================================================================
 # Main control — set exactly one task (only that branch runs).
@@ -27,9 +35,10 @@ ActiveTask = Literal[
     "merge_nwp_csvs",
     "rename_jpg_date_time",
     "augment_irradiance_csv",
+    "augment_irradiance_solar_cols",
 ]
 
-ACTIVE_TASK: ActiveTask = "augment_irradiance_csv"
+ACTIVE_TASK: ActiveTask = "augment_irradiance_solar_cols"
 
 # --- Task: flatten_jpegs ------------------------------------------------------
 FOLSOM_INPUT_DIR = Path("/home/kyber/projects/digital_energy/datasets/folsom_ds/original/sky image/raw")
@@ -72,7 +81,7 @@ IRR_TIME_COL = "timeStamp"
 IRR_GHI_COL = "ghi"
 IRR_DNI_COL = "dni"
 IRR_DHI_COL = "dhi"
-# Folsom site (from dataset info.yaml)
+# Folsom site (legacy hardcode for kt augment; solar-cols task reads info.yaml)
 FOLSOM_LATITUDE = 38.67895
 FOLSOM_LONGITUDE = -121.17688
 # Match dataloader/folsom.py semantics.
@@ -82,6 +91,18 @@ P_CS_CLIP_MAX = 1.2
 KT_DAYTIME_THRESHOLD = 0.1
 KT_EPS = 1e-6
 P_MEAN_SCALAR = 1.0
+
+# --- Task: augment_irradiance_solar_cols (Luoyang-style solar timefeat columns) ----
+# Overwrites the active Folsom irradiance CSV in place (atomic temp → replace).
+SOLAR_IRR_CSV = Path(
+    "/home/kyber/projects/digital_energy/datasets/folsom_ds/processed2/irradiance/"
+    "Folsom_irradiance_with_kt.csv"
+)
+SOLAR_INFO_YAML = Path(
+    "/home/kyber/projects/digital_energy/datasets/folsom_ds/processed2/info.yaml"
+)
+SOLAR_COLS = ("solar_azimuth", "solar_zenith", "day_of_year", "hour_of_day")
+SOLAR_CHUNK_ROWS = 200_000
 
 
 # =============================================================================
@@ -231,6 +252,88 @@ def augment_irradiance_with_kt_fields() -> Path:
     return dst
 
 
+def _load_folsom_lat_lon(info_yaml: Path) -> tuple[float, float]:
+    """Read ``site.latitude`` / ``site.longitude`` from Folsom ``info.yaml``."""
+    path = info_yaml.resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Folsom info.yaml not found: {path}")
+    with path.open("r", encoding="utf-8") as f:
+        meta = yaml.safe_load(f) or {}
+    site = meta.get("site") or {}
+    lat = site.get("latitude")
+    lon = site.get("longitude")
+    if lat is None or lon is None:
+        raise KeyError(f"{path}: must define site.latitude and site.longitude")
+    return float(lat), float(lon)
+
+
+def augment_irradiance_with_solar_cols(
+    csv_path: Path | None = None,
+    info_yaml: Path | None = None,
+    *,
+    chunk_rows: int = SOLAR_CHUNK_ROWS,
+) -> Path:
+    """
+    Overwrite Folsom irradiance CSV in place with Luoyang-style solar columns:
+      solar_azimuth, solar_zenith (apparent), day_of_year, hour_of_day
+
+    Uses ``modules.solar_encoder.compute_solar_features`` and site lat/lon from
+    ``info.yaml``. Existing columns / row order are preserved; solar columns are
+    added if missing or recomputed if already present. Writes via temp file then
+    ``Path.replace`` for atomicity.
+    """
+    src = (csv_path or SOLAR_IRR_CSV).resolve()
+    info = (info_yaml or SOLAR_INFO_YAML).resolve()
+    if not src.is_file():
+        raise FileNotFoundError(f"Irradiance CSV not found: {src}")
+
+    lat, lon = _load_folsom_lat_lon(info)
+    print(f"augment_irradiance_solar_cols: {src}")
+    print(f"  lat/lon from {info}: {lat}, {lon}")
+
+    df = pd.read_csv(src)
+    if IRR_TIME_COL not in df.columns:
+        raise KeyError(f"{src.name}: missing required time column {IRR_TIME_COL!r}")
+
+    ts = pd.to_datetime(df[IRR_TIME_COL], format="%Y-%m-%d %H:%M:%S", errors="coerce")
+    if bool(ts.isna().any()):
+        raise ValueError(f"{src.name}: NaT found after parsing {IRR_TIME_COL!r}")
+    times = pd.DatetimeIndex(ts)
+
+    n = len(df)
+    az = np.empty(n, dtype=np.float32)
+    ze = np.empty(n, dtype=np.float32)
+    doy = np.empty(n, dtype=np.int32)
+    hod = np.empty(n, dtype=np.float32)
+
+    chunk = max(1, int(chunk_rows))
+    for start in range(0, n, chunk):
+        stop = min(n, start + chunk)
+        feats = compute_solar_features(times[start:stop], lat, lon)
+        az[start:stop] = feats["azimuth"]
+        ze[start:stop] = feats["zenith"]
+        doy[start:stop] = feats["day_of_year"]
+        hod[start:stop] = feats["hour_of_day"]
+        print(f"  solar features: rows {start:,}..{stop - 1:,} / {n:,}")
+
+    out = df.copy()
+    out["solar_azimuth"] = az
+    out["solar_zenith"] = ze
+    out["day_of_year"] = doy
+    out["hour_of_day"] = hod
+
+    # Keep a stable column order: original cols first, then solar cols at end
+    # (replacing any prior solar col positions with a single trailing block).
+    base_cols = [c for c in df.columns if c not in SOLAR_COLS]
+    out = out[base_cols + list(SOLAR_COLS)]
+
+    tmp = src.with_name(src.name + ".tmp")
+    out.to_csv(tmp, index=False)
+    tmp.replace(src)
+    print(f"  wrote {n:,} rows → {src}")
+    return src
+
+
 # =============================================================================
 # NWP: merge 4 CSVs by timestamp keys, average weather columns
 # =============================================================================
@@ -366,6 +469,11 @@ def main() -> None:
     if ACTIVE_TASK == "augment_irradiance_csv":
         out = augment_irradiance_with_kt_fields()
         print(f"augment_irradiance_csv: wrote {out}")
+        return
+
+    if ACTIVE_TASK == "augment_irradiance_solar_cols":
+        out = augment_irradiance_with_solar_cols()
+        print(f"augment_irradiance_solar_cols: wrote {out}")
         return
 
     raise ValueError(f"Unknown ACTIVE_TASK: {ACTIVE_TASK!r}")

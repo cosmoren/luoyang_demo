@@ -30,7 +30,7 @@ sampling:
   skyimg_spatial_size: 224
   # extra channels for sky image: ray_map, sun_mask, sky_mask
   ray_map: false  # true | false
-  sun_mask: gaussian_pixel  # none | sun_only | sun_halo | gaussian_pixel | gaussian_angular
+  sun_mask: none  # none | sun_only | sun_halo | gaussian_pixel | gaussian_angular
   sun_mask_sigma_px: 70
   sun_mask_sigma_deg: 55
   sky_mask: none  # none | loose | tight | valid_disc
