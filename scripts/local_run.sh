@@ -4,7 +4,7 @@ set -euo pipefail
 # =============================================================================
 # 1) Knobs
 # =============================================================================
-RUN_ROOT="/home/kyber/projects/digital_energy/experiment_files/runs/2026-08-14_folsom-15m-weekend"
+RUN_ROOT="/home/kyber/projects/digital_energy/experiment_files/runs/fol luo adapt and fix/2026-08-14_fol-adapt"
 REPEAT=5
 SEED_START=1
 GPUS=(0 1)
@@ -26,8 +26,8 @@ DEFAULT_TRAIN_SCRIPT="training/train_vit_test_folsom_dinov2.py"
 #    Queue order: seed-outer (all exps @ SEED_START, then next seed, ...)
 # =============================================================================
 EXPERIMENTS=(
-  "sky| --no-use-nwp --no-ray-map --sun-mask none --sky-mask none"
-  "sky-nwp| --use-nwp --no-ray-map --sun-mask none --sky-mask none"
+  "ghi-sky| --no-use-nwp --no-ray-map --sun-mask none --sky-mask none"
+  "ghi-sky-nwp| --use-nwp --no-ray-map --sun-mask none --sky-mask none"
 )
 
 # =============================================================================
