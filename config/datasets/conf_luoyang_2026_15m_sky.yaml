@@ -8,20 +8,25 @@ paths:
 
 sampling:
   train_samples_per_csv: 10000
+  sky_sat_load_mode: lazy  # lazy | prefetch
+  use_satellite: false     # PV+sky campaign: do not open/load satellite
   csv_interval_min: 5
   pv_input_interval_min: 5
   pv_input_len: 576
   pv_output_interval_min: 15
   pv_output_len: 1
   test_anchor_stride_min: 5
-  val_anchor_stride_min: 30
+  val_anchor_stride_min: 5
   test_collect_time_match_tolerance_min: 0
   skyimg_window_size: 30
   skyimg_time_resolution_min: 1
   satimg_window_size: 24
   satimg_time_resolution_min: 10
 
+# Hard calendar split (BJ / Asia/Shanghai). Upper bounds are half-open.
+# Train: last target < May 7. Val: first target May 7–10. Test: first target >= May 11 (TABM-aligned, no end).
 split_policy:
-  test_start_bj: "2026-05-11 00:00:00"
-  train_fraction: 0.85
-  val_fraction: 0.15
+  train_end_bj: "2026-05-07 00:00:00"   # train: last target < train_end_bj
+  val_start_bj: "2026-05-07 00:00:00"   # val: first target in [val_start, val_end)
+  val_end_bj: "2026-05-11 00:00:00"
+  test_start_bj: "2026-05-11 00:00:00"  # test: first target >= test_start_bj

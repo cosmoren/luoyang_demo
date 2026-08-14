@@ -64,9 +64,15 @@ def _build_test_dataset() -> PVDataset:
         satimg_window_size=int(sampling_cfg["satimg_window_size"]),
         satimg_time_resolution_min=int(sampling_cfg["satimg_time_resolution_min"]),
         satimg_npy_shape_hwc=tuple(int(x) for x in sampling_cfg.get("satimg_npy_shape_hwc", [100, 100, 3])),
-        test_start_bj=split_cfg.get("test_start_bj", "2026-05-11 00:00:00"),
-        train_fraction=float(split_cfg.get("train_fraction", 0.85)),
-        val_fraction=float(split_cfg.get("val_fraction", 0.15)),
+        train_start_bj=(
+            str(split_cfg["train_start_bj"])
+            if split_cfg.get("train_start_bj") not in (None, "")
+            else None
+        ),
+        train_end_bj=str(split_cfg["train_end_bj"]),
+        val_start_bj=str(split_cfg["val_start_bj"]),
+        val_end_bj=str(split_cfg["val_end_bj"]),
+        test_start_bj=str(split_cfg["test_start_bj"]),
     )
 
 
@@ -113,8 +119,7 @@ def load_test_arrays():
         valid = float(d.get("skimg_valid", torch.tensor(0.0)).item())
         valid_list.append(valid)
         if skimg is not None and valid > 0.5:
-            last_frame = skimg[-1].permute(1, 2, 0).numpy()  # [H, W, C]
-            # keep only first 3 channels (RGB), drop asi_mask channel if present
+            last_frame = skimg[-1].permute(1, 2, 0).numpy()  # [H, W, C] RGB
             sky_list.append(last_frame[:, :, :3].astype(np.float32))
         else:
             sky_list.append(np.zeros((sky_h, sky_w, 3), dtype=np.float32))

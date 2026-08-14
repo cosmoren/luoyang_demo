@@ -14,7 +14,6 @@ import torch
 import xarray as xr
 import yaml
 import matplotlib.pyplot as plt
-from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -368,7 +367,7 @@ def interpolate_nwp_forecast_history_features(
 
 class PVDataset(Dataset):
     """Standalone dataset using final_power and BJ-time split policy."""
-    _GLOBAL_ZARR_MEM_CACHE: dict[str, dict[str, np.ndarray | torch.Tensor]] = {}
+    _GLOBAL_ZARR_MEM_CACHE: dict[str, dict[str, np.ndarray | torch.Tensor | None]] = {}
     _GLOBAL_CSV_DF_CACHE: dict[str, pd.DataFrame] = {}
     _GLOBAL_CSV_NP_CACHE: dict[str, dict[str, np.ndarray]] = {}
     _GLOBAL_NWP_DF_CACHE: dict[str, pd.DataFrame] = {}
@@ -402,12 +401,16 @@ class PVDataset(Dataset):
         satimg_npy_shape_hwc: tuple[int, int, int],
         train_samples_per_csv: int = 1,
         kt_noise_std: float = 0.0,
-        train_fraction: float = 0.85,
-        val_fraction: float = 0.15,
+        train_start_bj: str | None = None,
+        train_end_bj: str = "2026-05-07 00:00:00",
+        val_start_bj: str = "2026-05-07 00:00:00",
+        val_end_bj: str = "2026-05-11 00:00:00",
         test_start_bj: str = "2026-05-11 00:00:00",
         max_files: int | None = None,
         sample_file_subset: list[Path | str] | None = None,
         enable_sat_sky_cache: bool = False,
+        sky_sat_load_mode: str = "lazy",
+        use_satellite: bool = True,
     ) -> None:
         t_init = time.perf_counter()
         t_prev = t_init
@@ -463,13 +466,27 @@ class PVDataset(Dataset):
         if len(self._satimg_npy_shape_hwc) != 3:
             raise ValueError("satimg_npy_shape_hwc must be (H,W,C)")
 
-        if train_fraction <= 0 or val_fraction <= 0:
-            raise ValueError("train_fraction and val_fraction must be positive")
-        if abs((train_fraction + val_fraction) - 1.0) > 1e-9:
-            raise ValueError("train_fraction + val_fraction must equal 1.0")
-        self._train_fraction = float(train_fraction)
-        self._val_fraction = float(val_fraction)
+        self._train_start_bj = None
+        if train_start_bj is not None and str(train_start_bj).strip():
+            self._train_start_bj = pd.Timestamp(str(train_start_bj).strip()).tz_localize(
+                "Asia/Shanghai"
+            )
+        self._train_end_bj = pd.Timestamp(train_end_bj).tz_localize("Asia/Shanghai")
+        self._val_start_bj = pd.Timestamp(val_start_bj).tz_localize("Asia/Shanghai")
+        self._val_end_bj = pd.Timestamp(val_end_bj).tz_localize("Asia/Shanghai")
         self._test_start_bj = pd.Timestamp(test_start_bj).tz_localize("Asia/Shanghai")
+        if self._train_start_bj is not None and not (self._train_start_bj < self._train_end_bj):
+            raise ValueError(
+                "train_start_bj must be < train_end_bj "
+                f"(got train_start={self._train_start_bj}, train_end={self._train_end_bj})"
+            )
+        if not (self._train_end_bj <= self._val_start_bj <= self._val_end_bj <= self._test_start_bj):
+            raise ValueError(
+                "calendar split bounds must satisfy "
+                "train_end <= val_start <= val_end <= test_start "
+                f"(got train_end={self._train_end_bj}, val=[{self._val_start_bj},{self._val_end_bj}), "
+                f"test_start={self._test_start_bj})"
+            )
 
         pv_raw = str(pv_dir).strip() if pv_dir is not None else ""
         if not pv_raw:
@@ -483,6 +500,10 @@ class PVDataset(Dataset):
         self._dev_dn_total = "NE=total"
         self._skyimg_dir = Path(skyimg_dir).resolve()
         self._satimg_dir = Path(satimg_dir).resolve()
+        self.sky_sat_load_mode = str(sky_sat_load_mode).strip().lower()
+        if self.sky_sat_load_mode not in ("lazy", "prefetch"):
+            raise ValueError("sky_sat_load_mode must be lazy|prefetch")
+        self.use_satellite = bool(use_satellite)
         self.enable_sat_sky_cache = bool(enable_sat_sky_cache)
         self._sat_sky_cache_win_idx: int | None = None
         self._sat_sky_cache_bundle: dict[str, torch.Tensor | None] | None = None
@@ -491,50 +512,68 @@ class PVDataset(Dataset):
 
         self.satimg_ds = None
         self.skyimg_ds = None
-        self._satimg_mem: dict[str, np.ndarray | torch.Tensor] | None = None
-        self._skyimg_mem: dict[str, np.ndarray | torch.Tensor] | None = None
-        if self._satimg_dir.exists():
+        self._satimg_mem: dict[str, np.ndarray | torch.Tensor | None] | None = None
+        self._skyimg_mem: dict[str, np.ndarray | torch.Tensor | None] | None = None
+        if self.use_satellite and self._satimg_dir.exists():
             try:
                 sat_key = self._satimg_dir.resolve().as_posix()
-                if sat_key in self._GLOBAL_ZARR_MEM_CACHE:
+                if self.sky_sat_load_mode == "lazy":
+                    self._GLOBAL_ZARR_MEM_CACHE.pop(sat_key, None)
+                    self.satimg_ds = xr.open_zarr(self._satimg_dir)
+                    self._satimg_mem = self._zarr_ds_to_meta(self.satimg_ds)
+                elif (
+                    sat_key in self._GLOBAL_ZARR_MEM_CACHE
+                    and self._GLOBAL_ZARR_MEM_CACHE[sat_key].get("images") is not None
+                ):
                     self._satimg_mem = self._GLOBAL_ZARR_MEM_CACHE[sat_key]
                 else:
                     self.satimg_ds = xr.open_zarr(self._satimg_dir)
                     self._satimg_mem = self._zarr_ds_to_mem(self.satimg_ds)
                     self._GLOBAL_ZARR_MEM_CACHE[sat_key] = self._satimg_mem
-                self.satimg_ds = None
+                    self.satimg_ds = None
             except Exception as e:
                 print(f"[PVDataset2026] WARNING: open sat zarr failed: {e}")
-        else:
+        elif self.use_satellite:
             print(f"[PVDataset2026] WARNING: sat zarr dir not found: {self._satimg_dir}")
         if self._skyimg_dir.exists():
             try:
                 sky_key = self._skyimg_dir.resolve().as_posix()
-                if sky_key in self._GLOBAL_ZARR_MEM_CACHE:
+                if self.sky_sat_load_mode == "lazy":
+                    self._GLOBAL_ZARR_MEM_CACHE.pop(sky_key, None)
+                    self.skyimg_ds = xr.open_zarr(self._skyimg_dir)
+                    self._skyimg_mem = self._zarr_ds_to_meta(self.skyimg_ds)
+                elif (
+                    sky_key in self._GLOBAL_ZARR_MEM_CACHE
+                    and self._GLOBAL_ZARR_MEM_CACHE[sky_key].get("images") is not None
+                ):
                     self._skyimg_mem = self._GLOBAL_ZARR_MEM_CACHE[sky_key]
                 else:
                     self.skyimg_ds = xr.open_zarr(self._skyimg_dir)
                     self._skyimg_mem = self._zarr_ds_to_mem(self.skyimg_ds)
                     self._GLOBAL_ZARR_MEM_CACHE[sky_key] = self._skyimg_mem
-                self.skyimg_ds = None
+                    self.skyimg_ds = None
             except Exception as e:
                 print(f"[PVDataset2026] WARNING: open sky zarr failed: {e}")
         else:
             print(f"[PVDataset2026] WARNING: sky zarr dir not found: {self._skyimg_dir}")
+        sat_state = (
+            "disabled"
+            if not self.use_satellite
+            else f"open-{self.sky_sat_load_mode}"
+            if self._satimg_mem is not None
+            else "unavailable"
+        )
+        sky_state = (
+            f"open-{self.sky_sat_load_mode}"
+            if self._skyimg_mem is not None
+            else "unavailable"
+        )
+        print(
+            f"[PVDataset2026][{split}] sky/sat load: mode={self.sky_sat_load_mode} "
+            f"sky={sky_state} sat={sat_state}",
+            flush=True,
+        )
         _log_stage("sat/sky source init")
-
-        # ASI mask: binary sky-camera valid-pixel mask, stored in the dataset root (parent of skyimg_dir).
-        _asi_mask_path = self._skyimg_dir.parent / "asi_mask.png"
-        if _asi_mask_path.exists():
-            _raw = np.array(Image.open(_asi_mask_path).convert("L"))  # grayscale uint8 H×W
-            self.asi_mask: np.ndarray = (_raw > 127).astype(np.float32)  # bool-like float32
-            print(f"[PVDataset2026] asi_mask loaded: shape={self.asi_mask.shape} "
-                  f"valid_ratio={self.asi_mask.mean():.3f}")
-
-            print(self.asi_mask.shape, self.asi_mask.sum())
-        else:
-            self.asi_mask = None
-            print(f"[PVDataset2026] WARNING: asi_mask.png not found at {_asi_mask_path}")
 
         cfg = {}
         if self._config_path.is_file():
@@ -746,6 +785,20 @@ class PVDataset(Dataset):
         self._x_tail_1d = (-(lx - 1) * self._sx + np.arange(lx, dtype=np.intp) * self._sx).astype(np.intp, copy=False)
         self._y_off_1d = (self._sy + np.arange(ly, dtype=np.intp) * self._sy).astype(np.intp, copy=False)
 
+    def _train_mask_from_last_target(self, max_time) -> np.ndarray:
+        """Train uses LAST target timestamp; optional lower bound via train_start_bj."""
+        mask = (max_time < self._train_end_bj)
+        if self._train_start_bj is not None:
+            mask = mask & (max_time >= self._train_start_bj)
+        return np.asarray(mask, dtype=bool)
+
+    def _train_window_str(self) -> str:
+        if self._train_start_bj is None:
+            return f"last target < {self._train_end_bj} (BJ)"
+        return (
+            f"last target in [{self._train_start_bj}, {self._train_end_bj}) (BJ)"
+        )
+
     def _build_split_masks(self, ref_df: pd.DataFrame) -> None:
         collect_utc = pd.to_datetime(ref_df["collectTime"], utc=True)
         collect_bj = collect_utc.dt.tz_convert("Asia/Shanghai")
@@ -754,31 +807,33 @@ class PVDataset(Dataset):
         first_target_time = collect_bj.iloc[first_target_row]
         max_time = collect_bj.iloc[max_row]
 
-        # Test split should be defined by target timestamps (not history start),
-        # otherwise long history windows can delay the first exported target time.
+        # Assign by TARGET timestamps only (last target for train; first for val/test).
+        # History may reach earlier days; that is not leakage.
+        # Test stays tabm-aligned: first target >= test_start_bj, no upper bound.
+        self._train_anchor_mask = self._train_mask_from_last_target(max_time)
+        self._val_anchor_mask = (
+            (first_target_time >= self._val_start_bj) & (first_target_time < self._val_end_bj)
+        ).to_numpy(dtype=bool)
         self._test_anchor_mask = (first_target_time >= self._test_start_bj).to_numpy(dtype=bool)
-        pre_mask = (max_time < self._test_start_bj).to_numpy(dtype=bool)
-        pre_idx = np.nonzero(pre_mask)[0]
-        if pre_idx.size == 0:
-            raise RuntimeError("no pre-test anchors found")
-        val_n = max(1, int(round(pre_idx.size * self._val_fraction)))
-        if val_n >= pre_idx.size:
-            val_n = pre_idx.size - 1
-        val_idx = pre_idx[:val_n]
-        train_idx = pre_idx[val_n:]
-
-        self._train_anchor_mask = np.zeros_like(pre_mask, dtype=bool)
-        self._val_anchor_mask = np.zeros_like(pre_mask, dtype=bool)
-        self._train_anchor_mask[train_idx] = True
-        self._val_anchor_mask[val_idx] = True
 
         self._val_r_indices = np.nonzero(self._val_anchor_mask)[0][:: self._val_anchor_stride_rows].astype(np.intp, copy=False)
         self._test_r_indices = np.nonzero(self._test_anchor_mask)[0][:: self._test_anchor_stride_rows].astype(np.intp, copy=False)
         self._num_val_windows = int(self._val_r_indices.size)
         self._num_test_windows = int(self._test_r_indices.size)
+        if not self._train_anchor_mask.any():
+            raise RuntimeError(f"no train anchors with {self._train_window_str()}")
+        if self._num_val_windows == 0:
+            raise RuntimeError(
+                f"no val anchors with first target in "
+                f"[{self._val_start_bj}, {self._val_end_bj}) (BJ)"
+            )
+        if self._num_test_windows == 0:
+            raise RuntimeError(
+                f"no test anchors with first target >= {self._test_start_bj} (BJ)"
+            )
         ref_ct = pd.to_datetime(ref_df["collectTime"], errors="coerce")
-        self._val_last_x_time_ref = [pd.Timestamp(ref_ct.iloc[int(self._anchors[r])]) for r in self._val_r_indices] if self._num_val_windows > 0 else None
-        self._test_last_x_time_ref = [pd.Timestamp(ref_ct.iloc[int(self._anchors[r])]) for r in self._test_r_indices] if self._num_test_windows > 0 else None
+        self._val_last_x_time_ref = [pd.Timestamp(ref_ct.iloc[int(self._anchors[r])]) for r in self._val_r_indices]
+        self._test_last_x_time_ref = [pd.Timestamp(ref_ct.iloc[int(self._anchors[r])]) for r in self._test_r_indices]
 
     def _prefilter_files(self) -> None:
         keep_files: list[Path] = []
@@ -803,20 +858,11 @@ class PVDataset(Dataset):
                 y_idx = anchors[:, None] + y_off[None, :]
                 collect_bj = pd.to_datetime(np_data["collect_dt64"], utc=True).tz_convert("Asia/Shanghai")
                 max_time = collect_bj[y_idx[:, -1]]
-                pre_mask = (max_time < self._test_start_bj).astype(bool, copy=False)
-                pre_idx = np.nonzero(pre_mask)[0]
-                if pre_idx.size == 0:
-                    continue
-                val_n = max(1, int(round(pre_idx.size * self._val_fraction)))
-                if val_n >= pre_idx.size:
-                    val_n = pre_idx.size - 1
-                train_idx = pre_idx[val_n:]
-                if train_idx.size == 0:
+                train_mask_local = self._train_mask_from_last_target(max_time)
+                if not train_mask_local.any():
                     continue
                 inv_valid = np.asarray(np_data["inv_valid"], dtype=bool)
                 has_valid_y = inv_valid[y_idx].any(axis=1)
-                train_mask_local = np.zeros_like(has_valid_y, dtype=bool)
-                train_mask_local[train_idx] = True
                 valid_local_pos = np.nonzero(has_valid_y & train_mask_local)[0].astype(np.intp, copy=False)
                 if valid_local_pos.size > 0:
                     # Store last-row index j (not reference-anchor position).
@@ -903,19 +949,45 @@ class PVDataset(Dataset):
         return out
 
     @staticmethod
-    def _zarr_ds_to_mem(ds: xr.Dataset) -> dict[str, np.ndarray | torch.Tensor]:
+    def _zarr_ds_to_meta(ds: xr.Dataset) -> dict[str, np.ndarray | torch.Tensor | None]:
         time_vals = np.asarray(ds["time_utc"].values)
         time_dt64 = time_vals.astype("datetime64[ns]")
         time_ns = time_dt64.astype(np.int64)
         return {
             "time_dt64": time_dt64,
             "time_ns": time_ns,
-            "images": torch.from_numpy(np.asarray(ds["images"].values, dtype=np.float32)),
+            "images": None,
             "azimuth": np.asarray(ds["azimuth"].values, dtype=np.float32),
             "zenith": np.asarray(ds["zenith"].values, dtype=np.float32),
             "day_of_year": np.asarray(ds["day_of_year"].values, dtype=np.int32),
             "hour_of_day": np.asarray(ds["hour_of_day"].values, dtype=np.float32),
         }
+
+    @classmethod
+    def _zarr_ds_to_mem(cls, ds: xr.Dataset) -> dict[str, np.ndarray | torch.Tensor | None]:
+        out = cls._zarr_ds_to_meta(ds)
+        out["images"] = torch.from_numpy(np.asarray(ds["images"].values, dtype=np.float32))
+        return out
+
+    @staticmethod
+    def _read_image_slice(ds: xr.Dataset, l: int, r: int) -> torch.Tensor:
+        arr = np.asarray(ds["images"].isel(time_utc=slice(l, r)).values, dtype=np.float32)
+        return torch.from_numpy(np.ascontiguousarray(arr))
+
+    @classmethod
+    def _image_window(
+        cls,
+        mem: dict[str, np.ndarray | torch.Tensor | None],
+        ds: xr.Dataset | None,
+        l: int,
+        r: int,
+    ) -> torch.Tensor:
+        images = mem.get("images")
+        if isinstance(images, torch.Tensor):
+            return images[l:r].clone()
+        if ds is None:
+            raise RuntimeError("lazy image window requested without an open zarr dataset")
+        return cls._read_image_slice(ds, l, r)
 
     @staticmethod
     def _csv_col_numeric(
@@ -995,7 +1067,7 @@ class PVDataset(Dataset):
                 sat_timefeats = solar_features_encoder(sat_solar_features)
                 sat_dtime = delta_time_encoder(self._satimg_mem["time_dt64"][l:r], time0_utc)
                 sat_timefeats = torch.cat([sat_timefeats, sat_dtime.unsqueeze(1)], dim=1)
-                sat_tensor = self._satimg_mem["images"][l:r].clone()
+                sat_tensor = self._image_window(self._satimg_mem, self.satimg_ds, l, r)
                 exp_t = self.satimg_window_size
                 if sat_tensor.shape[0] > exp_t:
                     sat_tensor = sat_tensor[-exp_t:, ...]
@@ -1036,7 +1108,7 @@ class PVDataset(Dataset):
                 sky_timefeats = solar_features_encoder(sky_solar_features)
                 sky_dtime = delta_time_encoder(self._skyimg_mem["time_dt64"][l:r], time0_utc)
                 sky_timefeats = torch.cat([sky_timefeats, sky_dtime.unsqueeze(1)], dim=1)
-                sky_tensor = self._skyimg_mem["images"][l:r].clone()
+                sky_tensor = self._image_window(self._skyimg_mem, self.skyimg_ds, l, r)
                 exp_t = self.skyimg_window_size
                 if sky_tensor.shape[0] > exp_t:
                     sky_tensor = sky_tensor[-exp_t:, ...]
@@ -1054,13 +1126,7 @@ class PVDataset(Dataset):
                         ],
                         dim=0,
                     )
-                # Append asi_mask as an extra channel [T, C, H, W] -> [T, C+1, H, W]
-                if self.asi_mask is not None:
-                    T = sky_tensor.shape[0]
-                    mask_channel = torch.from_numpy(self.asi_mask).to(sky_tensor.dtype)  # [H, W]
-                    mask_channel = mask_channel.unsqueeze(0).unsqueeze(0).expand(T, 1, -1, -1)  # [T,1,H,W]
-                    sky_tensor = torch.cat([sky_tensor, mask_channel], dim=1)  # [T, C+1, H, W]
-
+                # skimg_tensor stays pure RGB [T, 3, H, W]; validity is sample-level skimg_valid.
                 skimg_valid = torch.tensor(1.0, dtype=torch.float32)
 
         return {
@@ -1506,8 +1572,8 @@ def collate_batched(batch: list[dict]) -> dict:
         "skimg_tensor",
         "skimg_timefeats",
         "skimg_valid",
-        # 4 channels: RGB + asi_mask (appended in _sat_sky_for_sample)
-        default_tensor_shape=(30, 4, 224, 224),
+        # Pure RGB; sample-level validity is skimg_valid_mask [B], not a channel.
+        default_tensor_shape=(30, 3, 224, 224),
         default_time_shape=(30, 9),
     )
     out["skimg_tensor"] = skimg_tensor
@@ -1664,11 +1730,19 @@ def _build_dataset_from_cfg(config_path: Path, split: str, max_files: int | None
         satimg_window_size=int(sampling.get("satimg_window_size", 24)),
         satimg_time_resolution_min=int(sampling.get("satimg_time_resolution_min", 10)),
         satimg_npy_shape_hwc=tuple(sampling.get("satimg_npy_shape_hwc", [100, 100, 3])),
+        sky_sat_load_mode=str(sampling.get("sky_sat_load_mode", "lazy")),
+        use_satellite=bool(sampling.get("use_satellite", True)),
         train_samples_per_csv=int(sampling.get("train_samples_per_csv", 100)),
         kt_noise_std=float(sampling.get("kt_noise_std", 0.01)),
-        train_fraction=float(split_cfg.get("train_fraction", 0.85)),
-        val_fraction=float(split_cfg.get("val_fraction", 0.15)),
-        test_start_bj=str(split_cfg.get("test_start_bj", "2026-05-11 00:00:00")),
+        train_start_bj=(
+            str(split_cfg["train_start_bj"])
+            if split_cfg.get("train_start_bj") not in (None, "")
+            else None
+        ),
+        train_end_bj=str(split_cfg["train_end_bj"]),
+        val_start_bj=str(split_cfg["val_start_bj"]),
+        val_end_bj=str(split_cfg["val_end_bj"]),
+        test_start_bj=str(split_cfg["test_start_bj"]),
         max_files=max_files,
     )
 

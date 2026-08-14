@@ -7,6 +7,8 @@ Quick run examples:
   python training/train_vit_luoyang2026total.py --task 4h --dataset-config conf_luoyang_2026_4h.yaml --config conf_train.yaml
 - 48h task:
   python training/train_vit_luoyang2026total.py --task 48h --dataset-config conf_luoyang_2026_48h.yaml --config conf_train.yaml
+- NWP ablation (zero nwp_tensor / nwp_history / nwp_forecast_history on all splits):
+  python training/train_vit_luoyang2026total.py --no-use-nwp
 """
 
 from __future__ import annotations
@@ -118,6 +120,29 @@ def _batch_to_device(batch: dict, device: torch.device) -> dict:
         else:
             raise TypeError(f"Optional key {key!r} must be torch.Tensor or None, got {type(v).__name__}")
     return out
+
+
+_NWP_ZERO_KEYS = ("nwp_tensor", "nwp_history", "nwp_forecast_history")
+
+
+def _prepare_nwp_for_vit(d: dict, *, use_nwp: bool) -> dict:
+    """
+    Hard NWP ablation after ``_batch_to_device``, before ``forward_vit``.
+
+      * ``use_nwp=True``  -> leave NWP tensors unchanged (dataloader still loads real NWP).
+      * ``use_nwp=False`` -> overwrite ``nwp_tensor``, ``nwp_history``, and
+        ``nwp_forecast_history`` with ``zeros_like`` on every train/eval batch.
+
+    Keep original shape/dtype/device; do not set ``None`` (forward would break).
+    This is not NWP dropout — dropout stays a separate train-time regularizer.
+    """
+    if use_nwp:
+        return d
+    for key in _NWP_ZERO_KEYS:
+        t = d.get(key)
+        if t is not None:
+            d[key] = torch.zeros_like(t)
+    return d
 
 
 def forward_vit(model: nn.Module, d: dict) -> torch.Tensor:
@@ -258,6 +283,7 @@ def train_one_epoch_task(
     task: str,
     max_batches: int | None = None,
     ema: ModelEMA | None = None,
+    use_nwp: bool = True,
 ) -> tuple[float, float, float]:
     model.train()
     total_loss = 0.0
@@ -272,6 +298,7 @@ def train_one_epoch_task(
         if max_batches is not None and batch_idx >= max_batches:
             break
         d = _batch_to_device(batch, device)
+        _prepare_nwp_for_vit(d, use_nwp=use_nwp)
         bsz = int(d["device_id"].size(0))
         optimizer.zero_grad()
         kt_pred = forward_vit(model, d)
@@ -329,6 +356,7 @@ def evaluate_task(
     task: str,
     collect_records: bool = False,
     pv_output_interval_min: int | None = None,
+    use_nwp: bool = True,
 ) -> TaskMetrics | tuple[TaskMetrics, dict[str, np.ndarray]]:
     model.eval()
     total_loss = 0.0
@@ -346,6 +374,7 @@ def evaluate_task(
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
             d = _batch_to_device(batch, device)
+            _prepare_nwp_for_vit(d, use_nwp=use_nwp)
             bsz = int(d["device_id"].size(0))
             kt_pred = forward_vit(model, d)
             pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
@@ -498,8 +527,27 @@ def _build_parser(h: dict, config_default: str, dataset_default: str) -> argpars
     parser.add_argument("--ema-decay", type=float, default=0.99)
     parser.add_argument("--ema-warmup-epochs", type=int, default=5)
     parser.add_argument("--max-files", type=int, default=None)
+    parser.add_argument(
+        "--sky-sat-load-mode",
+        choices=("lazy", "prefetch"),
+        default=None,
+        help="Override dataset YAML sky/satellite image loading strategy",
+    )
+    parser.add_argument("--use-satellite", dest="use_satellite", action="store_true")
+    parser.add_argument("--no-use-satellite", dest="use_satellite", action="store_false")
+    parser.set_defaults(use_satellite=None)
     parser.add_argument("--nwp-dropout-prob", type=float, default=0.0)
     parser.add_argument("--nwp-history-dropout-prob", type=float, default=0.0)
+    parser.add_argument(
+        "--use-nwp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Feed NWP tensors to the model. Default ON. Pass --no-use-nwp to zero "
+            "nwp_tensor, nwp_history, and nwp_forecast_history on every train/eval "
+            "batch (hard ablation; not nwp-dropout-prob)."
+        ),
+    )
     parser.add_argument(
         "--model",
         type=str,
@@ -510,7 +558,14 @@ def _build_parser(h: dict, config_default: str, dataset_default: str) -> argpars
     return parser
 
 
-def _dataset_kwargs(dataset_config_name: str, split: str, max_files: int | None) -> dict:
+def _dataset_kwargs(
+    dataset_config_name: str,
+    split: str,
+    max_files: int | None,
+    *,
+    sky_sat_load_mode_override: str | None = None,
+    use_satellite_override: bool | None = None,
+) -> dict:
     cfg_path = _resolve_named_config(_DATASETS_CONFIG_DIR, dataset_config_name, "dataset-config")
     cfg = _load_yaml(cfg_path)
     paths_cfg = cfg.get("paths", {}) or {}
@@ -529,11 +584,26 @@ def _dataset_kwargs(dataset_config_name: str, split: str, max_files: int | None)
             raise KeyError(f"dataset config sampling.{key} is required (in {cfg_path})")
         return sampling_cfg[key]
 
+    sky_sat_load_mode = (
+        sky_sat_load_mode_override
+        if sky_sat_load_mode_override is not None
+        else str(sampling_cfg.get("sky_sat_load_mode", "lazy"))
+    )
+    use_satellite = (
+        bool(use_satellite_override)
+        if use_satellite_override is not None
+        else bool(sampling_cfg.get("use_satellite", True))
+    )
+    sat_path = _req_path("sat_path") if use_satellite else str(paths_cfg.get("sat_path", ""))
+
+    raw_start = split_cfg.get("train_start_bj")
+    train_start_bj = str(raw_start).strip() if raw_start not in (None, "") else None
+
     return dict(
         config_path=str(cfg_path),
         pv_dir=str((data_dir / _req_path("pv_total_path")).resolve()),
         skyimg_dir=str((data_dir / _req_path("sky_image_path")).resolve()),
-        satimg_dir=str((data_dir / _req_path("sat_path")).resolve()),
+        satimg_dir=str((data_dir / sat_path).resolve()),
         split=split,
         csv_interval_min=int(_req_sampling("csv_interval_min")),
         pv_input_interval_min=int(_req_sampling("pv_input_interval_min")),
@@ -550,10 +620,14 @@ def _dataset_kwargs(dataset_config_name: str, split: str, max_files: int | None)
         satimg_window_size=int(_req_sampling("satimg_window_size")),
         satimg_time_resolution_min=int(_req_sampling("satimg_time_resolution_min")),
         satimg_npy_shape_hwc=tuple(int(x) for x in sampling_cfg.get("satimg_npy_shape_hwc", [100, 100, 3])),
+        sky_sat_load_mode=sky_sat_load_mode,
+        use_satellite=use_satellite,
         train_samples_per_csv=int(sampling_cfg.get("train_samples_per_csv", 1)),
-        train_fraction=float(split_cfg.get("train_fraction", 0.85)),
-        val_fraction=float(split_cfg.get("val_fraction", 0.15)),
-        test_start_bj=str(split_cfg.get("test_start_bj", "2026-05-11 00:00:00")),
+        train_start_bj=train_start_bj,
+        train_end_bj=str(split_cfg["train_end_bj"]),
+        val_start_bj=str(split_cfg["val_start_bj"]),
+        val_end_bj=str(split_cfg["val_end_bj"]),
+        test_start_bj=str(split_cfg["test_start_bj"]),
         max_files=max_files,
     )
 
@@ -577,30 +651,82 @@ def main() -> None:
         f"[startup] task={args.task} config={args.config} dataset_config={args.dataset_config} "
         f"epochs={args.epochs} batch_size={args.batch_size} "
         f"nwp_dropout={args.nwp_dropout_prob} nwp_history_dropout={args.nwp_history_dropout_prob} "
-        f"freeze_tabm={args.freeze_tabm} huber_delta={args.huber_delta}"
+        f"use_nwp={args.use_nwp} freeze_tabm={args.freeze_tabm} huber_delta={args.huber_delta}"
     )
     if args.init_checkpoint and args.resume_checkpoint:
         raise ValueError("Use only one of --init-checkpoint or --resume-checkpoint.")
 
+    dataset_override_kwargs = dict(
+        sky_sat_load_mode_override=args.sky_sat_load_mode,
+        use_satellite_override=args.use_satellite,
+    )
+    train_dataset_kwargs = _dataset_kwargs(
+        args.dataset_config,
+        "train",
+        args.max_files,
+        **dataset_override_kwargs,
+    )
+    selected_load_mode = train_dataset_kwargs["sky_sat_load_mode"]
+    selected_use_satellite = train_dataset_kwargs["use_satellite"]
+    print(
+        f"[startup] sky/sat load: mode={selected_load_mode} "
+        f"sky=enabled-{selected_load_mode} "
+        f"sat={'enabled-' + selected_load_mode if selected_use_satellite else 'disabled'}"
+    )
+    train_start_log = train_dataset_kwargs.get("train_start_bj")
+    if train_start_log:
+        train_win_log = f"[{train_start_log}, {train_dataset_kwargs['train_end_bj']})"
+    else:
+        train_win_log = f"(-inf, {train_dataset_kwargs['train_end_bj']})"
+    print(
+        "[startup] calendar split (BJ, half-open upper bounds): "
+        f"train last_target in {train_win_log}; "
+        f"val first_target in [{train_dataset_kwargs['val_start_bj']}, {train_dataset_kwargs['val_end_bj']}); "
+        f"test first_target >= {train_dataset_kwargs['test_start_bj']}"
+    )
     print("[startup] Building datasets (train/val/test)...")
-    train_dataset = PVDataset(**_dataset_kwargs(args.dataset_config, "train", args.max_files))
+    train_dataset = PVDataset(**train_dataset_kwargs)
     print(f"[startup] train dataset ready: files={len(train_dataset.sample_files)} samples={len(train_dataset)}")
-    val_dataset = PVDataset(**_dataset_kwargs(args.dataset_config, "val", args.max_files))
+    val_dataset = PVDataset(
+        **_dataset_kwargs(
+            args.dataset_config,
+            "val",
+            args.max_files,
+            **dataset_override_kwargs,
+        )
+    )
     print(f"[startup] val dataset ready: files={len(val_dataset.sample_files)} samples={len(val_dataset)}")
-    test_dataset = PVDataset(**_dataset_kwargs(args.dataset_config, "test", args.max_files))
+    test_dataset = PVDataset(
+        **_dataset_kwargs(
+            args.dataset_config,
+            "test",
+            args.max_files,
+            **dataset_override_kwargs,
+        )
+    )
     print(f"[startup] test dataset ready: files={len(test_dataset.sample_files)} samples={len(test_dataset)}")
     dev_dn_list = train_dataset.devDn_list
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_cls = _MODEL_REGISTRY[args.model]
     print(f"[startup] Initializing model/optimizer on device={device}, model={args.model}...")
-    model = model_cls(
-        dev_dn_list=dev_dn_list,
-        nwp_dropout_prob=args.nwp_dropout_prob,
-        nwp_history_dropout_prob=args.nwp_history_dropout_prob,
-        # simvp_in_frames=8,
-        # simvp_img_size=112,
-    ).to(device)
+    # Luoyang 2026total sky is pure RGB (3ch); validity is sample-level skimg_valid_mask.
+    model_kwargs: dict = {
+        "dev_dn_list": dev_dn_list,
+        "nwp_dropout_prob": args.nwp_dropout_prob,
+        "nwp_history_dropout_prob": args.nwp_history_dropout_prob,
+    }
+    model_sig = inspect.signature(model_cls.__init__)
+    if "sky_in_channels" in model_sig.parameters:
+        model_kwargs["sky_in_channels"] = 3
+    if "use_sun_mask" in model_sig.parameters:
+        model_kwargs["use_sun_mask"] = False
+    if "sky_in_channels" in model_kwargs or "use_sun_mask" in model_kwargs:
+        print(
+            f"[startup] sky contract: sky_in_channels={model_kwargs.get('sky_in_channels', 'n/a')} "
+            f"use_sun_mask={model_kwargs.get('use_sun_mask', 'n/a')}"
+        )
+    model = model_cls(**model_kwargs).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -728,12 +854,17 @@ def main() -> None:
             task=args.task,
             max_batches=args.train_max_batches_per_epoch,
             ema=ema if ema_active else None,
+            use_nwp=args.use_nwp,
         )
         if ema_active:
             with ema.apply(model):
-                val_metrics = evaluate_task(model, device, val_loader, criterion, task=args.task)
+                val_metrics = evaluate_task(
+                    model, device, val_loader, criterion, task=args.task, use_nwp=args.use_nwp
+                )
         else:
-            val_metrics = evaluate_task(model, device, val_loader, criterion, task=args.task)
+            val_metrics = evaluate_task(
+                model, device, val_loader, criterion, task=args.task, use_nwp=args.use_nwp
+            )
         scheduler.step()
 
         print(
@@ -817,6 +948,7 @@ def main() -> None:
             task=args.task,
             collect_records=True,
             pv_output_interval_min=test_dataset.pv_output_interval_min,
+            use_nwp=args.use_nwp,
         )
         print(
             f"{tag.capitalize()} checkpoint ({ckpt_path.name}, epoch={ckpt.get('epoch', '?')}): "
