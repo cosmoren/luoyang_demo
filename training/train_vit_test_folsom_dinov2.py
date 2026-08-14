@@ -74,8 +74,9 @@ _VIT_DINOV2_NWP_MSL_SLOT = 1
 _VIT_DINOV2_NWP_T2M_SLOT = 2
 _VIT_DINOV2_NWP_U10_SLOT = 3
 # Folsom pressure (~1e5 Pa) → near [-1, +1] before the query MLP MSL slot.
-_FOLSOM_NWP_PRESSURE_NORM_CENTER = 100500.0
-_FOLSOM_NWP_PRESSURE_NORM_SCALE = 500.0
+# Temporarily unused: pressure scale is disabled; raw Pa is passed through.
+# _FOLSOM_NWP_PRESSURE_NORM_CENTER = 100500.0
+# _FOLSOM_NWP_PRESSURE_NORM_SCALE = 500.0
 # Optional override for train/eval loss+metrics horizon (first N forecast steps).
 # ``None`` = use ``sampling.pv_output_len`` from the dataset config (default). Set an int
 # to score loss on fewer steps while keeping full model ``T_out``.
@@ -89,7 +90,8 @@ def remap_nwp_tensor_for_pv_vit_dinov2(nwp_tensor: torch.Tensor) -> torch.Tensor
 
     Folsom ``_interpolate_nwp`` stacks ``_FOLSOM_NWP_FEATURE_COLS`` then appends an invalid
     mask. The model reads Luoyang slots ``0=ssrd``, ``1=msl``, ``2=t2m``, ``3=u10``. This helper
-    reorders/copies values and normalizes pressure as ``(x - 100500) / 500`` into the MSL slot;
+    reorders/copies values into the MSL slot. Pressure scale ``(x - 100500) / 500`` is
+    temporarily disabled; raw Folsom pressure (Pa) is passed through like Luoyang raw msl;
     unused Folsom feature cols and the trailing mask stay as-is.
     """
     if nwp_tensor.ndim != 3:
@@ -101,9 +103,11 @@ def remap_nwp_tensor_for_pv_vit_dinov2(nwp_tensor: torch.Tensor) -> torch.Tensor
         )
     out = nwp_tensor.clone()
     out[:, :, _VIT_DINOV2_NWP_SSRD_SLOT] = nwp_tensor[:, :, _FOLSOM_NWP_DWSW_INDEX]
-    out[:, :, _VIT_DINOV2_NWP_MSL_SLOT] = (
-        nwp_tensor[:, :, _FOLSOM_NWP_PRESSURE_INDEX] - _FOLSOM_NWP_PRESSURE_NORM_CENTER
-    ) / _FOLSOM_NWP_PRESSURE_NORM_SCALE
+    # Pressure scale temporarily disabled: pass raw Folsom Pa into the MSL slot (like Luoyang raw msl).
+    # out[:, :, _VIT_DINOV2_NWP_MSL_SLOT] = (
+    #     nwp_tensor[:, :, _FOLSOM_NWP_PRESSURE_INDEX] - _FOLSOM_NWP_PRESSURE_NORM_CENTER
+    # ) / _FOLSOM_NWP_PRESSURE_NORM_SCALE
+    out[:, :, _VIT_DINOV2_NWP_MSL_SLOT] = nwp_tensor[:, :, _FOLSOM_NWP_PRESSURE_INDEX]
     out[:, :, _VIT_DINOV2_NWP_T2M_SLOT] = nwp_tensor[:, :, _FOLSOM_NWP_TEMPERATURE_INDEX]
     out[:, :, _VIT_DINOV2_NWP_U10_SLOT] = nwp_tensor[:, :, _FOLSOM_NWP_WIND_U_INDEX]
     return out
@@ -172,7 +176,7 @@ def _prepare_nwp_for_vit(d: dict, *, use_nwp: bool) -> dict:
 def _prepare_sky_for_vit(d: dict, *, zero_sky: bool) -> dict:
     """
     Optionally zero sky tensors after ``_batch_to_device`` so the ViT sees no sky signal while the
-    dataloader still loads real Zarr/JPEG (avoids bogus paths). Matches the model branch for
+    dataloader still loads real Zarr skies (avoids bogus paths). Matches the model branch for
     ``skimg_tensor.max() == 0`` (see ``pv_forecasting_model_vit_imgs``).
     """
     if not zero_sky:
@@ -553,7 +557,7 @@ def _build_parser(h: dict, config_default: str) -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "After each batch is on device, replace sky image tensors (and sky time features) with "
-            "zeros so the ViT uses the empty-sky branch while the dataset still loads real Zarr/JPEG. "
+            "zeros so the ViT uses the empty-sky branch while the dataset still loads real Zarr skies. "
             "Use for PV+NWP vs PV+NWP+sky comparisons (NWP is on by default)."
         ),
     )
@@ -745,7 +749,6 @@ def _dataset_kwargs(
         pv_input_len=int(_req_sampling("pv_input_len")),
         pv_output_interval_min=int(_req_sampling("pv_output_interval_min")),
         pv_output_len=int(_req_sampling("pv_output_len")),
-        pv_train_time_fraction=float(sampling_cfg.get("pv_train_time_fraction", 0.7)),
         test_anchor_stride_min=int(_req_sampling("test_anchor_stride_min")),
         val_anchor_stride_min=int(_req_sampling("val_anchor_stride_min")),
         test_collect_time_match_tolerance_min=int(sampling_cfg.get("test_collect_time_match_tolerance_min", 0)),
@@ -753,7 +756,6 @@ def _dataset_kwargs(
         val_split=float(sampling_cfg.get("val_split", 0.18)),
         test_split=float(sampling_cfg.get("test_split", 0.16)),
         skyimg_window_size=int(_req_sampling("skyimg_window_size")),
-        skyimg_time_resolution_min=int(_req_sampling("skyimg_time_resolution_min")),
         skyimg_spatial_size=int(_req_sampling("skyimg_spatial_size")),
         satimg_window_size=int(_req_sampling("satimg_window_size")),
         satimg_time_resolution_min=int(_req_sampling("satimg_time_resolution_min")),

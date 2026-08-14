@@ -23,47 +23,12 @@ from modules.SkyEncoder import (
 )
 from modules.SkyCompressor import SkyTwoStageCompressor
 from modules.SimVPEncoder import SimVPFeatureExtractor
-from dataloader.folsom import _FOLSOM_NWP_FEATURE_COLS
 from .timesformer import TimeSformerFeatureExtractor, TimesformerConfig
 import logging
 import os
 import contextlib
 import io
 
-
-# Per-feature normalizers applied to columns of ``nwp_tensor`` in
-# ``pv_forecasting_model_vit_imgs``. Order-agnostic dispatch: the column index for
-# each feature comes from ``_FOLSOM_NWP_FEATURE_COLS`` (see ``dataloader/folsom.py``);
-# the trainer feeds the raw tensor (no channel remap), and the model loops over the
-# resolved ``self.nwp_features`` list applying these closures in feature order.
-#
-# Constants (data-fit, post-refactor; ``temperature`` differs from the pre-refactor
-# ``(t - 288.15) / 10`` to match the merged Folsom NWP distribution):
-#   * dwsw          (W/m^2): (x/1000 - 0.5) * 2 -> ~[-1, +1.5] at peak sun
-#   * cloud_cover   (%)    : (x - 50)/50         -> [-1, +1]
-#   * precipitation (mm/h) : log1p(x.clamp(>=0))/3 -> ~[0, 2] for typical events
-#   * pressure      (Pa)   : (x - 100500)/500    -> roughly [-3, +3]
-#   * wind-u/wind-v (m/s)  : x / 5
-#   * temperature   (K)    : (x - 295)/12        -> ~[-2, +2] across Folsom annual range
-#   * rel_humidity  (%)    : (x - 50)/50         -> [-1, +1]
-#
-# The trailing invalid-mask channel (``nwp_tensor[:, :, -1]``) is passed through as-is
-# when ``use_invalid_mask`` is set on the model.
-NWP_FEATURE_NORMALIZERS = {
-    "dwsw":          lambda x: (x / 1000.0 - 0.5) * 2.0,
-    "cloud_cover":   lambda x: (x - 50.0) / 50.0,
-    "precipitation": lambda x: torch.log1p(x.clamp(min=0)) / 3.0,
-    "pressure":      lambda x: (x - 100500.0) / 500.0,
-    "wind-u":        lambda x: x / 5.0,
-    "wind-v":        lambda x: x / 5.0,
-    "temperature":   lambda x: (x - 295.0) / 12.0,
-    "rel_humidity":  lambda x: (x - 50.0) / 50.0,
-}
-# Sanity: every canonical NWP feature must have a normalizer.
-assert set(NWP_FEATURE_NORMALIZERS) == set(_FOLSOM_NWP_FEATURE_COLS), (
-    "NWP_FEATURE_NORMALIZERS and _FOLSOM_NWP_FEATURE_COLS must cover the same features: "
-    f"normalizers={sorted(NWP_FEATURE_NORMALIZERS)} vs feature_cols={sorted(_FOLSOM_NWP_FEATURE_COLS)}"
-)
 
 class TemporalCNN1d(nn.Module):
     """
@@ -562,25 +527,12 @@ class pv_forecasting_model_vit_nwp_short(nn.Module):
 
 
 
-# Default per-feature NWP selection for ``pv_forecasting_model_vit_imgs``. Matches the
-# post-refactor "minimal" preset and the pre-refactor hardcoded behaviour (which fed
-# ssrd-like + temperature-like channels through ``query_mlp``); used as the legacy
-# default when an older checkpoint does not record ``nwp_features``.
-_DEFAULT_VIT_IMGS_NWP_FEATURES: tuple[str, ...] = ("dwsw", "temperature")
-_DEFAULT_VIT_IMGS_NWP_USE_INVALID_MASK: bool = False
-
-
 # Using PV history and NWP to forecast PV, solar features and NWP features are used as query
 class pv_forecasting_model_vit_imgs(nn.Module):
     """
     Like ``pv_forecasting_model_vit_nwp`` but satellite frames go through
     :func:`modules.SatEncoder.patchify_spatiotemporal_images` and
     :class:`modules.SatEncoder.AlternatingIntraInterFrameAttention`, then cross-attend into the forecast query.
-
-    NWP forecast-query channels are configurable: ``nwp_features`` selects which columns
-    of ``_FOLSOM_NWP_FEATURE_COLS`` to read from ``nwp_tensor`` (each normalised via
-    :data:`NWP_FEATURE_NORMALIZERS`), and ``use_invalid_mask`` toggles passing the trailing
-    per-step invalid mask channel (``nwp_tensor[:, :, -1]``) through as-is.
     """
 
     def __init__(
@@ -588,8 +540,6 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         use_batchnorm: bool = True,
         dropout: float = 0.0,
         dev_dn_list: Optional[list] = None,
-        nwp_features: Optional[list[str]] = None,
-        use_invalid_mask: bool = _DEFAULT_VIT_IMGS_NWP_USE_INVALID_MASK,
         nwp_dropout_prob: float = 0.0,
         nwp_history_dropout_prob: float = 0.0,
         # Folsom Zarr RGB+image_valid = 4 (knobs off). Trainer must pass dataset.sky_in_channels.
@@ -603,29 +553,10 @@ class pv_forecasting_model_vit_imgs(nn.Module):
             raise ValueError(f"sky_in_channels must be >= 1, got {sky_in_channels}")
         self.sky_in_channels = int(sky_in_channels)
 
-        if nwp_features is None:
-            nwp_features = list(_DEFAULT_VIT_IMGS_NWP_FEATURES)
-        nwp_features = list(nwp_features)
-        unknown = [n for n in nwp_features if n not in NWP_FEATURE_NORMALIZERS]
-        if unknown:
-            raise ValueError(
-                f"Unknown NWP feature(s) {unknown}; valid features are "
-                f"{sorted(NWP_FEATURE_NORMALIZERS)}"
-            )
-        dupes = [n for n in nwp_features if nwp_features.count(n) > 1]
-        if dupes:
-            raise ValueError(f"Duplicate NWP feature(s) in nwp_features: {sorted(set(dupes))}")
-        self.nwp_features: list[str] = nwp_features
-        self.use_invalid_mask: bool = bool(use_invalid_mask)
         self.nwp_dropout_prob: float = max(0.0, min(1.0, float(nwp_dropout_prob)))
         self.nwp_history_dropout_prob: float = max(
             0.0, min(1.0, float(nwp_history_dropout_prob))
         )
-        # Pre-resolve column indices in ``nwp_tensor`` (last dim = 8 features + 1 mask).
-        self._nwp_feature_indices: list[int] = [
-            _FOLSOM_NWP_FEATURE_COLS.index(name) for name in self.nwp_features
-        ]
-        # Forecast-query input dim = 3 time feats + N NWP features (+ 1 if mask passed through).
         query_mlp_in_dim = 3 + 4
 
         dim = 64
@@ -998,8 +929,6 @@ class pv_forecasting_model_vit_dinov2(nn.Module):
         use_batchnorm: bool = True,
         dropout: float = 0.0,
         dev_dn_list: Optional[list] = None,
-        nwp_features: Optional[list[str]] = None,
-        use_invalid_mask: bool = _DEFAULT_VIT_IMGS_NWP_USE_INVALID_MASK,
         nwp_dropout_prob: float = 0.0,
         nwp_history_dropout_prob: float = 0.0,
         dinov2_model_name: str = "dinov2_vits14",
@@ -1021,29 +950,10 @@ class pv_forecasting_model_vit_dinov2(nn.Module):
                 f"use_sun_mask={self.use_sun_mask}, got {self.sky_in_channels}"
             )
 
-        if nwp_features is None:
-            nwp_features = list(_DEFAULT_VIT_IMGS_NWP_FEATURES)
-        nwp_features = list(nwp_features)
-        unknown = [n for n in nwp_features if n not in NWP_FEATURE_NORMALIZERS]
-        if unknown:
-            raise ValueError(
-                f"Unknown NWP feature(s) {unknown}; valid features are "
-                f"{sorted(NWP_FEATURE_NORMALIZERS)}"
-            )
-        dupes = [n for n in nwp_features if nwp_features.count(n) > 1]
-        if dupes:
-            raise ValueError(f"Duplicate NWP feature(s) in nwp_features: {sorted(set(dupes))}")
-        self.nwp_features: list[str] = nwp_features
-        self.use_invalid_mask: bool = bool(use_invalid_mask)
         self.nwp_dropout_prob: float = max(0.0, min(1.0, float(nwp_dropout_prob)))
         self.nwp_history_dropout_prob: float = max(
             0.0, min(1.0, float(nwp_history_dropout_prob))
         )
-        # Pre-resolve column indices in ``nwp_tensor`` (last dim = 8 features + 1 mask).
-        self._nwp_feature_indices: list[int] = [
-            _FOLSOM_NWP_FEATURE_COLS.index(name) for name in self.nwp_features
-        ]
-        # Forecast-query input dim = 3 time feats + N NWP features (+ 1 if mask passed through).
         query_mlp_in_dim = 3 + 4
 
         dim = 64
@@ -1458,8 +1368,6 @@ class pv_forecasting_model_vit_pvb(nn.Module):
         use_batchnorm: bool = True,
         dropout: float = 0.1,
         dev_dn_list: Optional[list] = None,
-        nwp_features: Optional[list[str]] = None,
-        use_invalid_mask: bool = _DEFAULT_VIT_IMGS_NWP_USE_INVALID_MASK,
         nwp_dropout_prob: float = 0.0,
         nwp_history_dropout_prob: float = 0.0,
     ):
@@ -1468,27 +1376,10 @@ class pv_forecasting_model_vit_pvb(nn.Module):
         self.use_batchnorm = use_batchnorm
         self.dropout = dropout
 
-        if nwp_features is None:
-            nwp_features = list(_DEFAULT_VIT_IMGS_NWP_FEATURES)
-        nwp_features = list(nwp_features)
-        unknown = [n for n in nwp_features if n not in NWP_FEATURE_NORMALIZERS]
-        if unknown:
-            raise ValueError(
-                f"Unknown NWP feature(s) {unknown}; valid features are "
-                f"{sorted(NWP_FEATURE_NORMALIZERS)}"
-            )
-        dupes = [n for n in nwp_features if nwp_features.count(n) > 1]
-        if dupes:
-            raise ValueError(f"Duplicate NWP feature(s) in nwp_features: {sorted(set(dupes))}")
-        self.nwp_features: list[str] = nwp_features
-        self.use_invalid_mask: bool = bool(use_invalid_mask)
         self.nwp_dropout_prob: float = max(0.0, min(1.0, float(nwp_dropout_prob)))
         self.nwp_history_dropout_prob: float = max(
             0.0, min(1.0, float(nwp_history_dropout_prob))
         )
-        self._nwp_feature_indices: list[int] = [
-            _FOLSOM_NWP_FEATURE_COLS.index(name) for name in self.nwp_features
-        ]
         query_mlp_in_dim = 3 + 4
 
         dim = 64
@@ -1685,8 +1576,6 @@ class pv_forecasting_model_vit_simvp(nn.Module):
         use_batchnorm: bool = True,
         dropout: float = 0.1,
         dev_dn_list: Optional[list] = None,
-        nwp_features: Optional[list[str]] = None,
-        use_invalid_mask: bool = _DEFAULT_VIT_IMGS_NWP_USE_INVALID_MASK,
         nwp_dropout_prob: float = 0.0,
         nwp_history_dropout_prob: float = 0.0,
         simvp_in_frames: int = 8,
@@ -1705,27 +1594,10 @@ class pv_forecasting_model_vit_simvp(nn.Module):
         self.simvp_in_frames: int = int(simvp_in_frames)
         self.simvp_img_size: Optional[int] = int(simvp_img_size) if simvp_img_size is not None else None
 
-        if nwp_features is None:
-            nwp_features = list(_DEFAULT_VIT_IMGS_NWP_FEATURES)
-        nwp_features = list(nwp_features)
-        unknown = [n for n in nwp_features if n not in NWP_FEATURE_NORMALIZERS]
-        if unknown:
-            raise ValueError(
-                f"Unknown NWP feature(s) {unknown}; valid features are "
-                f"{sorted(NWP_FEATURE_NORMALIZERS)}"
-            )
-        dupes = [n for n in nwp_features if nwp_features.count(n) > 1]
-        if dupes:
-            raise ValueError(f"Duplicate NWP feature(s) in nwp_features: {sorted(set(dupes))}")
-        self.nwp_features: list[str] = nwp_features
-        self.use_invalid_mask: bool = bool(use_invalid_mask)
         self.nwp_dropout_prob: float = max(0.0, min(1.0, float(nwp_dropout_prob)))
         self.nwp_history_dropout_prob: float = max(
             0.0, min(1.0, float(nwp_history_dropout_prob))
         )
-        self._nwp_feature_indices: list[int] = [
-            _FOLSOM_NWP_FEATURE_COLS.index(name) for name in self.nwp_features
-        ]
         query_mlp_in_dim = 3 + 4
 
         dim = 64
@@ -1945,11 +1817,6 @@ class pv_forecasting_model_tabm_FiLM(nn.Module):
     Like ``pv_forecasting_model_vit_nwp`` but satellite frames go through
     :func:`modules.SatEncoder.patchify_spatiotemporal_images` and
     :class:`modules.SatEncoder.AlternatingIntraInterFrameAttention`, then cross-attend into the forecast query.
-
-    NWP forecast-query channels are configurable: ``nwp_features`` selects which columns
-    of ``_FOLSOM_NWP_FEATURE_COLS`` to read from ``nwp_tensor`` (each normalised via
-    :data:`NWP_FEATURE_NORMALIZERS`), and ``use_invalid_mask`` toggles passing the trailing
-    per-step invalid mask channel (``nwp_tensor[:, :, -1]``) through as-is.
     """
 
     def __init__(
@@ -1957,8 +1824,6 @@ class pv_forecasting_model_tabm_FiLM(nn.Module):
         use_batchnorm: bool = True,
         dropout: float = 0.0,
         dev_dn_list: Optional[list] = None,
-        nwp_features: Optional[list[str]] = None,
-        use_invalid_mask: bool = _DEFAULT_VIT_IMGS_NWP_USE_INVALID_MASK,
         nwp_dropout_prob: float = 0.0,
         nwp_history_dropout_prob: float = 0.0,
     ):
@@ -1967,29 +1832,10 @@ class pv_forecasting_model_tabm_FiLM(nn.Module):
         self.use_batchnorm = use_batchnorm
         self.dropout = dropout
 
-        if nwp_features is None:
-            nwp_features = list(_DEFAULT_VIT_IMGS_NWP_FEATURES)
-        nwp_features = list(nwp_features)
-        unknown = [n for n in nwp_features if n not in NWP_FEATURE_NORMALIZERS]
-        if unknown:
-            raise ValueError(
-                f"Unknown NWP feature(s) {unknown}; valid features are "
-                f"{sorted(NWP_FEATURE_NORMALIZERS)}"
-            )
-        dupes = [n for n in nwp_features if nwp_features.count(n) > 1]
-        if dupes:
-            raise ValueError(f"Duplicate NWP feature(s) in nwp_features: {sorted(set(dupes))}")
-        self.nwp_features: list[str] = nwp_features
-        self.use_invalid_mask: bool = bool(use_invalid_mask)
         self.nwp_dropout_prob: float = max(0.0, min(1.0, float(nwp_dropout_prob)))
         self.nwp_history_dropout_prob: float = max(
             0.0, min(1.0, float(nwp_history_dropout_prob))
         )
-        # Pre-resolve column indices in ``nwp_tensor`` (last dim = 8 features + 1 mask).
-        self._nwp_feature_indices: list[int] = [
-            _FOLSOM_NWP_FEATURE_COLS.index(name) for name in self.nwp_features
-        ]
-        # Forecast-query input dim = 3 time feats + N NWP features (+ 1 if mask passed through).
         query_mlp_in_dim = 3 + 4
 
         dim = 64
@@ -2375,11 +2221,6 @@ class pv_forecasting_model_vit_gate(nn.Module):
     Like ``pv_forecasting_model_vit_nwp`` but satellite frames go through
     :func:`modules.SatEncoder.patchify_spatiotemporal_images` and
     :class:`modules.SatEncoder.AlternatingIntraInterFrameAttention`, then cross-attend into the forecast query.
-
-    NWP forecast-query channels are configurable: ``nwp_features`` selects which columns
-    of ``_FOLSOM_NWP_FEATURE_COLS`` to read from ``nwp_tensor`` (each normalised via
-    :data:`NWP_FEATURE_NORMALIZERS`), and ``use_invalid_mask`` toggles passing the trailing
-    per-step invalid mask channel (``nwp_tensor[:, :, -1]``) through as-is.
     """
 
     def __init__(
@@ -2387,8 +2228,6 @@ class pv_forecasting_model_vit_gate(nn.Module):
         use_batchnorm: bool = True,
         dropout: float = 0.0,
         dev_dn_list: Optional[list] = None,
-        nwp_features: Optional[list[str]] = None,
-        use_invalid_mask: bool = _DEFAULT_VIT_IMGS_NWP_USE_INVALID_MASK,
         nwp_dropout_prob: float = 0.0,
         nwp_history_dropout_prob: float = 0.0,
     ):
@@ -2397,29 +2236,10 @@ class pv_forecasting_model_vit_gate(nn.Module):
         self.use_batchnorm = use_batchnorm
         self.dropout = dropout
 
-        if nwp_features is None:
-            nwp_features = list(_DEFAULT_VIT_IMGS_NWP_FEATURES)
-        nwp_features = list(nwp_features)
-        unknown = [n for n in nwp_features if n not in NWP_FEATURE_NORMALIZERS]
-        if unknown:
-            raise ValueError(
-                f"Unknown NWP feature(s) {unknown}; valid features are "
-                f"{sorted(NWP_FEATURE_NORMALIZERS)}"
-            )
-        dupes = [n for n in nwp_features if nwp_features.count(n) > 1]
-        if dupes:
-            raise ValueError(f"Duplicate NWP feature(s) in nwp_features: {sorted(set(dupes))}")
-        self.nwp_features: list[str] = nwp_features
-        self.use_invalid_mask: bool = bool(use_invalid_mask)
         self.nwp_dropout_prob: float = max(0.0, min(1.0, float(nwp_dropout_prob)))
         self.nwp_history_dropout_prob: float = max(
             0.0, min(1.0, float(nwp_history_dropout_prob))
         )
-        # Pre-resolve column indices in ``nwp_tensor`` (last dim = 8 features + 1 mask).
-        self._nwp_feature_indices: list[int] = [
-            _FOLSOM_NWP_FEATURE_COLS.index(name) for name in self.nwp_features
-        ]
-        # Forecast-query input dim = 3 time feats + N NWP features (+ 1 if mask passed through).
         query_mlp_in_dim = 3 + 4
 
         dim = 64
