@@ -9,6 +9,8 @@ Quick run examples:
   python training/train_vit_luoyang2026total.py --task 48h --dataset-config conf_luoyang_2026_48h.yaml --config conf_train.yaml
 - NWP ablation (zero nwp_tensor / nwp_history / nwp_forecast_history on all splits):
   python training/train_vit_luoyang2026total.py --no-use-nwp
+- Sky ablation (zero skimg_tensor / skimg_timefeats / skimg_valid_mask on all splits):
+  python training/train_vit_luoyang2026total.py --zero-sky
 """
 
 from __future__ import annotations
@@ -123,6 +125,7 @@ def _batch_to_device(batch: dict, device: torch.device) -> dict:
 
 
 _NWP_ZERO_KEYS = ("nwp_tensor", "nwp_history", "nwp_forecast_history")
+_SKY_ZERO_KEYS = ("skimg_tensor", "skimg_timefeats", "skimg_valid_mask")
 
 
 def _prepare_nwp_for_vit(d: dict, *, use_nwp: bool) -> dict:
@@ -139,6 +142,26 @@ def _prepare_nwp_for_vit(d: dict, *, use_nwp: bool) -> dict:
     if use_nwp:
         return d
     for key in _NWP_ZERO_KEYS:
+        t = d.get(key)
+        if t is not None:
+            d[key] = torch.zeros_like(t)
+    return d
+
+
+def _prepare_sky_for_vit(d: dict, *, zero_sky: bool) -> dict:
+    """
+    Hard sky ablation after ``_batch_to_device``, before ``forward_vit``.
+
+      * ``zero_sky=False`` -> leave sky tensors unchanged.
+      * ``zero_sky=True``  -> overwrite ``skimg_tensor``, ``skimg_timefeats``, and
+        ``skimg_valid_mask`` with ``zeros_like`` on every train/eval batch.
+
+    Zeroed ``skimg_tensor`` hits the model ``max()==0`` skip path; zeroing the
+    valid mask also makes logged ``skimg_avail`` reflect the ablation.
+    """
+    if not zero_sky:
+        return d
+    for key in _SKY_ZERO_KEYS:
         t = d.get(key)
         if t is not None:
             d[key] = torch.zeros_like(t)
@@ -284,6 +307,7 @@ def train_one_epoch_task(
     max_batches: int | None = None,
     ema: ModelEMA | None = None,
     use_nwp: bool = True,
+    zero_sky: bool = False,
 ) -> tuple[float, float, float]:
     model.train()
     total_loss = 0.0
@@ -299,6 +323,7 @@ def train_one_epoch_task(
             break
         d = _batch_to_device(batch, device)
         _prepare_nwp_for_vit(d, use_nwp=use_nwp)
+        _prepare_sky_for_vit(d, zero_sky=zero_sky)
         bsz = int(d["device_id"].size(0))
         optimizer.zero_grad()
         kt_pred = forward_vit(model, d)
@@ -357,6 +382,7 @@ def evaluate_task(
     collect_records: bool = False,
     pv_output_interval_min: int | None = None,
     use_nwp: bool = True,
+    zero_sky: bool = False,
 ) -> TaskMetrics | tuple[TaskMetrics, dict[str, np.ndarray]]:
     model.eval()
     total_loss = 0.0
@@ -375,6 +401,7 @@ def evaluate_task(
         for batch_idx, batch in enumerate(loader):
             d = _batch_to_device(batch, device)
             _prepare_nwp_for_vit(d, use_nwp=use_nwp)
+            _prepare_sky_for_vit(d, zero_sky=zero_sky)
             bsz = int(d["device_id"].size(0))
             kt_pred = forward_vit(model, d)
             pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
@@ -549,6 +576,16 @@ def _build_parser(h: dict, config_default: str, dataset_default: str) -> argpars
         ),
     )
     parser.add_argument(
+        "--zero-sky",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Hard sky ablation. Default OFF. Pass --zero-sky to zero skimg_tensor, "
+            "skimg_timefeats, and skimg_valid_mask on every train/eval batch "
+            "(dataloader still opens sky zarr; model sees no sky signal)."
+        ),
+    )
+    parser.add_argument(
         "--model",
         type=str,
         default="pv_forecasting_model_vit_imgs",
@@ -651,7 +688,8 @@ def main() -> None:
         f"[startup] task={args.task} config={args.config} dataset_config={args.dataset_config} "
         f"epochs={args.epochs} batch_size={args.batch_size} "
         f"nwp_dropout={args.nwp_dropout_prob} nwp_history_dropout={args.nwp_history_dropout_prob} "
-        f"use_nwp={args.use_nwp} freeze_tabm={args.freeze_tabm} huber_delta={args.huber_delta}"
+        f"use_nwp={args.use_nwp} zero_sky={args.zero_sky} freeze_tabm={args.freeze_tabm} "
+        f"huber_delta={args.huber_delta}"
     )
     if args.init_checkpoint and args.resume_checkpoint:
         raise ValueError("Use only one of --init-checkpoint or --resume-checkpoint.")
@@ -855,15 +893,28 @@ def main() -> None:
             max_batches=args.train_max_batches_per_epoch,
             ema=ema if ema_active else None,
             use_nwp=args.use_nwp,
+            zero_sky=args.zero_sky,
         )
         if ema_active:
             with ema.apply(model):
                 val_metrics = evaluate_task(
-                    model, device, val_loader, criterion, task=args.task, use_nwp=args.use_nwp
+                    model,
+                    device,
+                    val_loader,
+                    criterion,
+                    task=args.task,
+                    use_nwp=args.use_nwp,
+                    zero_sky=args.zero_sky,
                 )
         else:
             val_metrics = evaluate_task(
-                model, device, val_loader, criterion, task=args.task, use_nwp=args.use_nwp
+                model,
+                device,
+                val_loader,
+                criterion,
+                task=args.task,
+                use_nwp=args.use_nwp,
+                zero_sky=args.zero_sky,
             )
         scheduler.step()
 
@@ -949,6 +1000,7 @@ def main() -> None:
             collect_records=True,
             pv_output_interval_min=test_dataset.pv_output_interval_min,
             use_nwp=args.use_nwp,
+            zero_sky=args.zero_sky,
         )
         print(
             f"{tag.capitalize()} checkpoint ({ckpt_path.name}, epoch={ckpt.get('epoch', '?')}): "
