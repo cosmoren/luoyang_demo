@@ -507,6 +507,15 @@ def _build_parser(h: dict, config_default: str, dataset_default: str) -> argpars
         choices=list(_MODEL_REGISTRY),
         help="Model class name to instantiate",
     )
+    parser.add_argument(
+        "--vjepa-hf-repo",
+        type=str,
+        default=None,
+        help=(
+            "HF repo id or local path for V-JEPA encoder "
+            "(only used by pv_forecasting_model_vit_vjepa)"
+        ),
+    )
     return parser
 
 
@@ -594,13 +603,19 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_cls = _MODEL_REGISTRY[args.model]
     print(f"[startup] Initializing model/optimizer on device={device}, model={args.model}...")
-    model = model_cls(
+    model_kwargs = dict(
         dev_dn_list=dev_dn_list,
         nwp_dropout_prob=args.nwp_dropout_prob,
         nwp_history_dropout_prob=args.nwp_history_dropout_prob,
-        # simvp_in_frames=8,
-        # simvp_img_size=112,
-    ).to(device)
+    )
+    if args.vjepa_hf_repo:
+        if args.model != "pv_forecasting_model_vit_vjepa":
+            raise ValueError(
+                "--vjepa-hf-repo is only valid with --model pv_forecasting_model_vit_vjepa"
+            )
+        model_kwargs["vjepa_hf_repo"] = args.vjepa_hf_repo
+        print(f"[startup] vjepa_hf_repo={args.vjepa_hf_repo}")
+    model = model_cls(**model_kwargs).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,

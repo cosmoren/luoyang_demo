@@ -974,6 +974,436 @@ class pv_forecasting_model_vit_imgs(nn.Module):
         return kt.squeeze(-1)
 
 
+class pv_forecasting_model_vit_vjepa(nn.Module):
+    """
+    Like ``pv_forecasting_model_vit_imgs``, but both sky and satellite features come from
+    separate HuggingFace V-JEPA 2.0 encoders (default: ViT-L/16 @ 256 each).
+
+    Sat/sky tokens are linearly projected to 64-d (separate proj heads) and concatenated
+    into ``hist_mem_compressed`` for cross-attention (no Conv compressors).
+
+    NWP forecast-query channels are configurable: ``nwp_features`` selects which columns
+    of ``_FOLSOM_NWP_FEATURE_COLS`` to read from ``nwp_tensor`` (each normalised via
+    :data:`NWP_FEATURE_NORMALIZERS`), and ``use_invalid_mask`` toggles passing the trailing
+    per-step invalid mask channel (``nwp_tensor[:, :, -1]``) through as-is.
+    """
+
+    # Smallest official V-JEPA 2.0 HF checkpoint (no ViT-B release for 2.0).
+    _VJEPA_HF_REPO = "facebook/vjepa2-vitl-fpc64-256"
+    _VJEPA_IMAGE_SIZE = 256
+
+    def __init__(
+        self,
+        use_batchnorm: bool = True,
+        dropout: float = 0.0,
+        dev_dn_list: Optional[list] = None,
+        nwp_features: Optional[list[str]] = None,
+        use_invalid_mask: bool = _DEFAULT_VIT_IMGS_NWP_USE_INVALID_MASK,
+        nwp_dropout_prob: float = 0.0,
+        nwp_history_dropout_prob: float = 0.0,
+        sky_in_channels: int = 4,
+        vjepa_hf_repo: str = _VJEPA_HF_REPO,
+        vjepa_image_size: int = _VJEPA_IMAGE_SIZE,
+        vjepa_freeze: bool = True,
+    ):
+        super().__init__()
+
+        self.use_batchnorm = use_batchnorm
+        self.dropout = dropout
+        if sky_in_channels < 1:
+            raise ValueError(f"sky_in_channels must be >= 1, got {sky_in_channels}")
+        self.sky_in_channels = int(sky_in_channels)
+        self.vjepa_hf_repo = str(vjepa_hf_repo)
+        self.vjepa_image_size = int(vjepa_image_size)
+        self.vjepa_freeze = bool(vjepa_freeze)
+        self.last_vjepa_sky_tokens: Optional[torch.Tensor] = None
+        self.last_vjepa_sat_tokens: Optional[torch.Tensor] = None
+
+        if nwp_features is None:
+            nwp_features = list(_DEFAULT_VIT_IMGS_NWP_FEATURES)
+        nwp_features = list(nwp_features)
+        unknown = [n for n in nwp_features if n not in NWP_FEATURE_NORMALIZERS]
+        if unknown:
+            raise ValueError(
+                f"Unknown NWP feature(s) {unknown}; valid features are "
+                f"{sorted(NWP_FEATURE_NORMALIZERS)}"
+            )
+        dupes = [n for n in nwp_features if nwp_features.count(n) > 1]
+        if dupes:
+            raise ValueError(f"Duplicate NWP feature(s) in nwp_features: {sorted(set(dupes))}")
+        self.nwp_features: list[str] = nwp_features
+        self.use_invalid_mask: bool = bool(use_invalid_mask)
+        self.nwp_dropout_prob: float = max(0.0, min(1.0, float(nwp_dropout_prob)))
+        self.nwp_history_dropout_prob: float = max(
+            0.0, min(1.0, float(nwp_history_dropout_prob))
+        )
+        # Pre-resolve column indices in ``nwp_tensor`` (last dim = 8 features + 1 mask).
+        self._nwp_feature_indices: list[int] = [
+            _FOLSOM_NWP_FEATURE_COLS.index(name) for name in self.nwp_features
+        ]
+        # Forecast-query input dim = 3 time feats + N NWP features (+ 1 if mask passed through).
+        query_mlp_in_dim = 3 + 4
+
+        dim = 64
+        self.tabm_mod_embed = nn.Parameter(torch.randn(1, 1, dim) * 0.02)   # TabM modality embedding
+        self.pv_mod_embed = nn.Parameter(torch.randn(1, 1, dim) * 0.02)   # PV modality embedding
+        self.sat_mod_embed = nn.Parameter(torch.randn(1, 1, dim) * 0.02)   # Satellite image modality embedding
+        self.sky_mod_embed = nn.Parameter(torch.randn(1, 1, dim) * 0.02)   # Sky imagem odality embedding
+
+        self.inverter_embedding = nn.Embedding(num_embeddings=1000, embedding_dim=16)
+        self.pv_hist_in_channels = 8
+        self.nwp_future_steps = 16
+        self.nwp_future_channels = 2
+        self.nwp_future_flat_dim = self.nwp_future_steps * self.nwp_future_channels
+        self.TCN = TemporalCNN1d(
+            in_channels=self.pv_hist_in_channels,
+            out_channels=64,
+            use_batchnorm=use_batchnorm,
+            dropout=dropout,
+        )
+
+        self.time_mlp = nn.Sequential(
+            nn.Linear(3, 64),
+            nn.GELU(),
+            nn.Linear(64, 64),
+        )
+        self.corase_idx = [18, 54, 90, 126, 162, 198, 234, 270, 295, 308, 322, 335, 349, 362, 376, 389,
+                           403, 416, 430, 443, 457, 470, 484, 497, 505, 508, 511, 514, 517, 520, 523, 526,
+                           529, 532, 535, 538, 541, 544, 547, 550, 553, 556, 559, 562, 565, 568, 571, 574]
+        # This model path uses 576-step history (derived from coarse idx settings).
+        self.pv_hist_len = max(self.corase_idx) + 2
+        self.learnable_pv_queries = nn.Parameter(torch.randn(1, 48, 64))
+        self.cross_attention_pv_compression = CrossAttention(query_dim=64, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)        
+        self.query_mlp = MLP(in_dim=query_mlp_in_dim, hidden_dims=(64, 64), out_dim=64, dropout=0.0)
+
+        # Separate V-JEPA 2.0 encoders (HF) for sat and sky; separate 64-d proj heads.
+        from transformers import AutoModel
+
+        self.vjepa_sky = AutoModel.from_pretrained(self.vjepa_hf_repo)
+        self.vjepa_sat = AutoModel.from_pretrained(self.vjepa_hf_repo)
+        if self.vjepa_freeze:
+            for p in self.vjepa_sky.parameters():
+                p.requires_grad = False
+            for p in self.vjepa_sat.parameters():
+                p.requires_grad = False
+            self.vjepa_sky.eval()
+            self.vjepa_sat.eval()
+        vjepa_dim = int(getattr(self.vjepa_sky.config, "hidden_size", 1024))
+        self.sat_token_proj = nn.Linear(vjepa_dim, 64)
+        self.sky_token_proj = nn.Linear(vjepa_dim, 64)
+        # Broadcast over [B, T, C, H, W] (HF V-JEPA expects this layout; it permutes internally).
+        self.register_buffer(
+            "_vjepa_img_mean",
+            torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_vjepa_img_std",
+            torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 1, 3, 1, 1),
+            persistent=False,
+        )
+
+        self.cross_attention_pv = CrossAttention(query_dim=64, key_dim=64, value_dim=64, embed_dim=64, num_heads=4, dropout=dropout)
+        # Residual head: cross-attn feats (64) + kt_tabm (1)
+        self.pv_feats_head = MLP(in_dim=65, hidden_dims=(128, 64), out_dim=64, dropout=0.0)
+        self.fc = FC(in_dim=64, out_dim=1)
+        # New PV-only 4h branch implemented with TabM:
+        # flatten pv_history to table features and predict kt at t0+4h.
+        self.pv_tabm_head = TabM(
+            n_num_features=2336,
+            cat_cardinalities=None,
+            d_out=1,
+            n_blocks=3,
+            d_block=512,
+            dropout=dropout,
+            k=32,
+            arch_type="tabm",
+            start_scaling_init="normal",
+        )
+        # Cached feature right before TabM final output projection.
+        self.pv_tabm_preoutput_features: Optional[torch.Tensor] = None
+        self._pv_tabm_output_pre_hook_handle = self.pv_tabm_head.output.register_forward_pre_hook(
+            self._capture_pv_tabm_preoutput_features
+        )
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.vjepa_freeze:
+            self.vjepa_sky.eval()
+            self.vjepa_sat.eval()
+        return self
+
+    def _prepare_video_for_vjepa(self, video_btchw: torch.Tensor) -> torch.Tensor:
+        """Convert ``[B,T,C,H,W]`` RGB video to HF V-JEPA ``[B,T,3,S,S]`` (S=256).
+
+        HuggingFace ``VJEPA2Embeddings`` expects ``[B, T, C, H, W]`` and permutes
+        to ``[B, C, T, H, W]`` internally before Conv3d — do NOT permute here.
+        """
+        if video_btchw.ndim != 5:
+            raise ValueError(f"video expected [B,T,C,H,W], got {tuple(video_btchw.shape)}")
+        bsz, num_frames, channels, height, width = video_btchw.shape
+        if channels < 3:
+            raise ValueError(f"video needs >=3 channels, got {channels}")
+        rgb = video_btchw[:, :, :3]
+        frames = rgb.reshape(bsz * num_frames, 3, height, width)
+        if float(frames.detach().max()) > 1.5:
+            frames = frames / 255.0
+        if height != self.vjepa_image_size or width != self.vjepa_image_size:
+            frames = F.interpolate(
+                frames,
+                size=(self.vjepa_image_size, self.vjepa_image_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+        video = frames.view(
+            bsz, num_frames, 3, self.vjepa_image_size, self.vjepa_image_size
+        )
+        # tubelet_size=2 requires an even frame count
+        if video.shape[1] % 2 == 1:
+            video = video[:, :-1]
+        mean = self._vjepa_img_mean.to(device=video.device, dtype=video.dtype)
+        std = self._vjepa_img_std.to(device=video.device, dtype=video.dtype)
+        return (video - mean) / std
+
+    def _encode_sky_with_vjepa(self, sky_hr: torch.Tensor) -> torch.Tensor:
+        """Run sky V-JEPA 2.0; returns ``last_hidden_state`` ``[B,N,D]``."""
+        video = self._prepare_video_for_vjepa(sky_hr)
+        if self.vjepa_freeze:
+            with torch.no_grad():
+                out = self.vjepa_sky(pixel_values_videos=video, skip_predictor=True)
+        else:
+            out = self.vjepa_sky(pixel_values_videos=video, skip_predictor=True)
+        tokens = out.last_hidden_state
+        self.last_vjepa_sky_tokens = tokens
+        return tokens
+
+    def _encode_sat_with_vjepa(self, sat_hr: torch.Tensor) -> torch.Tensor:
+        """Run sat V-JEPA 2.0; returns ``last_hidden_state`` ``[B,N,D]``."""
+        video = self._prepare_video_for_vjepa(sat_hr)
+        if self.vjepa_freeze:
+            with torch.no_grad():
+                out = self.vjepa_sat(pixel_values_videos=video, skip_predictor=True)
+        else:
+            out = self.vjepa_sat(pixel_values_videos=video, skip_predictor=True)
+        tokens = out.last_hidden_state
+        self.last_vjepa_sat_tokens = tokens
+        return tokens
+
+    @staticmethod
+    def _apply_channel_dropout(x: torch.Tensor, p: float, training: bool) -> torch.Tensor:
+        if (not training) or p <= 0.0:
+            return x
+        keep = 1.0 - float(p)
+        if keep <= 0.0:
+            return torch.zeros_like(x)
+        bsz, _, channels = x.shape
+        mask = (torch.rand((bsz, 1, channels), device=x.device) < keep).to(x.dtype)
+        return x * mask / keep
+
+    def _capture_pv_tabm_preoutput_features(self, module: nn.Module, inputs: tuple) -> None:
+        _ = module
+        if not inputs:
+            self.pv_tabm_preoutput_features = None
+            return
+        x = inputs[0]
+        self.pv_tabm_preoutput_features = x if isinstance(x, torch.Tensor) else None
+
+    def forward(self, device_id: torch.Tensor, pv: torch.Tensor, 
+                pv_mask: Optional[torch.Tensor] = None, 
+                pv_timefeats: Optional[torch.Tensor] = None,
+                forecast_timefeats: Optional[torch.Tensor] = None,
+                sat_tensor: Optional[torch.Tensor] = None,
+                sat_timefeats: Optional[torch.Tensor] = None,
+                skimg_tensor: Optional[torch.Tensor] = None,
+                skimg_timefeats: Optional[torch.Tensor] = None,
+                sat_valid_mask: Optional[torch.Tensor] = None,
+                skimg_valid_mask: Optional[torch.Tensor] = None,
+                nwp_tensor: Optional[torch.Tensor] = None,
+                nwp_history: Optional[torch.Tensor] = None,
+                nwp_forecast_history: Optional[torch.Tensor] = None) -> torch.Tensor:
+        
+        pv_masked = pv * pv_mask.to(pv.dtype)
+
+        pv_timefeats = pv_timefeats[:, :, [2,3,8]]
+        forecast_timefeats = forecast_timefeats[:, :, [2,3,8]]
+
+        # Read history features for PV branch; if missing, fallback to zeros.
+        if nwp_history is None:
+            nwp_history_ghi = torch.zeros_like(pv_masked)
+        else:
+            nwp_history_ghi = ((nwp_history[:, :, 0] / 1000.0 - 0.5) * 2.0).unsqueeze(1)
+        if nwp_forecast_history is None:
+            nwp_forecast_history_ghi = torch.zeros_like(pv_masked)
+        else:
+            nwp_forecast_history_ghi = ((nwp_forecast_history[:, :, 0] / 1000.0 - 0.5) * 2.0).unsqueeze(1)
+        delta_nwp_history_ghi = nwp_history_ghi - nwp_forecast_history_ghi
+
+        pv_history = torch.cat(
+            [
+                pv_masked,
+                pv_mask,
+                pv_timefeats.permute(0, 2, 1),
+                nwp_history_ghi,
+                nwp_forecast_history_ghi,
+                delta_nwp_history_ghi,
+            ],
+            dim=1,
+        )  # [B, C=8, T]
+
+        nwp_ssrd_normalized = (nwp_tensor[:, :, 0] / 1000.0 - 0.5) * 2.0
+        nwp_t2m_normalized = (nwp_tensor[:, :, 2] - 288.15) / 10.0
+
+        
+        pv_hist_flat = pv_history[:,[0,5,6,7],:].reshape(pv_history.shape[0], -1)
+        nwp_tensor_for_tabm = torch.stack(
+            [
+                nwp_ssrd_normalized,
+                nwp_t2m_normalized,
+            ],
+            dim=2,
+        )
+        nwp_tensor_flat = nwp_tensor_for_tabm.reshape(nwp_tensor_for_tabm.shape[0], -1)
+        cur_nwp_dim = nwp_tensor_flat.shape[1]
+        if cur_nwp_dim < self.nwp_future_flat_dim:
+            pad = torch.zeros(
+                nwp_tensor_flat.shape[0],
+                self.nwp_future_flat_dim - cur_nwp_dim,
+                device=nwp_tensor_flat.device,
+                dtype=nwp_tensor_flat.dtype,
+            )
+            nwp_tensor_flat = torch.cat([nwp_tensor_flat, pad], dim=1)
+        elif cur_nwp_dim > self.nwp_future_flat_dim:
+            nwp_tensor_flat = nwp_tensor_flat[:, : self.nwp_future_flat_dim]
+
+        x_num = torch.cat([pv_hist_flat, nwp_tensor_flat], dim=1)
+
+        self.pv_tabm_preoutput_features = None
+        tabm_out = self.pv_tabm_head(x_num=x_num, x_cat=None)  # [B, K, 1]
+        kt_tabm = tabm_out.mean(dim=1)  # [B, 1]
+
+        # return kt_tabm  # [B, 1] — keep dim so pv_pred = kt * target_p_cs * p_mean is [B, 1]
+
+        # Forecast queries: Luoyang total variant only uses two NWP channels:
+        # ssrd (idx=0) and t2m (idx=2), where nwp_tensor layout is
+        # [ssrd, msl, t2m, u10, v10, u100, v100, nan_mask].
+
+        nwp_channels = [forecast_timefeats]
+        if nwp_tensor is not None:
+            nwp_feats = torch.stack(
+                [
+                    (nwp_tensor[:, :, 0] / 1000.0 - 0.5) * 2.0,
+                    nwp_tensor[:, :, 1],
+                    (nwp_tensor[:, :, 2] - 288.15) / 10.0,
+                    nwp_tensor[:, :, 3],
+                ],
+                dim=2,
+            )
+            nwp_feats = self._apply_channel_dropout(
+                nwp_feats,
+                p=self.nwp_dropout_prob,
+                training=self.training,
+            )
+            nwp_channels.append(nwp_feats)
+        else:
+            zero_nwp_feat = torch.zeros(
+                forecast_timefeats.shape[:2],
+                device=forecast_timefeats.device,
+                dtype=forecast_timefeats.dtype,
+            )
+            nwp_channels.append(zero_nwp_feat.unsqueeze(2))  # ssrd
+            nwp_channels.append(zero_nwp_feat.unsqueeze(2))  # t2m
+            nwp_channels.append(zero_nwp_feat.unsqueeze(2))  # ssrd
+            nwp_channels.append(zero_nwp_feat.unsqueeze(2))  # t2m
+
+        forecast_ssrd_timefeats = torch.cat(nwp_channels, dim=2)
+        
+        forecast_query = self.query_mlp(forecast_ssrd_timefeats)
+
+        # satellite images encoder (vjepa_sat → proj → KV; no compressor)
+        B, T_out, _ = forecast_query.shape
+        self.last_vjepa_sat_tokens = None
+
+        if sat_tensor is None or sat_tensor.max() == 0:
+            sat_compressed = torch.zeros(B, 1, 64, device=pv.device, dtype=pv.dtype) + self.sat_mod_embed
+            sat_mask = torch.zeros(B, 1, device=pv.device, dtype=pv.dtype)
+        else:
+            B_sat, T_sat, C_sat, H_sat, W_sat = sat_tensor.shape
+            if C_sat < 1:
+                raise ValueError(f"sat_tensor expected at least 1 channel, got {C_sat}")
+
+            # Pseudo-RGB: replicate sat channel 0 onto channels 1/2 for V-JEPA.
+            # Use the last 16 frames only.
+            sat_c0 = sat_tensor[:, -16:, 0:1]
+            sat_pseudo_rgb = sat_c0.expand(-1, -1, 3, -1, -1).contiguous()
+            sat_tokens = self._encode_sat_with_vjepa(sat_pseudo_rgb)
+            sat_compressed = self.sat_token_proj(sat_tokens) + self.sat_mod_embed
+            sat_compressed = torch.nan_to_num(sat_compressed, nan=0.0, posinf=0.0, neginf=0.0)
+            sat_mask = torch.ones(
+                B, sat_compressed.shape[1], device=pv.device, dtype=pv.dtype
+            )
+
+        if sat_valid_mask is not None:
+            if sat_valid_mask.dim() != 1 or sat_valid_mask.shape[0] != B:
+                raise ValueError(f"sat_valid_mask expected [B], got {sat_valid_mask.shape}")
+            sat_valid_mask = sat_valid_mask.to(device=pv.device, dtype=pv.dtype).unsqueeze(1)
+            sat_compressed = sat_compressed * sat_valid_mask.unsqueeze(2)
+            sat_mask = sat_mask * sat_valid_mask
+
+        # sky images encoder (vjepa_sky → proj → KV; no compressor)
+        self.last_vjepa_sky_tokens = None
+        if skimg_tensor is None or skimg_tensor.max() == 0:
+            sky_compressed = torch.zeros(B, 1, 64, device=pv.device, dtype=pv.dtype) + self.sky_mod_embed
+            sky_mask = torch.zeros(B, 1, device=pv.device, dtype=pv.dtype)
+        else:
+            B_sky, T_sky, C_sky, H_sky, W_sky = skimg_tensor.shape
+            if C_sky < 3:
+                raise ValueError(f"skimg_tensor expected at least 3 channels, got {C_sky}")
+
+            # Last ~4 frames at stride 2.
+            sky_tokens = self._encode_sky_with_vjepa(skimg_tensor[:, -7::2, :3])
+            sky_compressed = self.sky_token_proj(sky_tokens) + self.sky_mod_embed
+            sky_compressed = torch.nan_to_num(sky_compressed, nan=0.0, posinf=0.0, neginf=0.0)
+            sky_mask = torch.ones(
+                B, sky_compressed.shape[1], device=pv.device, dtype=pv.dtype
+            )
+
+        if skimg_valid_mask is not None:
+            if skimg_valid_mask.dim() != 1 or skimg_valid_mask.shape[0] != B:
+                raise ValueError(f"skimg_valid_mask expected [B], got {skimg_valid_mask.shape}")
+            skimg_valid_mask = skimg_valid_mask.to(device=pv.device, dtype=pv.dtype).unsqueeze(1)
+            sky_compressed = sky_compressed * skimg_valid_mask.unsqueeze(2)
+            sky_mask = sky_mask * skimg_valid_mask
+
+        hist_mem_compressed = torch.cat(
+            [sat_compressed, sky_compressed], dim=1
+        )
+        key_value_mask = torch.cat([sat_mask, sky_mask], dim=1)
+
+        # Per-sample handling of all-masked rows: an all-masked row makes the
+        # attention softmax all -inf → NaN for that sample. Give those rows a
+        # dummy all-valid mask to keep the math finite, then zero their
+        # residual so samples without sat/sky contribute delta_kt = 0.
+        row_has_valid = (key_value_mask.sum(dim=1, keepdim=True) > 0).to(pv.dtype)  # [B,1]
+        safe_mask = torch.where(
+            row_has_valid.bool(), key_value_mask, torch.ones_like(key_value_mask)
+        )
+        forecast_pv_features = self.cross_attention_pv(query=forecast_query[:,-1:,:], key=hist_mem_compressed, value=hist_mem_compressed, key_value_mask=safe_mask)
+
+        # Fuse visual context with TabM baseline kt for residual prediction.
+        # forecast_pv_features: [B, 1, 64], kt_tabm: [B, 1] -> unsqueeze to [B, 1, 1]
+        fused = torch.cat(
+            [forecast_pv_features, kt_tabm.detach().unsqueeze(1)],
+            dim=2,
+        )  # [B, 1, 65]
+        pv_feats = self.pv_feats_head(fused)
+        delta_kt = self.fc(pv_feats) * row_has_valid.unsqueeze(2)  # [B,1,1]
+
+        kt = kt_tabm.unsqueeze(1) + delta_kt # [B,1,1]
+
+        return kt.squeeze(-1)
+
+
+
 # Using PV history and NWP to forecast PV, solar features and NWP features are used as query
 class pv_forecasting_model_vit_dinov2(nn.Module):
     """
