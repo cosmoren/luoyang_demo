@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import os
+import random
 import sys
 import time
 from dataclasses import dataclass
@@ -66,6 +67,28 @@ OPTIONAL_MODALITY_KEYS = (
     "nwp_forecast_history",
 )
 
+# FT trainable module roots (named_parameters prefix match: name == root or name.startswith(root+".")).
+_FT_SKY_MODULES = (
+    "sky_patch_embed",
+    "sky_alt_attn",
+    "sky_two_stage_compressor",
+    "sky_mod_embed",
+)
+_FT_CONCAT_MODULES = (
+    "cross_attention_pv",
+    "pv_feats_head",
+    "fc",
+)
+_FT_TABM_MODULES = (
+    "pv_tabm_head",
+)
+_FT_TIME_MODULES = (
+    "time_mlp",
+)
+_FT_KEEP_FROZEN_PREFIXES = (
+    "sky_patch_embed.backbone.",  # DINOv2 backbone stays frozen inside sky_patch_embed
+)
+
 
 def _gpu_id_for_checkpoint() -> int:
     raw = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -78,6 +101,23 @@ def _gpu_id_for_checkpoint() -> int:
     if not parts:
         return torch.cuda.current_device()
     return int(parts[0]) if parts[0].isdigit() else torch.cuda.current_device()
+
+
+def _seed_worker(worker_id: int) -> None:
+    """DataLoader worker_init_fn: distinct-but-deterministic per-worker RNGs."""
+    worker_seed = (torch.initial_seed() + worker_id) % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def _apply_seed(seed: int) -> None:
+    """Seed python/numpy/torch (+cuda) and prefer deterministic cudnn where cheap."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def _shape_of(x) -> str:
@@ -166,6 +206,80 @@ def _prepare_sky_for_vit(d: dict, *, zero_sky: bool) -> dict:
         if t is not None:
             d[key] = torch.zeros_like(t)
     return d
+
+
+def _name_matches_module(name: str, root: str) -> bool:
+    return name == root or name.startswith(root + ".")
+
+
+def _ft_module_roots(mode: str) -> tuple[str, ...]:
+    if mode == "sky_only":
+        return _FT_SKY_MODULES
+    if mode == "concat_only":
+        return _FT_CONCAT_MODULES
+    if mode == "sky_concat":
+        return _FT_SKY_MODULES + _FT_CONCAT_MODULES
+    if mode == "sky_concat_time":
+        return _FT_SKY_MODULES + _FT_CONCAT_MODULES + _FT_TIME_MODULES
+    if mode == "sky_concat_tabm":
+        return _FT_SKY_MODULES + _FT_CONCAT_MODULES + _FT_TABM_MODULES
+    raise ValueError(f"unknown ft_trainable mode: {mode!r}")
+
+
+def _apply_ft_trainable_freeze(model: nn.Module, mode: str) -> tuple[int, list[str]]:
+    """Freeze all params, then unfreeze only the FT recipe modules. Returns (n_trainable, module list)."""
+    for p in model.parameters():
+        p.requires_grad = False
+
+    roots = _ft_module_roots(mode)
+    trainable_modules: set[str] = set()
+    for name, p in model.named_parameters():
+        if any(name.startswith(pref) for pref in _FT_KEEP_FROZEN_PREFIXES):
+            continue
+        if any(_name_matches_module(name, root) for root in roots):
+            p.requires_grad = True
+            trainable_modules.add(name.split(".", 1)[0])
+
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if n_trainable <= 0:
+        raise RuntimeError(f"ft_trainable={mode} left zero trainable parameters")
+    return n_trainable, sorted(trainable_modules)
+
+
+def _ft_param_groups(
+    model: nn.Module,
+    *,
+    lr_default: float,
+    lr_sky: float | None,
+    lr_concat: float | None,
+) -> list[dict]:
+    """Split trainable params into sky / concat / other AdamW groups with per-group LRs.
+
+    Call after ``_apply_ft_trainable_freeze``. ``other`` catches trainable params outside
+    sky/concat (e.g. ``time_mlp`` under ``sky_concat_time``, ``pv_tabm_head`` under
+    ``sky_concat_tabm``) and keeps ``lr_default``.
+    """
+    buckets: dict[str, list[nn.Parameter]] = {"sky": [], "concat": [], "other": []}
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if any(_name_matches_module(name, root) for root in _FT_SKY_MODULES):
+            buckets["sky"].append(p)
+        elif any(_name_matches_module(name, root) for root in _FT_CONCAT_MODULES):
+            buckets["concat"].append(p)
+        else:
+            buckets["other"].append(p)
+
+    lr_by_group = {
+        "sky": lr_default if lr_sky is None else lr_sky,
+        "concat": lr_default if lr_concat is None else lr_concat,
+        "other": lr_default,
+    }
+    return [
+        {"name": group, "params": params, "lr": lr_by_group[group]}
+        for group, params in buckets.items()
+        if params
+    ]
 
 
 def forward_vit(model: nn.Module, d: dict) -> torch.Tensor:
@@ -540,6 +654,15 @@ def _build_parser(h: dict, config_default: str, dataset_default: str) -> argpars
     parser.add_argument("--warmup-epochs", type=int, default=int(h.get("warmup_epochs", 0)))
     parser.add_argument("--lr-min", type=float, default=1e-6)
     parser.add_argument("--huber-delta", type=float, default=float(h.get("huber_delta", 35.0)))
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help=(
+            "RNG seed for python/numpy/torch/cuda + DataLoader workers. "
+            "Omit for legacy unseeded runs; pass explicitly for multi-seed weekend queues."
+        ),
+    )
     parser.add_argument("--checkpoint_dir", type=str, default=None)
     parser.add_argument("--init-checkpoint", type=str, default=None)
     parser.add_argument("--resume-checkpoint", type=str, default=None)
@@ -583,6 +706,31 @@ def _build_parser(h: dict, config_default: str, dataset_default: str) -> argpars
             "Hard sky ablation. Default OFF. Pass --zero-sky to zero skimg_tensor, "
             "skimg_timefeats, and skimg_valid_mask on every train/eval batch "
             "(dataloader still opens sky zarr; model sees no sky signal)."
+        ),
+    )
+    parser.add_argument(
+        "--ft-trainable",
+        choices=("sky_only", "concat_only", "sky_concat", "sky_concat_time", "sky_concat_tabm"),
+        default=None,
+        help="FT freeze recipe: freeze all, then train only these modules",
+    )
+    parser.add_argument(
+        "--lr-sky",
+        type=float,
+        default=None,
+        help=(
+            "FT-only per-group LR for the sky encoder wrappers (sky_patch_embed minus the "
+            "frozen DINOv2 backbone, sky_alt_attn, sky_two_stage_compressor, sky_mod_embed). "
+            "Defaults to --lr. Requires --ft-trainable."
+        ),
+    )
+    parser.add_argument(
+        "--lr-concat",
+        type=float,
+        default=None,
+        help=(
+            "FT-only per-group LR for the concat head (cross_attention_pv, pv_feats_head, fc). "
+            "Defaults to --lr. Requires --ft-trainable."
         ),
     )
     parser.add_argument(
@@ -691,8 +839,15 @@ def main() -> None:
         f"use_nwp={args.use_nwp} zero_sky={args.zero_sky} freeze_tabm={args.freeze_tabm} "
         f"huber_delta={args.huber_delta}"
     )
+    if args.seed is not None:
+        _apply_seed(int(args.seed))
+        print(f"[startup] seed={int(args.seed)}", flush=True)
+    else:
+        print("[startup] seed=<unset>", flush=True)
     if args.init_checkpoint and args.resume_checkpoint:
         raise ValueError("Use only one of --init-checkpoint or --resume-checkpoint.")
+    if args.ft_trainable is None and (args.lr_sky is not None or args.lr_concat is not None):
+        raise ValueError("--lr-sky/--lr-concat require --ft-trainable.")
 
     dataset_override_kwargs = dict(
         sky_sat_load_mode_override=args.sky_sat_load_mode,
@@ -722,6 +877,7 @@ def main() -> None:
         f"val first_target in [{train_dataset_kwargs['val_start_bj']}, {train_dataset_kwargs['val_end_bj']}); "
         f"test first_target >= {train_dataset_kwargs['test_start_bj']}"
     )
+    print(f"[startup] ft_trainable={args.ft_trainable}")
     print("[startup] Building datasets (train/val/test)...")
     train_dataset = PVDataset(**train_dataset_kwargs)
     print(f"[startup] train dataset ready: files={len(train_dataset.sample_files)} samples={len(train_dataset)}")
@@ -793,13 +949,27 @@ def main() -> None:
             raise FileNotFoundError(f"resume checkpoint not found: {resume_path}")
         ckpt = torch.load(resume_path, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"])
-        if "optimizer_state_dict" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        if "scheduler_state_dict" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        start_epoch = int(ckpt.get("epoch", 0)) + 1
-        best_val_rmse = float(ckpt.get("val_rmse", ckpt.get("val_loss", best_val_rmse)))
-        print(f"Resumed from {resume_path}, start_epoch={start_epoch}, best_val_rmse={best_val_rmse:.6f}")
+        if args.ft_trainable is not None:
+            # Fresh FT run from implanted weights: ignore host epoch / opt / sched.
+            start_epoch = 1
+            best_val_rmse = float("inf")
+            print(
+                "[startup] FT mode: ignoring ckpt epoch/opt/sched; "
+                f"start_epoch={start_epoch} best_val_rmse=inf "
+                f"(ckpt_epoch={ckpt.get('epoch', '?')})",
+                flush=True,
+            )
+        else:
+            if "optimizer_state_dict" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            if "scheduler_state_dict" in ckpt:
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            start_epoch = int(ckpt.get("epoch", 0)) + 1
+            best_val_rmse = float(ckpt.get("val_rmse", ckpt.get("val_loss", best_val_rmse)))
+            print(
+                f"Resumed from {resume_path}, start_epoch={start_epoch}, "
+                f"best_val_rmse={best_val_rmse:.6f}"
+            )
     elif args.init_checkpoint:
         print(f"[startup] Loading init checkpoint (TabM only): {args.init_checkpoint}")
         init_path = Path(args.init_checkpoint).expanduser().resolve()
@@ -820,7 +990,67 @@ def main() -> None:
             print(f"[init_checkpoint] {len(non_tabm_missing)} non-TabM keys use fresh init (expected)")
         print(f"Initialized TabM weights from {init_path}")
 
-    if args.freeze_tabm:
+    if args.ft_trainable is not None:
+        n_trainable, trainable_modules = _apply_ft_trainable_freeze(model, args.ft_trainable)
+        args.freeze_tabm = args.ft_trainable != "sky_concat_tabm"
+        print(
+            f"[startup] FT freeze recipe={args.ft_trainable}: "
+            f"n_trainable={n_trainable:,} modules={trainable_modules}",
+            flush=True,
+        )
+        # Rebuild optimizer/scheduler so only trainable params are stepped.
+        # Per-group LRs are opt-in: without --lr-sky/--lr-concat this stays a single
+        # group at --lr, byte-identical to pre-per-group-LR runs.
+        split_lr = args.lr_sky is not None or args.lr_concat is not None
+        if split_lr:
+            param_groups = _ft_param_groups(
+                model,
+                lr_default=args.lr,
+                lr_sky=args.lr_sky,
+                lr_concat=args.lr_concat,
+            )
+            group_names = [g["name"] for g in param_groups]
+            for flag, group, value in (
+                ("--lr-sky", "sky", args.lr_sky),
+                ("--lr-concat", "concat", args.lr_concat),
+            ):
+                if value is not None and group not in group_names:
+                    print(
+                        f"[startup] WARNING: {flag} ignored; ft_trainable={args.ft_trainable} "
+                        f"has no trainable {group} params",
+                        flush=True,
+                    )
+        else:
+            param_groups = [{"params": [p for p in model.parameters() if p.requires_grad]}]
+        optimizer = torch.optim.AdamW(
+            param_groups,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            betas=(0.9, 0.999),
+        )
+        scheduler = _build_lr_scheduler(
+            optimizer,
+            epochs=args.epochs,
+            warmup_epochs=args.warmup_epochs,
+            lr_min=args.lr_min,
+        )
+        print(
+            f"[startup] rebuilt optimizer on trainable params only "
+            f"(n_trainable={n_trainable:,})",
+            flush=True,
+        )
+        if split_lr:
+            print(
+                "[startup] FT param groups: "
+                + " ".join(
+                    f"{g['name']}(n={sum(p.numel() for p in g['params']):,}, lr={g['lr']:.2e})"
+                    for g in param_groups
+                ),
+                flush=True,
+            )
+        else:
+            print(f"[startup] FT single param group: lr={args.lr:.2e}", flush=True)
+    elif args.freeze_tabm:
         if not (args.resume_checkpoint or args.init_checkpoint):
             print(
                 "[startup] WARNING: freeze_tabm=True without init/resume checkpoint; "
@@ -833,7 +1063,23 @@ def main() -> None:
     else:
         print("[startup] TabM trainable (freeze_tabm=False)")
 
+    n_trainable_final = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(
+        f"[startup] trainable summary: ft_trainable={args.ft_trainable} "
+        f"n_trainable={n_trainable_final:,} "
+        f"train_start_bj={train_dataset_kwargs.get('train_start_bj')} "
+        f"train_end_bj={train_dataset_kwargs['train_end_bj']} "
+        f"val=[{train_dataset_kwargs['val_start_bj']},{train_dataset_kwargs['val_end_bj']}) "
+        f"test>={train_dataset_kwargs['test_start_bj']}",
+        flush=True,
+    )
+
     persistent = args.num_workers > 0
+    worker_init_fn = _seed_worker if args.seed is not None else None
+    loader_generator = None
+    if args.seed is not None:
+        loader_generator = torch.Generator()
+        loader_generator.manual_seed(int(args.seed))
     print(
         f"[startup] Building DataLoaders (num_workers={args.num_workers}, "
         f"persistent_workers={persistent})..."
@@ -846,6 +1092,8 @@ def main() -> None:
         num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=persistent,
+        worker_init_fn=worker_init_fn,
+        generator=loader_generator,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -855,6 +1103,7 @@ def main() -> None:
         num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=persistent,
+        worker_init_fn=worker_init_fn,
     )
     test_loader = DataLoader(
         test_dataset,
@@ -864,6 +1113,7 @@ def main() -> None:
         num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=persistent,
+        worker_init_fn=worker_init_fn,
     )
 
     checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else (_PROJECT_ROOT / "checkpoints_2026total")
@@ -877,6 +1127,12 @@ def main() -> None:
 
     for epoch in range(start_epoch, args.epochs + 1):
         cur_lr = optimizer.param_groups[0]["lr"]
+        group_lrs = [(g.get("name", f"g{i}"), g["lr"]) for i, g in enumerate(optimizer.param_groups)]
+        lr_field = (
+            f"lr={cur_lr:.2e}"
+            if len(group_lrs) < 2
+            else " ".join(f"lr_{name}={lr:.2e}" for name, lr in group_lrs)
+        )
         ema_active = ema is not None and epoch > args.ema_warmup_epochs
         if ema is not None and not ema_active:
             for k, v in model.state_dict().items():
@@ -919,7 +1175,7 @@ def main() -> None:
         scheduler.step()
 
         print(
-            f"Epoch {epoch}/{args.epochs} task={args.task} lr={cur_lr:.2e} "
+            f"Epoch {epoch}/{args.epochs} task={args.task} {lr_field} "
             f"train_loss={train_loss:.6f} val_loss={val_metrics.loss:.6f} "
             f"val_rmse={val_metrics.rmse:.6f} val_mae={val_metrics.mae:.6f} "
             f"sat_avail={sat_avail_rate:.3f} skimg_avail={skimg_avail_rate:.3f}"
@@ -931,6 +1187,9 @@ def main() -> None:
         writer.add_scalar("availability/train_sat", sat_avail_rate, epoch)
         writer.add_scalar("availability/train_skimg", skimg_avail_rate, epoch)
         writer.add_scalar("lr", cur_lr, epoch)
+        if len(group_lrs) > 1:
+            for name, lr in group_lrs:
+                writer.add_scalar(f"lr/{name}", lr, epoch)
 
         if args.save_every and epoch % args.save_every == 0:
             path = checkpoint_dir / f"pv_forecast_vit_epoch_{epoch}_{suffix}.pt"

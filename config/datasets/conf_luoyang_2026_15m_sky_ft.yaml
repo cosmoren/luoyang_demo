@@ -1,0 +1,34 @@
+paths:
+  data_dir: "/home/kyber/projects/digital_energy/datasets/luoyang_2026_ds"
+  pv_path: pv
+  pv_total_path: pv_total.csv
+  sky_image_path: luoyangASI_skimg_zarr
+  sat_path: luoyang_sat_zarr
+  nwp_path: NWP
+
+sampling:
+  train_samples_per_csv: 10000
+  sky_sat_load_mode: lazy  # lazy | prefetch
+  use_satellite: false     # PV+sky campaign: do not open/load satellite
+  csv_interval_min: 5
+  pv_input_interval_min: 5
+  pv_input_len: 576
+  pv_output_interval_min: 15
+  pv_output_len: 1
+  test_anchor_stride_min: 5
+  val_anchor_stride_min: 5
+  test_collect_time_match_tolerance_min: 0
+  skyimg_window_size: 30
+  skyimg_time_resolution_min: 1
+  satimg_window_size: 24
+  satimg_time_resolution_min: 10
+
+# Hard calendar split (BJ / Asia/Shanghai). Upper bounds are half-open.
+# FT train: sky-only via train_start_bj (Apr17–May6, 20d); val May7–10 (4d);
+# test: first target >= May 11 (unbounded; no test_end_bj).
+split_policy:
+  train_start_bj: "2026-04-17 00:00:00"  # FT train: last target in [train_start, train_end)
+  train_end_bj: "2026-05-07 00:00:00"
+  val_start_bj: "2026-05-07 00:00:00"
+  val_end_bj: "2026-05-11 00:00:00"
+  test_start_bj: "2026-05-11 00:00:00"
