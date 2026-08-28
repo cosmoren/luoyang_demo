@@ -90,7 +90,6 @@ P_CS_CLIP_MIN = 0.0
 P_CS_CLIP_MAX = 1.2
 KT_DAYTIME_THRESHOLD = 0.1
 KT_EPS = 1e-6
-P_MEAN_SCALAR = 1.0
 
 # --- Task: augment_irradiance_solar_cols (Luoyang-style solar timefeat columns) ----
 # Overwrites the active Folsom irradiance CSV in place (atomic temp → replace).
@@ -208,7 +207,7 @@ def augment_irradiance_with_kt_fields() -> Path:
     Read one Folsom irradiance CSV and append:
       - p_cs    : clearsky_ghi / 1000, clipped to [0, 1.2]
       - kt_mask : 1 if p_cs > 0.1 else 0
-      - p_mean  : constant 1.0 (matches dataloader/folsom.py)
+      - p_mean  : Q90 of daytime ``ghi / p_cs`` (Luoyang 2026-total recipe)
       - kt      : ghi / (p_cs * p_mean + 1e-6) * kt_mask
 
     ``weather_score`` is intentionally NOT produced.
@@ -238,8 +237,24 @@ def augment_irradiance_with_kt_fields() -> Path:
     p_cs = np.clip(cs_ghi / FOLSOM_GHI_SCALE, P_CS_CLIP_MIN, P_CS_CLIP_MAX).astype(np.float32)
 
     kt_mask = (p_cs > KT_DAYTIME_THRESHOLD).astype(np.int8)
-    p_mean = np.full_like(p_cs, fill_value=float(P_MEAN_SCALAR), dtype=np.float32)
-    kt = (ghi / (p_cs.astype(np.float64) * float(P_MEAN_SCALAR) + KT_EPS)) * kt_mask.astype(np.float64)
+    p_cs64 = p_cs.astype(np.float64)
+    day = p_cs64 > KT_DAYTIME_THRESHOLD
+    ratio = np.divide(
+        ghi,
+        p_cs64,
+        out=np.full_like(ghi, np.nan, dtype=np.float64),
+        where=(p_cs64 > 0),
+    )
+    day_ratio = ratio[day]
+    day_ratio = day_ratio[np.isfinite(day_ratio)]
+    if day_ratio.size > 0:
+        p_mean_scalar = float(np.quantile(day_ratio, 0.9))
+    else:
+        p_mean_scalar = float(np.mean(ghi))
+    if (not np.isfinite(p_mean_scalar)) or p_mean_scalar <= 0:
+        p_mean_scalar = max(float(np.mean(ghi)), 1e-6)
+    p_mean = np.full_like(p_cs, fill_value=p_mean_scalar, dtype=np.float32)
+    kt = (ghi / (p_cs64 * p_mean_scalar + KT_EPS)) * kt_mask.astype(np.float64)
 
     out = df.copy()
     out["p_cs"] = p_cs.astype(np.float32)

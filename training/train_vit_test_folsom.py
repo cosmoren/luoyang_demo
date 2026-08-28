@@ -69,7 +69,6 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 from dataloader.folsom import (  # noqa: E402
     _DEFAULT_FOLSOM_TRAIN_EPOCH_LEN,
     _FOLSOM_HUBER_DELTA,
-    _FOLSOM_KT_INPUT_SCALE,
     _FOLSOM_NWP_FEATURE_COLS,
     FolsomIrradianceDataset,
     collate_folsom_vit_batch,
@@ -218,16 +217,14 @@ def _seed_worker(worker_id: int) -> None:
 
 
 def forward_vit(model: nn.Module, d: dict) -> torch.Tensor:
-    """Mirrors ``training/train_vit_test.py::forward_vit``: the ViT is fed normalized
-    ``kt`` (clear-sky index / 4000.0) and the daytime ``kt_mask``; the caller scales the
-    output back to ``kt`` and multiplies by ``target_p_cs * p_mean`` to recover ``pv``.
-    Folsom's divisor is 4000 (vs Luoyang's 20) because Folsom kt is in W/m^2-ish units
-    (numerator is raw GHI ~1000 W/m^2, denominator is dimensionless ``p_cs``) so empirical
-    kt p99 ~= 1434 / max ~= 2630; ``/4000`` lands the ViT input at p99 ~= 0.36 and max ~=
-    0.66, matching Luoyang's headroom (Luoyang p99/20 = 0.38, max/20 = 0.60)."""
+    """Mirrors Luoyang 2026-total: the ViT is fed ``kt`` and the daytime ``kt_mask``;
+    the caller multiplies by ``target_p_cs * p_mean`` to recover ``pv``. After Q90
+    ``p_mean`` calibration, Folsom ``kt`` is already on the same ~O(1) scale as
+    Luoyang, so there is no extra input/output scalar (legacy checkpoints used
+    ``/4000`` and are incompatible)."""
     return model(
         d["device_id"],
-        d["kt"] / _FOLSOM_KT_INPUT_SCALE,
+        d["kt"],
         pv_mask=d["kt_mask"],
         pv_timefeats=d["pv_timefeats"],
         forecast_timefeats=d["forecast_timefeats"],
@@ -299,7 +296,7 @@ def train_one_epoch(
         _prepare_sky_for_vit(d, zero_sky=zero_sky)
         B = d["device_id"].size(0)
         optimizer.zero_grad()
-        kt_pred = forward_vit(model, d) * _FOLSOM_KT_INPUT_SCALE
+        kt_pred = forward_vit(model, d)
         pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
         t_out = int(pv_pred.shape[1])
         assert d["target_pv"].shape[1] == t_out, (pv_pred.shape, d["target_pv"].shape)
@@ -353,7 +350,7 @@ def evaluate(
             d = _batch_to_device(batch, device)
             _prepare_nwp_for_vit(d, use_nwp=use_nwp)
             _prepare_sky_for_vit(d, zero_sky=zero_sky)
-            kt_pred = forward_vit(model, d) * _FOLSOM_KT_INPUT_SCALE
+            kt_pred = forward_vit(model, d)
             pv_pred = kt_pred * d["target_p_cs"] * d["p_mean"].unsqueeze(1)
             t_out = int(pv_pred.shape[1])
             h = min(horizon, t_out)
