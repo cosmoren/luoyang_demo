@@ -4,7 +4,7 @@ set -euo pipefail
 # =============================================================================
 # 1) Knobs
 # =============================================================================
-RUN_ROOT="/home/kyber/projects/digital_energy/experiment_files/runs/fol luo adapt and fix/2026-08-14_fol-adapt"
+RUN_ROOT="/home/kyber/projects/digital_energy/experiment_files/runs/fol luo scale fix/ft/fix 2"
 REPEAT=5
 SEED_START=1
 GPUS=(0 1)
@@ -17,7 +17,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
 # Default trainer if an experiment line omits the script field (2-field form).
-DEFAULT_TRAIN_SCRIPT="training/train_vit_test_folsom_dinov2.py"
+DEFAULT_TRAIN_SCRIPT="training/train_vit_luoyang2026total.py"
 
 # =============================================================================
 # 2) Experiments — one per line, either:
@@ -25,9 +25,11 @@ DEFAULT_TRAIN_SCRIPT="training/train_vit_test_folsom_dinov2.py"
 #      name|train_script|flags            (vit_imgs and dinov2 in one file)
 #    Queue order: seed-outer (all exps @ SEED_START, then next seed, ...)
 # =============================================================================
+IMPLANT="/home/kyber/projects/digital_energy/experiment_files/runs/fol luo scale fix/implant/fol2luo_skyconcat/luoyang_host_folsom_full_implant.pt"
+FT_COMMON="--task 15m --config conf_train_finetune.yaml --dataset-config conf_luoyang_2026_15m_sky_ft.yaml --model pv_forecasting_model_vit_dinov2 --no-use-nwp --no-use-satellite --epochs 10 --lr-min 1e-6 --warmup-epochs 2"
+
 EXPERIMENTS=(
-  "ghi-sky| --no-use-nwp --no-ray-map --sun-mask none --sky-mask none"
-  "ghi-sky-nwp| --use-nwp --no-ray-map --sun-mask none --sky-mask none"
+  "5e-5|training/train_vit_luoyang2026total.py|${FT_COMMON} --ft-trainable sky_concat --lr 5e-5 --resume-checkpoint \"${IMPLANT}\""
 )
 
 # =============================================================================
@@ -141,13 +143,13 @@ for ((i = 0; i < REPEAT; i++)); do
 
     gpu="$(_wait_for_free_gpu)"
 
-    # shellcheck disable=SC2206
-    extra=( ${flags} )
+    # Quote-aware split so paths with spaces (e.g. resume-checkpoint) stay intact.
+    # shellcheck disable=SC2206,SC2086
+    eval "extra=( ${flags} )"
     cmd=(
       env "CUDA_VISIBLE_DEVICES=${gpu}"
       python "${train_script}"
       --seed "${seed}"
-      --tb-log-dir "${run_dir}"
       --checkpoint_dir "${run_dir}"
       "${extra[@]}"
     )

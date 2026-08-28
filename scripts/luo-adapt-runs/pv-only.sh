@@ -90,7 +90,7 @@ PY
 python training/train_vit_luoyang2026total.py \
   --task 15m \
   --dataset-config conf_luoyang_2026_15m.yaml \
-  --model pv_forecasting_model_vit_dinov2 \
+--model pv_forecasting_model_vit_dinov2 \
   --sky-sat-load-mode lazy \
   --no-use-satellite \
   --zero-sky \
