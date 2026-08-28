@@ -255,7 +255,7 @@ def render_png(rows: list[tuple[str, dict]], out_path: Path) -> None:
     n_rows = len(rows)
     n_data_cols = len(col_keys)
 
-    case_w = 1.55
+    case_w = 1.86
     data_w = 1.50
     row_h = 0.42
     header_h = 0.52
